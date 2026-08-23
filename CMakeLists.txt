@@ -58,6 +58,11 @@ ExternalProject_Add(libmodsecurity_ext
                       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_libmodsecurity.cmake
     INSTALL_COMMAND   ""
     BUILD_IN_SOURCE   0
+    # Tell Ninja (and other generators) that this external project produces
+    # these files, so the link step for modsecurityiis has a rule for them.
+    BUILD_BYPRODUCTS
+                      ${LIBMODSECURITY_BUILD}/lib/libModSecurity.lib
+                      ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll
 )
 
 # Imported target for the engine DLL/lib produced by the build above.
