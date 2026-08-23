@@ -20,14 +20,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Conan 2.x
-        run: pip install "conan>=2"
+      - name: Install Conan 2.x + Ninja
+        run: pip install "conan>=2" ninja
 
-      - name: Setup MSBuild (Visual Studio developer environment)
-        uses: microsoft/setup-msbuild@v2
+      - name: Set up MSVC toolchain (cl.exe + Windows SDK)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Configure
-        run: cmake -B build -S . -G "Visual Studio 17 2022" -A x64
+        run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release
@@ -40,3 +42,4 @@ jobs:
           if-no-files-found: warn
           path: |
             build/Release/*.dll
+            build/*.dll
