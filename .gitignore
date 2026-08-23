@@ -1,0 +1,17 @@
+# Build output
+build/
+out/
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+
+# vcpkg
+vcpkg_installed/
+
+# Editor / OS
+.vs/
+*.user
+.DS_Store

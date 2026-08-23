@@ -1,0 +1,4 @@
+[submodule "libmodsecurity"]
+	path = libmodsecurity
+	url = https://github.com/owasp-modsecurity/ModSecurity
+	branch = v3/master

@@ -1,0 +1,15 @@
+<!--
+    ModSecurity configuration schema for IIS.
+    Register this section so the system.webServer/ModSecurity
+    configuration can be read by moduleconfig.cpp via the IIS
+    administration COM API (IAppHostAdminManager).
+-->
+
+<configSchema>
+
+  <sectionSchema name="system.webServer/ModSecurity">
+    <attribute name="enabled" type="bool" defaultValue="false"/>
+    <attribute name="configFile" type="string" defaultValue="c:\inetpub\modsecurity.conf" validationType="nonEmptyString" />
+  </sectionSchema>
+
+</configSchema>
