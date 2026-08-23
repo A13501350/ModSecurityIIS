@@ -29,9 +29,8 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     {
         if (m_pTx != nullptr)
         {
-            // VERIFY: method name. v3 logs via processLogging() at the end of
-            // the request lifecycle.
-            m_pTx->processLogging();   // <-- VERIFY
+            // v3 finalizes logging at the end of the request lifecycle.
+            m_pTx->processLogging();
             delete m_pTx;
             m_pTx = nullptr;
         }

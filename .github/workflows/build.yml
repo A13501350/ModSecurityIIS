@@ -20,8 +20,30 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Conan 2.x + Ninja
-        run: pip install "conan>=2" ninja
+      # Install Conan 2.x and expose its home dir for caching.
+      - name: Setup Conan
+        id: setup-conan
+        uses: conan-io/setup-conan@v1
+
+      # Cache the Conan package cache. libModSecurity pulls many C/C++
+      # dependencies (pcre2, yajl, libxml2, lua, libcurl, poco, ...); caching
+      # them avoids re-downloading hundreds of MB on every run. The key pins
+      # compiler.version=193 (conancenter's prebuilt binaries) so the cache is
+      # only reused for the exact settings we build with.
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup-conan.outputs.conan-home }}/p
+          key: conan193-${{ runner.os }}-${{ hashFiles('libmodsecurity/build/win32/conanfile.txt') }}
+          restore-keys: |
+            conan193-${{ runner.os }}-
+
+      # Pin CMake to a 3.x release. libModSecurity's own (older) CMake scripts
+      # can break under CMake 4.x, and the GitHub runner ships CMake 4.x.
+      # Note: Conan only uses its own bundled CMake when building deps from
+      # source, which we avoid by consuming prebuilt binaries (compiler.version=193).
+      - name: Install CMake 3.x + Ninja
+        run: pip install "cmake<4" ninja
 
       - name: Set up MSVC toolchain (cl.exe + Windows SDK)
         uses: ilammy/msvc-dev-cmd@v1
@@ -43,3 +65,4 @@ jobs:
           path: |
             build/Release/*.dll
             build/*.dll
+            build/libmodsecurity_build/build_libmodsecurity.log
