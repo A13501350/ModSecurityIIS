@@ -29,17 +29,21 @@ jobs:
       - name: Install Conan 2.x + Ninja
         run: pip install "conan>=2" ninja
 
-      # Cache the Conan package cache. libModSecurity pulls many C/C++
-      # dependencies (pcre2, yajl, libxml2, lua, libcurl, poco, ...); caching
-      # them avoids re-downloading hundreds of MB on every run. The key pins
-      # compiler.version=193 (conancenter's prebuilt binaries) so the cache is
-      # only reused for the exact settings we build with.
-      - name: Cache Conan packages
+      # Cache both the Conan package cache and the already-built engine tree.
+      # libModSecurity pulls many C/C++ dependencies (pcre2, yajl, libxml2, lua,
+      # libcurl, poco, ...) and recompiling them (plus the 230-file engine
+      # itself) takes ~30 min, so caching it makes connector-only iterations
+      # fast. The key covers the conanfile and our build helper so a dep/flag
+      # change invalidates the cached engine.
+      - name: Cache Conan packages + engine build
         uses: actions/cache@v4
         with:
-          path: ~/.conan2/p
-          key: conan193-${{ runner.os }}-${{ hashFiles('libmodsecurity/build/win32/conanfile.txt') }}
+          path: |
+            ~/.conan2/p
+            build/libmodsecurity_build
+          key: lmengine-${{ runner.os }}-${{ hashFiles('libmodsecurity/build/win32/conanfile.txt') }}-${{ hashFiles('cmake/build_libmodsecurity.cmake') }}
           restore-keys: |
+            lmengine-${{ runner.os }}-
             conan193-${{ runner.os }}-
 
       - name: Set up MSVC toolchain (cl.exe + Windows SDK)

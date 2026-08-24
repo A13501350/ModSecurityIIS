@@ -5,12 +5,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 
-#undef inline
-#define inline inline
-
 #include "httpserv.h"
 
-#include "mymodule.h"
+#include "ModSecurityIIS.h"
 #include "mymodulefactory.h"
 #include "moduleconfig.h"
 

@@ -16,9 +16,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
-#undef inline
-#define inline inline
-
 #include <winsock2.h>
 #include <Windows.h>
 #include <sal.h>
