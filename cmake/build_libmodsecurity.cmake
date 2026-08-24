@@ -50,9 +50,17 @@ run("conan;profile;detect;--force")
 set(_profile "$ENV{USERPROFILE}/.conan2/profiles/default")
 if(EXISTS "${_profile}")
     file(READ "${_profile}" _p)
-    string(FIND "${_p}" "tool_requires" _has)
-    if(_has EQUAL -1)
+    string(FIND "${_p}" "cmake/[>=3 <4]" _has_tr)
+    if(_has_tr EQUAL -1)
         file(APPEND "${_profile}" "\n[tool_requires]\n!cmake/*: cmake/[>=3 <4]\n")
+    endif()
+    # Build every dependency with Ninja. The runner ships only VS 2025, so the
+    # default "Visual Studio 17 2022" generator implied by compiler.version=193
+    # cannot find a VS instance. Ninja uses the MSVC cl.exe already on PATH
+    # (set up by ilammy/msvc-dev-cmd) and is version-agnostic.
+    string(FIND "${_p}" "generator=Ninja" _has_gen)
+    if(_has_gen EQUAL -1)
+        file(APPEND "${_profile}" "\n[conf]\ntools.cmake.cmaketoolchain:generator=Ninja\n")
     endif()
 endif()
 
