@@ -10,8 +10,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #
 # The submodule has NO root CMakeLists.txt. Its Windows build lives in
 # build/win32/ and is Conan-based (build/win32/conanfile.txt + CMakeLists.txt,
-# see vcbuild.bat). We drive that exact build via ExternalProject so a single
-# `cmake --build` produces both the engine and this module.
+# see the sibling vcbuild.bat for the canonical flow). We drive that exact
+# flow with cmake/build_libmodsecurity.cmake (the README's vcbuild.bat, with
+# two CI-specific corrections: Ninja generator since the runner ships VS2025
+# not VS2022, and compiler.version=193 so Conan downloads prebuilt binaries
+# instead of building deps from source under CMake 4.x).
+#
+# A plain add_custom_command produces the DLL + import lib; declaring them as
+# OUTPUT lets Ninja treat them as regular build artifacts (no ExternalProject
+# / BUILD_BYPRODUCTS indirection needed).
 #
 # Prerequisites on the Windows build machine:
 #   * Visual Studio 2019+ ("Desktop development with C++")
@@ -25,6 +32,9 @@ set(LIBMODSECURITY_SRC    ${CMAKE_SOURCE_DIR}/libmodsecurity
     CACHE PATH "libModSecurity submodule source tree")
 set(LIBMODSECURITY_WIN32  ${LIBMODSECURITY_SRC}/build/win32)
 set(LIBMODSECURITY_BUILD  ${CMAKE_BINARY_DIR}/libmodsecurity_build)
+
+set(LIBMODSECURITY_LIB    ${LIBMODSECURITY_BUILD}/lib/libModSecurity.lib)
+set(LIBMODSECURITY_DLL    ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll)
 
 # Initialize the nested submodules the engine build requires.
 find_package(Git)
@@ -45,32 +55,28 @@ else()
     message(WARNING "Git not found; cannot auto-init libModSecurity submodules.")
 endif()
 
-include(ExternalProject)
-ExternalProject_Add(libmodsecurity_ext
-    SOURCE_DIR        ${LIBMODSECURITY_SRC}
-    CONFIGURE_COMMAND ""   # configure is done inside the build script
-    BUILD_COMMAND     ${CMAKE_COMMAND}
-                      -D LM_SRC=${LIBMODSECURITY_SRC}
-                      -D LM_WIN32=${LIBMODSECURITY_WIN32}
-                      -D LM_BUILD=${LIBMODSECURITY_BUILD}
-                      -D CMAKE_GEN=${CMAKE_GENERATOR}
-                      -D CMAKE_ARCH=x64
-                      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_libmodsecurity.cmake
-    INSTALL_COMMAND   ""
-    BUILD_IN_SOURCE   0
-    # Tell Ninja (and other generators) that this external project produces
-    # these files, so the link step for modsecurityiis has a rule for them.
-    BUILD_BYPRODUCTS
-                      ${LIBMODSECURITY_BUILD}/lib/libModSecurity.lib
-                      ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll
+# Build the engine (Conan install + CMake configure + build) as a normal
+# custom command. The OUTPUT files make the dependency explicit to Ninja.
+add_custom_command(
+    OUTPUT  ${LIBMODSECURITY_LIB} ${LIBMODSECURITY_DLL}
+    COMMAND ${CMAKE_COMMAND}
+            -D LM_SRC=${LIBMODSECURITY_SRC}
+            -D LM_WIN32=${LIBMODSECURITY_WIN32}
+            -D LM_BUILD=${LIBMODSECURITY_BUILD}
+            -D CMAKE_GEN=${CMAKE_GENERATOR}
+            -D CMAKE_ARCH=x64
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_libmodsecurity.cmake
+    COMMENT "Building libModSecurity (Conan + CMake, per build/win32 README)"
+    VERBATIM
 )
+add_custom_target(libmodsecurity_build DEPENDS ${LIBMODSECURITY_LIB} ${LIBMODSECURITY_DLL})
 
 # Imported target for the engine DLL/lib produced by the build above.
 # Output dirs are forced by the build script, so these paths are predictable.
 add_library(libmodsecurity SHARED IMPORTED)
 set_target_properties(libmodsecurity PROPERTIES
-    IMPORTED_LOCATION ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll
-    IMPORTED_IMPLIB  ${LIBMODSECURITY_BUILD}/lib/libModSecurity.lib
+    IMPORTED_LOCATION ${LIBMODSECURITY_DLL}
+    IMPORTED_IMPLIB  ${LIBMODSECURITY_LIB}
 )
 
 # ---------------------------------------------------------------------------
@@ -114,7 +120,7 @@ target_include_directories(modsecurityiis PRIVATE
     ${LIBMODSECURITY_SRC}/src
 )
 
-add_dependencies(modsecurityiis libmodsecurity_ext)
+add_dependencies(modsecurityiis libmodsecurity_build)
 
 target_link_libraries(modsecurityiis PRIVATE
     libmodsecurity
@@ -127,7 +133,7 @@ add_custom_command(TARGET modsecurityiis POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll
             $<TARGET_FILE_DIR:modsecurityiis>
-    DEPENDS libmodsecurity_ext
+    DEPENDS libmodsecurity_build
 )
 
 set_target_properties(modsecurityiis PROPERTIES
