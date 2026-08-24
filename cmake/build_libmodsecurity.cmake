@@ -39,6 +39,11 @@ function(run cmd)
 endfunction()
 
 # 0) Make sure a default Conan profile exists (detects the MSVC toolchain).
+execute_process(COMMAND conan --version OUTPUT_VARIABLE _cv ERROR_VARIABLE _ce RESULT_VARIABLE _cr)
+message("CONAN --version rc=${_cr} out=${_cv} err=${_ce}")
+execute_process(COMMAND where conan OUTPUT_VARIABLE _w ERROR_VARIABLE _we RESULT_VARIABLE _wr)
+message("WHERE conan rc=${_wr} out=${_w} err=${_we}")
+
 run("conan;profile;detect;--force")
 
 set(_profile "$ENV{USERPROFILE}/.conan2/profiles/default")
