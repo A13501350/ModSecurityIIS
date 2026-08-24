@@ -62,6 +62,27 @@ static std::string WToUtf8(const WCHAR* w, int byteLen)
     return out;
 }
 
+// IIS raw header values (HTTP_KNOWN_HEADER.pRawValue / HTTP_UNKNOWN_HEADER.*)
+// are ANSI (PCSTR) byte strings on the wire, already UTF-8/ASCII. ModSecurity
+// expects UTF-8, so copy the bytes (RawValueLength may include a trailing NUL).
+static std::string AToUtf8(const char* a, int byteLen)
+{
+    if (a == nullptr || byteLen <= 0)
+    {
+        return "";
+    }
+    int len = byteLen;
+    if (a[len - 1] == '\0')
+    {
+        len--;
+    }
+    if (len <= 0)
+    {
+        return "";
+    }
+    return std::string(a, len);
+}
+
 static std::string SockAddrToIp(PSOCKADDR pAddr)
 {
     if (pAddr == nullptr)
@@ -250,35 +271,37 @@ CMyHttpModule::OnBeginRequest(
 
     EnterCriticalSection(&m_csLock);
 
+    do
+    {
     if (pHttpContext == NULL)
     {
         hr = E_UNEXPECTED;
-        goto Finished;
+        break;
     }
 
     pRequest = pHttpContext->GetRequest();
     if (pRequest == NULL)
     {
         hr = E_UNEXPECTED;
-        goto Finished;
+        break;
     }
 
     hr = MODSECURITY_STORED_CONTEXT::GetConfig(pHttpContext, &pConfig);
     if (FAILED(hr))
     {
         hr = S_OK;          // config not present -> simply don't secure
-        goto Finished;
+        break;
     }
 
     if (pConfig->GetIsEnabled() == false)
     {
-        goto Finished;
+        break;
     }
 
     WCHAR* wpath = pConfig->GetPath();
     if (wpath == NULL || wpath[0] == L'\0')
     {
-        goto Finished;
+        break;
     }
 
     std::string configFile = WToUtf8(wpath, (int)wcslen(wpath) * (int)sizeof(WCHAR));
@@ -287,7 +310,7 @@ CMyHttpModule::OnBeginRequest(
     if (rules == nullptr)
     {
         WriteEventViewerLog(rulesErr.c_str(), EVENTLOG_ERROR_TYPE);
-        goto Finished;
+        break;
     }
 
     // v3 API: Transaction(ModSecurity*, RulesSet*, void*) where the 3rd arg is
@@ -296,7 +319,7 @@ CMyHttpModule::OnBeginRequest(
     if (tx == nullptr)
     {
         hr = E_UNEXPECTED;
-        goto Finished;
+        break;
     }
 
     REQUEST_STORED_CONTEXT* rsc = new REQUEST_STORED_CONTEXT();
@@ -339,7 +362,7 @@ CMyHttpModule::OnBeginRequest(
 #define _TRANSHEADER(id,str)                                               \
     if (req->Headers.KnownHeaders[id].pRawValue != NULL)                   \
     {                                                                      \
-        std::string v = WToUtf8(req->Headers.KnownHeaders[id].pRawValue,   \
+        std::string v = AToUtf8(req->Headers.KnownHeaders[id].pRawValue,   \
                                 req->Headers.KnownHeaders[id].RawValueLength); \
         tx->addRequestHeader((const unsigned char*)(str),                 \
                              (const unsigned char*)v.c_str());            \
@@ -391,9 +414,9 @@ CMyHttpModule::OnBeginRequest(
 
     for (int i = 0; i < req->Headers.UnknownHeaderCount; i++)
     {
-        std::string name = WToUtf8(req->Headers.pUnknownHeaders[i].pName,
+        std::string name = AToUtf8(req->Headers.pUnknownHeaders[i].pName,
                                    req->Headers.pUnknownHeaders[i].NameLength);
-        std::string val  = WToUtf8(req->Headers.pUnknownHeaders[i].pRawValue,
+        std::string val  = AToUtf8(req->Headers.pUnknownHeaders[i].pRawValue,
                                    req->Headers.pUnknownHeaders[i].RawValueLength);
         tx->addRequestHeader((const unsigned char*)name.c_str(),
                              (const unsigned char*)val.c_str());
@@ -431,7 +454,8 @@ CMyHttpModule::OnBeginRequest(
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
-Finished:
+    } while (0);
+
     LeaveCriticalSection(&m_csLock);
     if (FAILED(hr))
     {
@@ -458,9 +482,11 @@ CMyHttpModule::OnSendResponse(
 
     EnterCriticalSection(&m_csLock);
 
+    do
+    {
     if (rsc == NULL || rsc->m_pTx == NULL)
     {
-        goto Exit;
+        break;
     }
 
     modsecurity::Transaction* tx = rsc->m_pTx;
@@ -472,7 +498,7 @@ CMyHttpModule::OnSendResponse(
 #define _TRANSHEADER(id,str)                                               \
     if (pRaw->Headers.KnownHeaders[id].pRawValue != NULL)                   \
     {                                                                      \
-        std::string v = WToUtf8(pRaw->Headers.KnownHeaders[id].pRawValue,   \
+        std::string v = AToUtf8(pRaw->Headers.KnownHeaders[id].pRawValue,   \
                                 pRaw->Headers.KnownHeaders[id].RawValueLength); \
         tx->addResponseHeader((const unsigned char*)(str),                \
                               (const unsigned char*)v.c_str());            \
@@ -513,16 +539,23 @@ CMyHttpModule::OnSendResponse(
 
     for (int i = 0; i < pRaw->Headers.UnknownHeaderCount; i++)
     {
-        std::string name = WToUtf8(pRaw->Headers.pUnknownHeaders[i].pName,
+        std::string name = AToUtf8(pRaw->Headers.pUnknownHeaders[i].pName,
                                    pRaw->Headers.pUnknownHeaders[i].NameLength);
-        std::string val  = WToUtf8(pRaw->Headers.pUnknownHeaders[i].pRawValue,
+        std::string val  = AToUtf8(pRaw->Headers.pUnknownHeaders[i].pRawValue,
                                    pRaw->Headers.pUnknownHeaders[i].RawValueLength);
         tx->addResponseHeader((const unsigned char*)name.c_str(),
                               (const unsigned char*)val.c_str());
     }
 
     // v3 API: processResponseHeaders(int code, const std::string& protocol).
-    int respStatus = (int)pResponse->GetStatus();
+    // IHttpResponse::GetStatus returns void; status comes via OUT params.
+    USHORT statusCode = 0;
+    USHORT subStatus = 0;
+    PCSTR  statusReason = NULL;
+    int    respStatus = 0;
+    pResponse->GetStatus(&statusCode, &subStatus, &statusReason,
+                         NULL, NULL, NULL, NULL, NULL, NULL);
+    respStatus = (int)statusCode;
     tx->processResponseHeaders(respStatus, "HTTP/1.1");
     if (ApplyIntervention(rsc, pHttpContext))
     {
@@ -579,7 +612,8 @@ CMyHttpModule::OnSendResponse(
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
-Exit:
+    } while (0);
+
     LeaveCriticalSection(&m_csLock);
     return RQ_NOTIFICATION_CONTINUE;
 }
