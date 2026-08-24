@@ -19,31 +19,32 @@
 set(_log "${LM_BUILD}/build_libmodsecurity.log")
 file(REMOVE "${_log}")
 file(WRITE "${_log}" "")
+set(_rc 0)
 
 function(run cmd)
-    # Capture combined output to the log so a failure is diagnosable; also
-    # forward to the parent console.
+    math(EXPR _rc "${_rc} + 1")
+    set(_tf "${LM_BUILD}/run_${_rc}.log")
+    set(_chunk "")
+    # NOTE: do not use execute_process(OUTPUT_FILE ... APPEND) -- the APPEND
+    # option requires CMake >= 3.17, and the pip "cmake<4" we pin may be older.
+    # Capture to a per-call temp file, then fold it into the combined log.
     execute_process(COMMAND ${cmd}
-                    OUTPUT_FILE "${_log}" APPEND
-                    ERROR_FILE  "${_log}" APPEND
+                    OUTPUT_FILE "${_tf}"
+                    ERROR_FILE  "${_tf}"
                     RESULT_VARIABLE _r)
+    if(EXISTS "${_tf}")
+        file(READ "${_tf}" _chunk)
+        file(APPEND "${_log}" "${_chunk}")
+    endif()
     if(NOT _r EQUAL 0)
         message("---- build_libmodsecurity.cmake: command failed (${_r}) ----")
-        message("---- last 120 lines of ${_log} ----")
-        file(READ "${_log}" _contents)
-        # Print the tail manually (no string(TAIL) in older CMake).
-        string(REGEX REPLACE ".*\n" "" _dummy "${_contents}") # no-op guard
-        message("${_contents}")
+        message("---- output of: ${cmd} ----")
+        message("${_chunk}")
         message(FATAL_ERROR "Command failed (${_r}): ${cmd}")
     endif()
 endfunction()
 
 # 0) Make sure a default Conan profile exists (detects the MSVC toolchain).
-execute_process(COMMAND conan --version OUTPUT_VARIABLE _cv ERROR_VARIABLE _ce RESULT_VARIABLE _cr)
-message("CONAN --version rc=${_cr} out=${_cv} err=${_ce}")
-execute_process(COMMAND where conan OUTPUT_VARIABLE _w ERROR_VARIABLE _we RESULT_VARIABLE _wr)
-message("WHERE conan rc=${_wr} out=${_w} err=${_we}")
-
 run("conan;profile;detect;--force")
 
 set(_profile "$ENV{USERPROFILE}/.conan2/profiles/default")

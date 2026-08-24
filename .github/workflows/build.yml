@@ -20,11 +20,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Install Conan 2.x, a 3.x CMake, and Ninja on PATH. Conan is required
-      # directly by our build helper (cmake/build_libmodsecurity.cmake), so it
-      # must be on PATH (setup-conan@v1 does not expose it to later steps).
-      - name: Install Conan 2.x + CMake 3.x + Ninja
-        run: pip install "conan>=2" "cmake<4" ninja
+      # Install Conan 2.x and Ninja on PATH. Conan is required directly by our
+      # build helper (cmake/build_libmodsecurity.cmake), so it must be on PATH
+      # (setup-conan@v1 does not expose it to later steps). The runner's CMake
+      # 4.x is used for the build; Conan's own CMake (used when building deps
+      # like yajl from source) is pinned to 3.x via a profile override in the
+      # build helper, see conan-center-index#26878.
+      - name: Install Conan 2.x + Ninja
+        run: pip install "conan>=2" ninja
 
       # Cache the Conan package cache. libModSecurity pulls many C/C++
       # dependencies (pcre2, yajl, libxml2, lua, libcurl, poco, ...); caching
