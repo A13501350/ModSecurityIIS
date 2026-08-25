@@ -62,7 +62,14 @@ MODSECURITY_STORED_CONTEXT::Initialize(
 
     if ( pPropertyException != NULL )
     {
-        ppException = ( IAppHostConfigException** ) &pPropertyException;
+        // Hand the exception object to the caller via the OUT parameter.
+        // (The previous code assigned only the local copy of the pointer,
+        // so callers never saw the exception and misread this failure as a
+        // successful init with an unset value.)
+        if ( ppException != NULL )
+        {
+            *ppException = pPropertyException;
+        }
         goto Failure;
     }
 
@@ -85,7 +92,10 @@ MODSECURITY_STORED_CONTEXT::Initialize(
 
     if ( pPropertyException != NULL )
     {
-        ppException = ( IAppHostConfigException** ) &pPropertyException;
+        if ( ppException != NULL )
+        {
+            *ppException = pPropertyException;
+        }
         goto Failure;
     }
 
@@ -193,71 +203,6 @@ MODSECURITY_STORED_CONTEXT::MODSECURITY_STORED_CONTEXT():
     m_bIsEnabled ( FALSE ),
     m_pszPath( NULL )
 {
-}
-
-DWORD
-MODSECURITY_STORED_CONTEXT::GlobalWideCharToMultiByte(
-        WCHAR*  pSource,
-        DWORD   dwLengthSource,
-        CHAR**  ppszDestination,
-        USHORT* pdwLengthDestination )
-{
-    DWORD       dwResult    = NULL;
-    DWORD       dwCount     = 0;
-
-    if ( ( pSource == NULL ) || ( ppszDestination == NULL ) || ( pdwLengthDestination == NULL ) )
-    {
-        dwResult = ERROR_INVALID_PARAMETER;
-        goto Exit;
-    }
-
-    *pdwLengthDestination = 0;
-    *ppszDestination     = NULL;
-
-    dwCount = WideCharToMultiByte(
-                    CP_ACP, 0, pSource, dwLengthSource + 1,
-                    *ppszDestination, 0, NULL, NULL );
-
-    if ( 0 == dwCount )
-    {
-        dwResult = GetLastError ();
-        if ( dwResult == 0 ) dwResult = ERROR_INVALID_DATA;
-        goto Exit;
-    }
-
-    *ppszDestination = new CHAR[ dwCount + 1 ];
-    if ( NULL == ( *ppszDestination ) )
-    {
-        dwResult = ERROR_OUTOFMEMORY;
-        goto Exit;
-    }
-
-    SecureZeroMemory( ( *ppszDestination ), ( dwCount + 1 ) * sizeof ( CHAR ) );
-
-    if ( 0 == WideCharToMultiByte(
-                CP_ACP, 0, pSource, dwLengthSource + 1,
-                *ppszDestination, dwCount, NULL, NULL ) )
-    {
-        dwResult = GetLastError();
-        goto Exit;
-    }
-
-    *pdwLengthDestination = ( USHORT )dwCount;
-
-Exit:
-    if ( dwResult != 0 )
-    {
-        if ( pdwLengthDestination != NULL ) *pdwLengthDestination = 0;
-        if ( ppszDestination != NULL )
-        {
-            if ( ( *ppszDestination ) != NULL )
-            {
-                delete [] ( *ppszDestination );
-                ( *ppszDestination ) = NULL;
-            }
-        }
-    }
-    return dwResult;
 }
 
 HRESULT
