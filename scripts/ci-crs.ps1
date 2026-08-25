@@ -277,14 +277,41 @@ Write-Host "[6/8] sanity: SQLi -> $($sqli.StatusCode), XSS -> $($xss.StatusCode)
 if ($sqli.StatusCode -ne 200) { throw "SQLi probe should pass through in DetectionOnly (got $($sqli.StatusCode))." }
 if ($xss.StatusCode  -ne 200) { throw "XSS probe should pass through in DetectionOnly (got $($xss.StatusCode))." }
 
-$newSlice = ""
+# Evidence pass: did the ruleset LOAD on libModSecurity v3 at all?
+# Parse failures are reported by the connector through the "ModSecurity"
+# Application event source; audit-open failures show up there too.
+Write-Host "== ModSecurity event-log entries (last 15 min) =="
+try {
+    Get-WinEvent -FilterHashtable @{ LogName = "Application";
+                                    ProviderName = "ModSecurity";
+                                    StartTime = (Get-Date).AddMinutes(-15) } `
+        -MaxEvents 10 -ErrorAction Stop |
+        ForEach-Object {
+            $m = $_.Message
+            Write-Host ("[{0}] {1}: {2}" -f $_.TimeCreated, $_.LevelDisplayName,
+                        $m.Substring(0, [Math]::Min(800, $m.Length)))
+        }
+} catch { Write-Host "(no ModSecurity events: $($_.Exception.Message))" }
+Write-Host "== audit directory =="
+Get-ChildItem $auditDir -ErrorAction SilentlyContinue |
+    Format-Table Name, Length, LastWriteTime
 if (Test-Path $auditLog) {
-    $fs = [System.IO.File]::Open($auditLog, "Open", "Read", "ReadWrite")
-    try {
-        $fs.Position = [Math]::Min($offset, $fs.Length)
-        $reader = New-Object System.IO.StreamReader($fs)
-        $newSlice = $reader.ReadToEnd()
-    } finally { $fs.Close() }
+    Write-Host "== audit.log head =="
+    Get-Content $auditLog -TotalCount 6
+}
+
+$newSlice = ""
+foreach ($try in 1..3) {
+    if (Test-Path $auditLog) {
+        $fs = [System.IO.File]::Open($auditLog, "Open", "Read", "ReadWrite")
+        try {
+            $fs.Position = [Math]::Min($offset, $fs.Length)
+            $reader = New-Object System.IO.StreamReader($fs)
+            $newSlice = $reader.ReadToEnd()
+        } finally { $fs.Close() }
+    }
+    if ($newSlice -match '\[id "\d+"\]') { break }
+    Start-Sleep -Seconds 3
 }
 if ($newSlice -notmatch '\[id "9421\d\d"\]') {
     throw "SQLi probe was not logged by CRS 9421xx rules (DetectionOnly audit check failed)."
