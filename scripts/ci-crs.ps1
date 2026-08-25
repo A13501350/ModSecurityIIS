@@ -317,7 +317,8 @@ foreach ($try in 1..3) {
     if ($newSlice -match '\[id "\d+"\]') { break }
     Start-Sleep -Seconds 3
 }
-if ($newSlice -notmatch '\[id "9421\d{3}"\]') {
+# CRS rule ids are six digits: 9421xx for SQLi group hits, 941xxx for XSS.
+if ($newSlice -notmatch '\[id "9421\d{2}"\]') {
     throw "SQLi probe was not logged by CRS 9421xx rules (DetectionOnly audit check failed)."
 }
 if ($newSlice -notmatch '\[id "941\d{3}"\]') {
