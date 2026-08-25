@@ -113,6 +113,13 @@ jobs:
         shell: pwsh
         run: ./scripts/ci-smoke.ps1 -DllDir artifact
 
+      # Experimental: run the official OWASP CRS regression suite (go-ftw)
+      # through the module, with IIS reverse-proxying to albedo. A curated
+      # subset keeps runtime bounded; failures fail the job so we iterate.
+      - name: Test against OWASP CRS (go-ftw + albedo)
+        shell: pwsh
+        run: ./scripts/ci-crs.ps1 -DllDir artifact
+
       - name: Upload smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -123,3 +130,13 @@ jobs:
             C:/inetpub/modsec/
             C:/inetpub/logs/modsec-audit/
             C:/inetpub/modsectest/
+
+      - name: Upload FTW output and audit log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crs-ftw-logs
+          if-no-files-found: warn
+          path: |
+            go-ftw-output.txt
+            modsec_crs_audit.log
