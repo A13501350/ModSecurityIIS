@@ -222,8 +222,6 @@ CMyHttpModule::CMyHttpModule()
     GetSystemInfo(&sysInfo);
     m_dwPageSize = sysInfo.dwPageSize;
 
-    InitializeCriticalSection(&m_csLock);
-
     // Create the global engine singleton once.
     iis::engine();
 }
@@ -236,7 +234,6 @@ CMyHttpModule::~CMyHttpModule()
         m_hEventLog = NULL;
         g_hEventLog = NULL;
     }
-    DeleteCriticalSection(&m_csLock);
 }
 
 void CMyHttpModule::Dispose()
@@ -268,8 +265,6 @@ CMyHttpModule::OnBeginRequest(
     MODSECURITY_STORED_CONTEXT*   pConfig   = NULL;
 
     UNREFERENCED_PARAMETER(pProvider);
-
-    EnterCriticalSection(&m_csLock);
 
     do
     {
@@ -425,7 +420,6 @@ CMyHttpModule::OnBeginRequest(
     tx->processRequestHeaders();
     if (ApplyIntervention(rsc, pHttpContext))
     {
-        LeaveCriticalSection(&m_csLock);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
@@ -436,27 +430,33 @@ CMyHttpModule::OnBeginRequest(
         while (pRequest->GetRemainingEntityBytes() > 0)
         {
             HRESULT hrr = pRequest->ReadEntityBody(buf, sizeof(buf), FALSE, &read, NULL);
-            if (FAILED(hrr) && hrr != HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
+            if (read > 0)
             {
-                break;
+                tx->appendRequestBody((const unsigned char*)buf, (size_t)read);
+                // ReadEntityBody consumes the entity-body pipe, so the downstream
+                // handler (ASP.NET/PHP/ISAPI) would otherwise receive an empty
+                // body. Re-insert the bytes (IIS appends to existing entity body)
+                // so the application still sees the original request body.
+                pRequest->InsertEntityBody(buf, read);
             }
             if (read == 0)
             {
                 break;
             }
-            tx->appendRequestBody((const unsigned char*)buf, (size_t)read);
+            if (FAILED(hrr) && hrr != HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
+            {
+                break;
+            }
         }
         tx->processRequestBody();
     }
     if (ApplyIntervention(rsc, pHttpContext))
     {
-        LeaveCriticalSection(&m_csLock);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     } while (0);
 
-    LeaveCriticalSection(&m_csLock);
     if (FAILED(hr))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
@@ -479,8 +479,6 @@ CMyHttpModule::OnSendResponse(
 
     REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)
         pHttpContext->GetModuleContextContainer()->GetModuleContext(g_pModuleContext);
-
-    EnterCriticalSection(&m_csLock);
 
     do
     {
@@ -559,7 +557,6 @@ CMyHttpModule::OnSendResponse(
     tx->processResponseHeaders(respStatus, "HTTP/1.1");
     if (ApplyIntervention(rsc, pHttpContext))
     {
-        LeaveCriticalSection(&m_csLock);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
@@ -608,13 +605,11 @@ CMyHttpModule::OnSendResponse(
     tx->processResponseBody();
     if (ApplyIntervention(rsc, pHttpContext))
     {
-        LeaveCriticalSection(&m_csLock);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     } while (0);
 
-    LeaveCriticalSection(&m_csLock);
     return RQ_NOTIFICATION_CONTINUE;
 }
 
@@ -636,9 +631,7 @@ CMyHttpModule::OnPostEndRequest(
 
     if (rsc != NULL && rsc->m_pTx != NULL)
     {
-        EnterCriticalSection(&m_csLock);
         rsc->FinishRequest();   // processLogging + delete tx
-        LeaveCriticalSection(&m_csLock);
     }
 
     return RQ_NOTIFICATION_CONTINUE;
