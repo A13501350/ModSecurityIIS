@@ -125,9 +125,11 @@ Write-Host "[2/8] Engine config written ($conf)"
     /enabled:true /configFile:$conf /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
-# go-ftw targets http://localhost (port 80) by default: free the port and
-# rebind the test site.
-& $appcmd stop site "Default Web Site" 2>$null | Out-Null
+# go-ftw targets http://localhost (port 80) by default. Delete the Default
+# Web Site outright -- a later iisreset would otherwise bring it back up and
+# it would win the race for the :80 binding (observed: requests silently
+# landed in C:\inetpub\wwwroot, bypassing both the WAF and this site).
+& $appcmd delete site "Default Web Site" 2>$null | Out-Null
 & $appcmd set site $SiteName /bindings:"http/*:80:"
 & $appcmd start site $SiteName
 
@@ -136,6 +138,13 @@ if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed
 foreach ($i in 1..30) {
     if ((Get-Service W3SVC).Status -eq "Running") { break }
     Start-Sleep -Seconds 1
+}
+
+# Assert THIS site owns port 80 before anything else depends on it.
+$own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+           -SkipHttpErrorCheck -TimeoutSec 10
+if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsectest") {
+    throw "port-80 ownership check failed ($($own.StatusCode)); ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
 
@@ -243,7 +252,7 @@ Write-Host "[5/8] go-ftw + albedo ready; proxy probe /anything -> $($probe.Statu
 if ($probe.StatusCode -ne 200) {
     Write-ProbeDiagnostics $probe
     Write-Host "--- effective rewrite config (site) ---"
-    & $appcmd list config $SiteName /section:rewrite 2>&1 | Write-Host
+    & $appcmd list config $SiteName /section:system.webServer/rewrite 2>&1 | Write-Host
     Write-Host "Falling back to a GLOBAL rewrite rule..."
     New-GlobalProxyRule
     $probe = Invoke-WebRequest "http://localhost/anything" -UseBasicParsing `
