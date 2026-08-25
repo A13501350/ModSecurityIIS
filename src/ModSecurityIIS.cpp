@@ -159,16 +159,22 @@ static std::string VerbToString(HTTP_REQUEST* req)
     }
 }
 
+// NOTE: the engine composes REQUEST_LINE / REQUEST_PROTOCOL itself by
+// prepending "HTTP/" to whatever we pass (transaction.cc: " HTTP/" +
+// http_version), so this returns the BARE version ("1.1", "2"). The
+// response side is the opposite: Transaction::processResponseHeaders
+// stores the protocol string verbatim into RESPONSE_PROTOCOL, so callers
+// there must pass the full "HTTP/x.y".
 static std::string VersionToString(HTTP_VERSION version)
 {
-    if (HTTP_EQUAL_VERSION(version, 0, 9))  return "HTTP/0.9";
-    if (HTTP_EQUAL_VERSION(version, 1, 0))  return "HTTP/1.0";
-    if (HTTP_EQUAL_VERSION(version, 1, 1))  return "HTTP/1.1";
-    if (HTTP_EQUAL_VERSION(version, 2, 0))  return "HTTP/2";
-    if (HTTP_EQUAL_VERSION(version, 3, 0))  return "HTTP/3";
+    if (HTTP_EQUAL_VERSION(version, 0, 9))  return "0.9";
+    if (HTTP_EQUAL_VERSION(version, 1, 0))  return "1.0";
+    if (HTTP_EQUAL_VERSION(version, 1, 1))  return "1.1";
+    if (HTTP_EQUAL_VERSION(version, 2, 0))  return "2.0";
+    if (HTTP_EQUAL_VERSION(version, 3, 0))  return "3.0";
     // Unknown future version: report the major number instead of silently
-    // claiming HTTP/1.1.
-    return "HTTP/" + std::to_string(version.MajorVersion);
+    // claiming 1.1.
+    return std::to_string(version.MajorVersion);
 }
 
 
@@ -755,8 +761,11 @@ CMyHttpModule::OnSendResponse(
     pResponse->GetStatus(&statusCode, &subStatus, &statusReason,
                          NULL, NULL, NULL, NULL, NULL, NULL);
     respStatus = (int)statusCode;
+    // RESPONSE_PROTOCOL stores the string verbatim -> full "HTTP/x.y" here
+    // (see VersionToString note about the request-side asymmetry).
     tx->processResponseHeaders(respStatus,
-        rsc->m_Protocol.empty() ? "HTTP/1.1" : rsc->m_Protocol);
+        rsc->m_Protocol.empty() ? std::string("HTTP/1.1")
+                                : "HTTP/" + rsc->m_Protocol);
     if (ApplyIntervention(rsc, pHttpContext))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
