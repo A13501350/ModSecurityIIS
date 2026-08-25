@@ -93,7 +93,6 @@ if(MSVC)
         COMMAND mc.exe -U -h ${CMAKE_CURRENT_BINARY_DIR} -r ${CMAKE_CURRENT_BINARY_DIR} ${MC_SOURCE}
         DEPENDS ${MC_SOURCE}
         COMMENT "Generating Event Viewer resource from .mc"
-        VERIFY_SUPPORTED
     )
 endif()
 
@@ -129,11 +128,12 @@ target_link_libraries(modsecurityiis PRIVATE
 )
 
 # Copy the engine DLL next to our module so it can be loaded at runtime.
+# (The build-order dependency on libmodsecurity_build is already established
+# via add_dependencies above; POST_BUILD commands take no DEPENDS keyword.)
 add_custom_command(TARGET modsecurityiis POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${LIBMODSECURITY_BUILD}/bin/libModSecurity.dll
             $<TARGET_FILE_DIR:modsecurityiis>
-    DEPENDS libmodsecurity_build
 )
 
 set_target_properties(modsecurityiis PROPERTIES
