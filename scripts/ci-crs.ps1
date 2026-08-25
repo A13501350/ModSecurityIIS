@@ -51,7 +51,28 @@ Remove-Item "$crsDir\*" -Recurse -Force -ErrorAction SilentlyContinue
 tar -xzf $tgz -C $crsDir --strip-components=1
 Get-ChildItem $crsDir -Recurse -Filter "*.example" |
     ForEach-Object { Rename-Item $_.FullName ($_.Name -replace '\.example$', '') }
-Write-Host "[1/8] CRS unpacked to $crsDir"
+
+# Engine configuration required by the regression suite
+# (tests/regression/README.md): PL4, test-tuned limits, remove the anomaly-
+# score enforcement rule, and flip every transaction into DetectionOnly --
+# tests assert audit-log rule hits, not HTTP blocking.
+Add-Content (Join-Path $crsDir "crs-setup.conf") @'
+SecAction "id:900005,\
+  phase:1,\
+  nolog,\
+  pass,\
+  ctl:ruleEngine=DetectionOnly,\
+  ctl:ruleRemoveById=910000,\
+  setvar:tx.blocking_paranoia_level=4,\
+  setvar:tx.crs_validate_utf8_encoding=1,\
+  setvar:tx.arg_name_length=100,\
+  setvar:tx.arg_length=400,\
+  setvar:tx.total_arg_length=64000,\
+  setvar:tx.max_num_args=255,\
+  setvar:tx.max_file_size=64100,\
+  setvar:tx.combined_file_sizes=65535"
+'@
+Write-Host "[1/8] CRS unpacked to $crsDir (test setup injected)"
 
 # --- 2) engine configuration ----------------------------------------------------
 $auditDir = "C:\inetpub\logs\modsec-crs-audit"
@@ -160,25 +181,48 @@ $probe = Invoke-WebRequest "http://localhost/status/200" -UseBasicParsing `
 Write-Host "[5/8] go-ftw + albedo ready; proxy probe /status/200 -> $($probe.StatusCode)"
 if ($probe.StatusCode -ne 200) { throw "reverse proxy probe failed." }
 
-# --- 6) direct-attack sanity (must block) ----------------------------------------
+# --- 6) direct-attack sanity (DetectionOnly contract: 200 + audit-log hit) ------
+# The suite runs with ctl:ruleEngine=DetectionOnly, so probes must be LOGGED
+# but NOT blocked. Assert both halves, per tests/regression/README.md.
+$auditLog = Join-Path $auditDir "audit.log"
+$offset   = (Test-Path $auditLog) ? (Get-Item $auditLog).Length : 0
 $sqli = Invoke-WebRequest "http://localhost/?id=1%27%20OR%20%271%27%3D%271" `
             -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 $xss  = Invoke-WebRequest "http://localhost/?q=%3Cscript%3Ealert(1)%3C/script%3E" `
             -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 Write-Host "[6/8] sanity: SQLi -> $($sqli.StatusCode), XSS -> $($xss.StatusCode)"
-if ($sqli.StatusCode -ne 403) { throw "SQLi probe not blocked (got $($sqli.StatusCode))." }
-if ($xss.StatusCode  -ne 403) { throw "XSS probe not blocked (got $($xss.StatusCode))." }
+if ($sqli.StatusCode -ne 200) { throw "SQLi probe should pass through in DetectionOnly (got $($sqli.StatusCode))." }
+if ($xss.StatusCode  -ne 200) { throw "XSS probe should pass through in DetectionOnly (got $($xss.StatusCode))." }
+
+$newSlice = ""
+if (Test-Path $auditLog) {
+    $fs = [System.IO.File]::Open($auditLog, "Open", "Read", "ReadWrite")
+    try {
+        $fs.Position = [Math]::Min($offset, $fs.Length)
+        $reader = New-Object System.IO.StreamReader($fs)
+        $newSlice = $reader.ReadToEnd()
+    } finally { $fs.Close() }
+}
+if ($newSlice -notmatch '\[id "9421\d\d"\]') {
+    throw "SQLi probe was not logged by CRS 9421xx rules (DetectionOnly audit check failed)."
+}
+if ($newSlice -notmatch '\[id "941\d\d"\]') {
+    throw "XSS probe was not logged by CRS 941xxx rules (DetectionOnly audit check failed)."
+}
+Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 
 # --- 7) go-ftw over a representative CRS subset ----------------------------------
 # One file per rule group entry point keeps runtime bounded while covering
-# every major category: protocol (920/921), LFI (930), RFI (931), RCE (932),
-# PHP/XSS (933), generic XSS (941), SQLi (942), session (943), scanning (935).
-$includeRegex = '^(920100|920120|920160|920200|920210|920250|920280|920300|920320|920340|920350|920360|920420|920440|920480|921110|921130|921150|921160|930100|930110|930120|931100|932100|932105|932150|933100|933110|933131|933160|934100|935100|941100|941110|941160|941190|942100|942110|942140|942260|942360|943100|943110)\.yaml$'
+# every major category: method enforcement (911), protocol (920/921),
+# LFI (930), RFI (931), RCE (932), PHP/XSS (933), SSRF (934), scanning (935),
+# generic XSS (941), SQLi (942), session fixation (943).
+$includeRegex = '^(911100|920100|920120|920160|920200|920210|920250|920280|920300|920320|920340|920350|920360|920420|920440|920480|921110|921130|921150|921160|930100|930110|930120|931100|932100|932105|932150|933100|933110|933131|933160|934100|935100|941100|941110|941160|941190|942100|942110|942140|942260|942360|943100|943110)\.yaml$'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
+$auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 @"
 ---
-logfile: '$($auditDir -replace '\\','\\')\audit.log'
+logfile: '$auditPathForYaml'
 jsonlog: false
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
