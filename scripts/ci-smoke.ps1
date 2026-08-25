@@ -126,15 +126,53 @@ Assert-True ($LASTEXITCODE -eq 0) "deploy script succeeded" "exit=$LASTEXITCODE"
 Assert-True (& $appcmd list modules /name:ModSecurityIIS | Select-String "ModSecurityIIS" -Quiet) `
             "native module registered" "appcmd list modules came back empty"
 
-# Schema files under inetsrv\config\schema are only picked up when the IIS
-# configuration system (re)starts; a freshly copied schema is invisible to
-# the already-running WAS/W3SVC and every later "set config /section:..."
-# fails with "missing a section declaration".
-Stop-Service W3SVC -ErrorAction SilentlyContinue
-Stop-Service WAS  -ErrorAction SilentlyContinue -Force
-Start-Service WAS
-Start-Service W3SVC
-Write-Host "[3/6] Module registered, IIS config stack restarted for schema."
+# Schema files under inetsrv\config\schema are only picked up when the whole
+# IIS configuration stack reloads -- WAS/W3SVC alone is not enough, the
+# watcher lives in IISADMIN (this mirrors iisreset).
+function Restart-IisConfigStack {
+    & iisreset /stop 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    & iisreset /start 2>&1 | Out-Null
+    # iisreset /start returns immediately; wait until W3SVC is really up.
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+}
+Restart-IisConfigStack
+
+# Diagnostics: prove the schema file is where we put it and whether the
+# config system now knows the section.
+Write-Host "== schema file =="
+Get-Item "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml" |
+    Format-Table FullName, Length, LastWriteTime
+Get-Content "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml"
+
+& $appcmd list config /section:system.webServer/ModSecurity 2>&1 | Write-Host
+$declared = ($LASTEXITCODE -eq 0)
+if (-not $declared) {
+    Write-Warning "Schema still invisible after iisreset; declaring the section in applicationHost.config directly."
+    $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+    Copy-Item $ahConfig "$ahConfig.bak-modsec" -Force
+    [xml]$doc = Get-Content $ahConfig
+    $sg = @($doc.configuration.configSections.sectionGroup) |
+          Where-Object { $_.name -eq "system.webServer" }
+    if (-not $sg) { throw "sectionGroup 'system.webServer' not found in applicationHost.config" }
+    if (-not (@($sg.section) | Where-Object { $_.name -eq "ModSecurity" })) {
+        $sec = $doc.CreateElement("section")
+        $sec.SetAttribute("name", "ModSecurity")
+        $sec.SetAttribute("overrideModeDefault", "Allow")
+        $sec.SetAttribute("allowLocation", "false")
+        [void]$sg.AppendChild($sec)
+        $doc.Save($ahConfig)
+    }
+    Restart-IisConfigStack
+    & $appcmd list config /section:system.webServer/ModSecurity 2>&1 | Write-Host
+    $declared = ($LASTEXITCODE -eq 0)
+}
+Assert-True $declared "schema/section visible to config system" `
+            "system.webServer/ModSecurity still undeclared after restarts"
+Write-Host "[3/6] Module registered, config stack restarted for schema."
 
 # --- 4) engine config + rules --------------------------------------------------
 New-Item -ItemType Directory -Force $ConfRoot | Out-Null
