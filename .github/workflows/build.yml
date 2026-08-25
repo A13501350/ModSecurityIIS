@@ -115,9 +115,12 @@ jobs:
         shell: pwsh
         run: ./scripts/ci-smoke.ps1 -DllDir artifact
 
-      # Experimental: run the official OWASP CRS regression suite (go-ftw)
-      # through the module, with IIS reverse-proxying to albedo. A curated
-      # subset keeps runtime bounded; failures fail the job so we iterate.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: true
+
       - name: Test against OWASP CRS (go-ftw + albedo)
         shell: pwsh
         run: ./scripts/ci-crs.ps1 -DllDir artifact

@@ -5,13 +5,13 @@
 # deploy the module -> write a minimal modsecurity.conf + rules -> create
 # an app pool/site on 127.0.0.1:18080 -> assert behavior:
 #
-#   A  GET  normal UA                 -> 200   (pass-through works)
-#   B  GET  UA "modsec-test-block"    -> 403   (phase 1 header rule)
-#   C  POST evil=<script>...          -> 403   (phase 2 request-body rule)
-#   D  POST benign body               -> 405   (module did not false-positive;
-#                                              static handler rejects the verb)
+#   A  GET  normal UA               -> 200  (pass-through works)
+#   B  GET  UA "modsec-test-block"  -> 403  (phase 1 header rule)
+#   C  POST evil=<script>...        -> 403  (phase 2 request-body rule)
+#   D  POST benign body             -> 405  (no false positive; handler rejects verb)
 #   E  audit log contains rule ids 1001/1002
 #   F  Application event log has "ModSecurity" entries (server-log callback)
+#   P  GET  X-ModSec-Probe: logme    -> 200  (non-disruptive server-log path)
 #
 # Any failed assertion exits non-zero.
 
@@ -156,7 +156,6 @@ Restart-IisConfigStack
 Write-Host "== schema file =="
 Get-Item "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml" |
     Format-Table FullName, Length, LastWriteTime
-Get-Content "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml"
 
 & $appcmd list config /section:system.webServer/ModSecurity 2>&1 | Write-Host
 $declared = ($LASTEXITCODE -eq 0)
@@ -315,16 +314,6 @@ try {
     Assert-True $false "F event-log entries via server-log callback" $_.Exception.Message
 }
 
-# Post-mortem aids: IIS access log for the test site (shows the FINAL status
-# each request ended with, module-blocked or handler-served) and the active
-# handler/module configuration.
-Write-Host "== W3SVC logs =="
-Get-ChildItem "C:\inetpub\logs\LogFiles" -Recurse -Filter "*.log" |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 2 |
-    ForEach-Object { Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 15 }
-Write-Host "== handlers/modules config =="
-& $appcmd list config $SiteName /section:handlers | Select-Object -First 3 | Write-Host
-# Full per-case details live in modsec/diag (uploaded as artifacts).
 
 Write-Host ""
 if ($failures.Count -gt 0) {

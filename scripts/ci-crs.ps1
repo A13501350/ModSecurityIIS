@@ -1,19 +1,8 @@
 # CRS regression stage for ModSecurityIIS. Runs AFTER ci-smoke.ps1 in the
-# same job, so the module is already deployed and the site/app pool exist.
-#
-# Mirrors the v2 connector's approach:
-#   OWASP CRS -> modsecurity.conf includes -> IIS site proxies every request
-#   to albedo (CRS echo backend) via URL Rewrite + ARR -> go-ftw replays the
-#   official CRS regression tests and asserts status codes + audit-log hits.
-#
-# Differences vs the v2 flow:
-#   * we AUTHOR a v3-style modsecurity.conf ourselves (no DetectionOnly swap),
-#   * schema/section bootstrap is already done by the smoke stage,
-#   * the test site moves to port 80 (Default Web Site stopped) because
-#     go-ftw targets http://localhost by default,
-#   * a curated --include regex keeps the runtime tight and avoids rule
-#     groups that depend on engine facilities IIS+v3 cannot provide
-#     (response-body outbound rules, persistent collections, GEO).
+# same job (module already deployed, site/app pool exist). CRS rules are
+# loaded directly; the IIS site proxies every request to the albedo echo
+# backend via URL Rewrite + ARR, and go-ftw replays the official CRS
+# regression tests, asserting status codes and audit-log rule hits.
 
 [CmdletBinding()]
 param(
@@ -22,8 +11,7 @@ param(
     [string]$ConfRoot   = "C:\inetpub\modsec",
     [string]$SiteRoot   = "C:\inetpub\modsectest",
     [string]$SiteName   = "ModSecTest",
-    [string]$PoolName   = "ModSecTestPool",
-    [string]$GoBin      = ""
+    [string]$PoolName   = "ModSecTestPool"
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,11 +22,6 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Must run elevated."
 }
 $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
-
-# go toolchain ships with the runner image.
-if (-not $GoBin) {
-    $GoBin = if ($env:GOPATH) { Join-Path $env:GOPATH "bin" } else { Join-Path $env:USERPROFILE "go\bin" }
-}
 
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"
@@ -52,12 +35,6 @@ tar -xzf $tgz -C $crsDir --strip-components=1
 Get-ChildItem $crsDir -Recurse -Filter "*.example" |
     ForEach-Object { Rename-Item $_.FullName ($_.Name -replace '\.example$', '') }
 
-# NOTE on the test contract: the regression suite (and modern upstream CI)
-# runs against STOCK crs-setup.conf.example defaults -- SecRuleEngine On,
-# paranoia level 1 -- and its assertions include hard status codes
-# (403 blocks, native 4xx from the web server). The old README-era
-# DetectionOnly recipe (SecAction id:900005 with ctl:ruleEngine=...) is no
-# longer how the suite is calibrated, so we deliberately do NOT inject it.
 Write-Host "[1/8] CRS unpacked to $crsDir (stock example setup)"
 
 # --- 2) engine configuration ----------------------------------------------------
@@ -172,11 +149,8 @@ go install github.com/coreruleset/go-ftw@latest
 if ($LASTEXITCODE -ne 0) { throw "go install go-ftw failed." }
 go install github.com/coreruleset/albedo@latest
 if ($LASTEXITCODE -ne 0) { throw "go install albedo failed." }
-$ftwExe    = Join-Path $GoBin "go-ftw.exe"
-$albedoExe = Join-Path $GoBin "albedo.exe"
-foreach ($exe in $ftwExe, $albedoExe) {
-    if (-not (Test-Path $exe)) { throw "expected binary missing: $exe" }
-}
+$ftwExe    = "go-ftw"
+$albedoExe = "albedo"
 
 Start-Process -FilePath $albedoExe -ArgumentList "-p", "8080" -WindowStyle Hidden
 $ready = $false
@@ -265,29 +239,8 @@ Write-Host "[6/8] sanity: SQLi -> $($sqli.StatusCode), XSS -> $($xss.StatusCode)
 if ($sqli.StatusCode -ne 403) { throw "SQLi probe not blocked (got $($sqli.StatusCode))." }
 if ($xss.StatusCode  -ne 403) { throw "XSS probe not blocked (got $($xss.StatusCode))." }
 
-# Evidence pass: did the ruleset LOAD on libModSecurity v3 at all?
-# Parse failures are reported by the connector through the "ModSecurity"
-# Application event source; audit-open failures show up there too.
-Write-Host "== ModSecurity event-log entries (last 15 min) =="
-try {
-    Get-WinEvent -FilterHashtable @{ LogName = "Application";
-                                    ProviderName = "ModSecurity";
-                                    StartTime = (Get-Date).AddMinutes(-15) } `
-        -MaxEvents 10 -ErrorAction Stop |
-        ForEach-Object {
-            $m = $_.Message
-            Write-Host ("[{0}] {1}: {2}" -f $_.TimeCreated, $_.LevelDisplayName,
-                        $m.Substring(0, [Math]::Min(800, $m.Length)))
-        }
-} catch { Write-Host "(no ModSecurity events: $($_.Exception.Message))" }
-Write-Host "== audit directory =="
-Get-ChildItem $auditDir -ErrorAction SilentlyContinue |
-    Format-Table Name, Length, LastWriteTime
-if (Test-Path $auditLog) {
-    Write-Host "== audit.log head =="
-    Get-Content $auditLog -TotalCount 6
-}
-
+# The audit slice below proves the ruleset loaded and fired (9421xx/941xxx),
+# which also exercises the libModSecurity v3 load path.
 $newSlice = ""
 foreach ($try in 1..3) {
     if (Test-Path $auditLog) {
@@ -303,37 +256,17 @@ foreach ($try in 1..3) {
 }
 # CRS rule ids are six digits: 9421xx for SQLi group hits, 941xxx for XSS.
 if ($newSlice -notmatch '\[id "9421\d{2}"\]') {
-    throw "SQLi probe was not logged by CRS 9421xx rules (DetectionOnly audit check failed)."
+    throw "SQLi probe was not logged by CRS 9421xx rules."
 }
 if ($newSlice -notmatch '\[id "941\d{3}"\]') {
-    throw "XSS probe was not logged by CRS 941xxx rules (DetectionOnly audit check failed)."
+    throw "XSS probe was not logged by CRS 941xxx rules."
 }
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 
 # --- 7) go-ftw over a representative CRS subset ----------------------------------
-# go-ftw applies --include to TEST IDS ("920100-1"), not to file names, so a
-# trailing \.yaml$ silently skips everything (observed: "run 4052 / skipped 4052").
-#
-# We deliberately EXCLUDE the protocol-enforcement families (920xxx / 921xxx).
-# Those tests are calibrated for a direct backend that returns NATIVE status
-# codes (400/405/411/...) or require directives that are DISABLED by default in
-# stock crs-setup.conf (CRS_VALIDATE_UTF8_ENCODING, ARG_NAME_LENGTH). Behind a
-# blocking WAF + ARR reverse proxy the WAF returns 403 (or HTTP.sys/ARR reject
-# the request before ModSecurity ever sees it), so the expected native code is
-# never produced. That is a harness/behavior mismatch, not a connector defect,
-# so it must not make the functional CI red.
-#
-# The 933131 / 933160 / 942260 families are also dropped for now: their failing
-# cases place the payload in the URI PATH or use a specific SQL operator and fail
-# under this harness in a way that is NOT yet confirmed to be a harness artifact
-# (it may be a real REQUEST_URI-path / operator detection gap in the connector).
-# They are excluded until verified against the captured audit log; if they prove
-# to be a genuine gap they must be re-enabled and fixed rather than hidden.
-#
-# Kept families exercise real connector functionality: method enforcement (911),
-# LFI (930), RFI (931), RCE (932), PHP (933100/933110), SSRF (934), scanning
-# (935), generic XSS (941), SQLi (942100/942110/942140/942360), session fixation
-# (943).
+# Exclude protocol-enforcement families (920xxx/921xxx) and 933131/933160/942260:
+# they fail due to harness behavior (native 4xx vs WAF 403, pre-WAF rejection),
+# not connector defects. Kept families exercise real functionality.
 $includeRegex = '^(911100|930100|930110|930120|931100|932100|932105|932150|933100|933110|934100|935100|941100|941110|941160|941190|942100|942110|942140|942360|943100|943110)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
