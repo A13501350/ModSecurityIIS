@@ -20,12 +20,12 @@ jobs:
 
     steps:
       - name: Checkout (with submodules, recursive)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -45,7 +45,7 @@ jobs:
       # fast. The key covers the conanfile and our build helper so a dep/flag
       # change invalidates the cached engine.
       - name: Cache Conan packages + engine build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.conan2/p
@@ -74,7 +74,7 @@ jobs:
         with:
           arch: x64
 
-      - uses: ammaraskar/msvc-problem-matcher@master
+      - uses: ammaraskar/msvc-problem-matcher@0.3.0
 
       - name: Configure
         run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: modsecurityiis
           if-no-files-found: warn
@@ -105,10 +105,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download built DLLs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: modsecurityiis
           path: artifact
@@ -136,7 +136,7 @@ jobs:
 
       - name: Upload smoke diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: iis-smoke-diagnostics
           if-no-files-found: ignore
@@ -147,7 +147,7 @@ jobs:
 
       - name: Upload FTW output and audit log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crs-ftw-logs
           if-no-files-found: warn
