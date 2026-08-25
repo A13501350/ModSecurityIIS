@@ -49,9 +49,20 @@ cmake -B build -S . -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-This produces `build/src/Release/modsecurityiis.dll` (plus a copy of
-`libModSecurity.dll` alongside it). Deploy both DLLs to the IIS modules
-directory.
+This produces `build/modsecurityiis.dll` with a copy of `libModSecurity.dll`
+next to it (single-config generators like Ninja; with the Visual Studio
+generator the path is `build/Release/`). Deploy both DLLs to the IIS modules
+directory -- or run the deployment script:
+
+```bat
+powershell -ExecutionPolicy Bypass -File scripts\deploy-modsecurityiis.ps1 -DllDir build
+```
+
+The script copies the DLLs into `%windir%\System32\inetsrv\ModSecurityIIS`,
+installs the configuration schema (`ModSecurity.xml`), registers the
+"ModSecurity" **Application event source** (without this registry key Event
+Viewer cannot render the messages our DLL reports), and registers the native
+module via appcmd. A WiX-based MSI does not exist yet.
 
 ## Enable in IIS
 
@@ -98,3 +109,25 @@ All ModSecurity call sites are implemented against the **verified** v3 API
 
 The `extern "C"` `msc_*` equivalents exist in the same headers if a pure-C
 connector is ever needed, but this project intentionally uses the C++ API.
+
+## Engine limitations (verified against libModSecurity 3.0.16)
+
+These are libModSecurity limitations, not connector bugs -- no connector can
+work around them today:
+
+- **`pause` action**: rejected at rule-parse time (`ACTION_NOT_SUPPORTED`
+  in the seclang parser), so any ruleset using it fails `loadFromUri()` with
+  an error. The `pause` field of `ModSecurityIntervention` exists but the
+  engine never sets it.
+- **No TLS/HTTPS visibility**: v3 has neither an `HTTPS` nor a
+  `REQUEST_SCHEME` variable and no API for a connector to feed TLS state;
+  rules referencing those variables fail to load. `SERVER_NAME` is derived
+  from the Host header only.
+- **`REMOTE_USER`**: the variable exists but there is no public API to
+  populate it, so it always evaluates empty.
+- **GEO / IP reputation**: built here with `-DWITH_MAXMIND=OFF`, so `GEO`
+  lookups are unavailable; `-DWITH_LMDB=OFF` (the engine's default) means
+  persistent collections (`initcol:ip=...`) do not survive across worker
+  processes, weakening rate-limit style rules.
+- **Rules reload**: rulesets are cached per config file for the lifetime of
+  the worker process; recycle the application pool after editing them.
