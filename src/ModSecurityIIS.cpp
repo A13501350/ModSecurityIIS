@@ -598,10 +598,14 @@ CMyHttpModule::OnBeginRequest(
     }
 
     // --- request body ---
+    // Do NOT gate the loop on GetRemainingEntityBytes(): at RQ_BEGIN_REQUEST
+    // it can legitimately report 0 while chunks are still in flight, which
+    // silently skips inspection. Drive the loop off ReadEntityBody results;
+    // ERROR_HANDLE_EOF marks the clean end of the entity.
     {
         char  buf[65536];
         DWORD read = 0;
-        while (pRequest->GetRemainingEntityBytes() > 0)
+        for (;;)
         {
             HRESULT hrr = pRequest->ReadEntityBody(buf, sizeof(buf), FALSE, &read, NULL);
             if (read > 0)
@@ -609,13 +613,13 @@ CMyHttpModule::OnBeginRequest(
                 tx->appendRequestBody((const unsigned char*)buf, (size_t)read);
                 // ReadEntityBody consumes the entity-body pipe, so the downstream
                 // handler (ASP.NET/PHP/ISAPI) would otherwise receive an empty
-                // body. Re-insert the bytes (IIS appends to existing entity body)
-                // so the application still sees the original request body.
+                // body. Re-insert the bytes so the application still sees the
+                // original request body.
                 pRequest->InsertEntityBody(buf, read);
             }
-            if (read == 0)
+            if (read == 0 || read < sizeof(buf))
             {
-                break;
+                break;              // drained (or clean EOF signaled via hrr)
             }
             if (FAILED(hrr) && hrr != HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
             {
