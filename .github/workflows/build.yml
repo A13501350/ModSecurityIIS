@@ -46,16 +46,33 @@ jobs:
             lmengine-${{ runner.os }}-
             conan193-${{ runner.os }}-
 
+      # Object-level compilation cache. Complements the Conan/engine tree
+      # cache above: it pays off when that cache misses (eviction, key bump)
+      # and a full ~40-min engine+deps rebuild would otherwise start over.
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure sccache env
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_ENV "SCCACHE_GHA_ENABLED=true"
+          Add-Content $env:GITHUB_ENV "SCCACHE_IDLE_TIMEOUT=0"
+          # Conan-invoked builds need the sccache binary on PATH.
+          Add-Content $env:GITHUB_PATH (Split-Path $env:SCCACHE_PATH)
+
       - name: Set up MSVC toolchain (cl.exe + Windows SDK)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - name: Configure
-        run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: sccache stats
+        run: "& $env:SCCACHE_PATH --show-stats"
 
       - name: Upload artifacts
         if: always()

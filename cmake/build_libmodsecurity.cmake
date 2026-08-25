@@ -54,16 +54,30 @@ run("conan;profile;detect;--force")
 set(_profile "$ENV{USERPROFILE}/.conan2/profiles/default")
 if(EXISTS "${_profile}")
     file(READ "${_profile}" _p)
+    # Old recipes such as yajl 2.1.0 require CMake 3.x; the runner ships 4.x,
+    # so pin Conan's own CMake tool_require (see conan-center-index#26878).
     string(FIND "${_p}" "cmake/[>=3 <4]" _has_tr)
     if(_has_tr EQUAL -1)
         file(APPEND "${_profile}" "\n[tool_requires]\n!cmake/*: cmake/[>=3 <4]\n")
     endif()
+    # Keep a single [conf] section; append our entries into it.
+    string(FIND "${_p}" "[conf]" _has_conf)
+    if(_has_conf EQUAL -1)
+        file(APPEND "${_profile}" "\n[conf]\n")
+    endif()
     # Build every dependency with Ninja (version-agnostic, faster than the VS
     # generator and unaffected by which VS edition is installed). Ninja uses
     # the MSVC cl.exe already on PATH (set up by ilammy/msvc-dev-cmd).
-    string(FIND "${_p}" "generator=Ninja" _has_gen)
+    string(FIND "${_p}" "cmaketoolchain:generator" _has_gen)
     if(_has_gen EQUAL -1)
-        file(APPEND "${_profile}" "\n[conf]\ntools.cmake.cmaketoolchain:generator=Ninja\n")
+        file(APPEND "${_profile}" "tools.cmake.cmaketoolchain:generator=Ninja\n")
+    endif()
+    # When CI enables sccache, route dependency compilation through it too.
+    if(DEFINED ENV{SCCACHE_GHA_ENABLED})
+        string(FIND "${_p}" "compiler_launcher" _has_launch)
+        if(_has_launch EQUAL -1)
+            file(APPEND "${_profile}" "tools.build:compiler_launcher=sccache\n")
+        endif()
     endif()
 endif()
 
