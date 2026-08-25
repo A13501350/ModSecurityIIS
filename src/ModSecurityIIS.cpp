@@ -349,10 +349,6 @@ CMyHttpModule::CMyHttpModule()
     m_hEventLog = RegisterEventSourceA(NULL, "ModSecurity");
     g_hEventLog  = m_hEventLog;
 
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    m_dwPageSize = sysInfo.dwPageSize;
-
     // Create the global engine singleton once.
     iis::engine();
 }
@@ -367,6 +363,10 @@ CMyHttpModule::~CMyHttpModule()
     }
 }
 
+// Intentionally empty: the base-class default Dispose() does "delete this",
+// but this module is a singleton owned by CMyHttpModuleFactory (freed in
+// Terminate). Letting IIS delete it here would free it while requests may
+// still hold references.
 void CMyHttpModule::Dispose()
 {
 }

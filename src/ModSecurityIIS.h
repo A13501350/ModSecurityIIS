@@ -9,7 +9,6 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr), m_pProvider(nullptr),
-          m_pResponseBuffer(nullptr), m_pResponseLength(0), m_pResponsePosition(0),
           m_ResponseHeadersFed(false)
     { }
 
@@ -25,6 +24,7 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
         FinishRequest();
         delete this;
     }
+
 
     // Must never let an exception escape: besides the explicit call from
     // OnPostEndRequest this also runs from the destructor -- and a throwing
@@ -64,9 +64,6 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // response protocol mirrors the request protocol, so it is reused when
     // feeding Transaction::processResponseHeaders.
     std::string               m_Protocol;
-    char*                     m_pResponseBuffer;
-    ULONGLONG                 m_pResponseLength;
-    ULONGLONG                 m_pResponsePosition;
 };
 
 
@@ -74,7 +71,6 @@ class CMyHttpModule : public CHttpModule
 {
 public:
     HANDLE              m_hEventLog;
-    DWORD               m_dwPageSize;
 
     REQUEST_NOTIFICATION_STATUS
     OnBeginRequest(
