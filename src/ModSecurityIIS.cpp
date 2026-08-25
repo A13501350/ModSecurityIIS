@@ -464,7 +464,24 @@ CMyHttpModule::OnBeginRequest(
     rsc->m_pTx          = tx;
     rsc->m_pHttpContext = pHttpContext;
     rsc->m_pProvider    = pProvider;
-    pHttpContext->GetModuleContextContainer()->SetModuleContext(rsc, g_pModuleContext);
+    IHttpModuleContextContainer* pCtxContainer =
+        pHttpContext->GetModuleContextContainer();
+    HRESULT shr = pCtxContainer->SetModuleContext(rsc, g_pModuleContext);
+    if (FAILED(shr))
+    {
+        // Release our orphaned context (and its transaction).
+        rsc->CleanupStoredContext();
+        rsc = NULL;
+        if (shr == HRESULT_FROM_WIN32(ERROR_ALREADY_ASSIGNED))
+        {
+            // A context already exists for this request. Notifications for
+            // one request are normally serialized, so treat this as "the
+            // request is already being handled" and pass through.
+            break;
+        }
+        hr = E_UNEXPECTED;
+        break;
+    }
 
     HTTP_REQUEST* req = pRequest->GetRawHttpRequest();
 
