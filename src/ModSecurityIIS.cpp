@@ -159,9 +159,14 @@ static std::string VerbToString(HTTP_REQUEST* req)
 
 static std::string VersionToString(HTTP_VERSION version)
 {
-    if (HTTP_EQUAL_VERSION(version, 0, 9)) return "HTTP/0.9";
-    if (HTTP_EQUAL_VERSION(version, 1, 0)) return "HTTP/1.0";
-    return "HTTP/1.1";
+    if (HTTP_EQUAL_VERSION(version, 0, 9))  return "HTTP/0.9";
+    if (HTTP_EQUAL_VERSION(version, 1, 0))  return "HTTP/1.0";
+    if (HTTP_EQUAL_VERSION(version, 1, 1))  return "HTTP/1.1";
+    if (HTTP_EQUAL_VERSION(version, 2, 0))  return "HTTP/2";
+    if (HTTP_EQUAL_VERSION(version, 3, 0))  return "HTTP/3";
+    // Unknown future version: report the major number instead of silently
+    // claiming HTTP/1.1.
+    return "HTTP/" + std::to_string(version.MajorVersion);
 }
 
 
@@ -338,7 +343,6 @@ CMyHttpModule::OnBeginRequest(
     rsc->m_pTx          = tx;
     rsc->m_pHttpContext = pHttpContext;
     rsc->m_pProvider    = pProvider;
-
     pHttpContext->GetModuleContextContainer()->SetModuleContext(rsc, g_pModuleContext);
 
     HTTP_REQUEST* req = pRequest->GetRawHttpRequest();
@@ -382,6 +386,7 @@ CMyHttpModule::OnBeginRequest(
     }
     std::string method  = VerbToString(req);
     std::string version = VersionToString(req->Version);
+    rsc->m_Protocol = version;
     tx->processURI(uri.c_str(), method.c_str(), version.c_str());
 
     // --- request headers ---
@@ -578,6 +583,8 @@ CMyHttpModule::OnSendResponse(
 
     // v3 API: processResponseHeaders(int code, const std::string& protocol).
     // IHttpResponse::GetStatus returns void; status comes via OUT params.
+    // The response protocol mirrors the request protocol (HTTP/2 responses
+    // travel over HTTP/2; only report HTTP/1.1 when it really was 1.1).
     USHORT statusCode = 0;
     USHORT subStatus = 0;
     PCSTR  statusReason = NULL;
@@ -585,7 +592,8 @@ CMyHttpModule::OnSendResponse(
     pResponse->GetStatus(&statusCode, &subStatus, &statusReason,
                          NULL, NULL, NULL, NULL, NULL, NULL);
     respStatus = (int)statusCode;
-    tx->processResponseHeaders(respStatus, "HTTP/1.1");
+    tx->processResponseHeaders(respStatus,
+        rsc->m_Protocol.empty() ? "HTTP/1.1" : rsc->m_Protocol);
     if (ApplyIntervention(rsc, pHttpContext))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;

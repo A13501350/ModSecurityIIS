@@ -39,6 +39,10 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     modsecurity::Transaction* m_pTx;
     IHttpContext*             m_pHttpContext;
     IHttpEventProvider*       m_pProvider;
+    // HTTP version of the request line ("HTTP/1.1", "HTTP/2", ...). The
+    // response protocol mirrors the request protocol, so it is reused when
+    // feeding Transaction::processResponseHeaders.
+    std::string               m_Protocol;
     char*                     m_pResponseBuffer;
     ULONGLONG                 m_pResponseLength;
     ULONGLONG                 m_pResponsePosition;
