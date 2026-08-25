@@ -128,6 +128,7 @@ static std::string VerbToString(HTTP_REQUEST* req)
     case HttpVerbPUT:     return "PUT";
     case HttpVerbDELETE:  return "DELETE";
     case HttpVerbTRACE:   return "TRACE";
+    case HttpVerbTRACK:   return "TRACK";
     case HttpVerbCONNECT: return "CONNECT";
     case HttpVerbMOVE:    return "MOVE";
     case HttpVerbCOPY:    return "COPY";
@@ -136,7 +137,23 @@ static std::string VerbToString(HTTP_REQUEST* req)
     case HttpVerbMKCOL:   return "MKCOL";
     case HttpVerbLOCK:    return "LOCK";
     case HttpVerbUNLOCK:  return "UNLOCK";
-    default:              return "INVALID";
+    case HttpVerbSEARCH:  return "SEARCH";
+    default:
+        // http.sys maps every non-enumerated method (PATCH, custom verbs,
+        // WebDAV extensions, ...) to HttpVerbUnknown and keeps the original
+        // bytes in pUnknownVerb. Report the real method so rules matching
+        // REQUEST_METHOD (e.g. @streq PATCH) keep working; fall back to
+        // "INVALID" only when the raw bytes are unavailable.
+        if (req->Verb == HttpVerbUnknown && req->pUnknownVerb != NULL)
+        {
+            std::string verb = AToUtf8(req->pUnknownVerb,
+                                       (int)req->UnknownVerbLength + 1);
+            if (!verb.empty())
+            {
+                return verb;
+            }
+        }
+        return "INVALID";
     }
 }
 
