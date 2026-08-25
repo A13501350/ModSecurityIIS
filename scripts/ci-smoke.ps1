@@ -72,13 +72,32 @@ Write-Host "[1/6] IIS ready."
 $inetsrv = "$env:windir\System32\inetsrv"
 $depsOutput = & dumpbin /dependents $engine 2>&1 | Out-String
 Write-Host "== dumpbin /dependents libModSecurity.dll =="; Write-Host $depsOutput
+
+# Stage the dynamic VC++ runtime the engine links against (/MD). Without
+# this, resolution relies on the VS toolchain being on PATH -- true on the
+# runner, not necessarily on a clean deployment host.
+$crtSrc = Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"
+foreach ($c in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+    $p = Join-Path $crtSrc $c
+    if (($env:VCToolsRedistDir) -and (Test-Path $p)) {
+        Copy-Item $p $inetsrv -Force
+    } else {
+        Write-Warning "VC runtime $c not found under $crtSrc"
+    }
+}
+
 $systemDeps = @("kernel32", "user32", "advapi32", "ws2_32", "ws2_64", `
-                "msvcrt", "ucrtbase", "vcruntime140", "vcruntime140_1", `
-                "msvcp140", "ntdll", "ole32", "shell32")
+                "iphlpapi", "bcrypt", "crypt32", "msvcrt", "ucrtbase", `
+                "vcruntime140", "vcruntime140_1", "msvcp140", "ntdll", `
+                "ole32", "shell32")
 $missing = @()
 foreach ($m in [regex]::Matches($depsOutput, "(?im)^\s*(\S+\.dll)\s*$")) {
-    $dep = $m.Groups[1].Value
-    if ($systemDeps -contains ($dep -replace "\.dll$", "")) { continue }
+    $dep  = $m.Groups[1].Value
+    $base = ($dep -replace "\.dll$", "")
+    # api-ms-win-crt-* are UCRT API Sets: virtual, always resolvable by the
+    # OS loader, and with no physical file under System32.
+    if ($base -like "api-ms-win-crt*") { continue }
+    if ($systemDeps -contains $base) { continue }
     if (-not (Test-Path (Join-Path $env:windir "System32\$dep"))) { $missing += $dep.ToLower() }
 }
 foreach ($dep in $missing) {
@@ -106,7 +125,16 @@ Assert-True ($LASTEXITCODE -eq 0) "deploy script succeeded" "exit=$LASTEXITCODE"
 & $appcmd list modules /name:ModSecurityIIS
 Assert-True (& $appcmd list modules /name:ModSecurityIIS | Select-String "ModSecurityIIS" -Quiet) `
             "native module registered" "appcmd list modules came back empty"
-Write-Host "[3/6] Module registered."
+
+# Schema files under inetsrv\config\schema are only picked up when the IIS
+# configuration system (re)starts; a freshly copied schema is invisible to
+# the already-running WAS/W3SVC and every later "set config /section:..."
+# fails with "missing a section declaration".
+Stop-Service W3SVC -ErrorAction SilentlyContinue
+Stop-Service WAS  -ErrorAction SilentlyContinue -Force
+Start-Service WAS
+Start-Service W3SVC
+Write-Host "[3/6] Module registered, IIS config stack restarted for schema."
 
 # --- 4) engine config + rules --------------------------------------------------
 New-Item -ItemType Directory -Force $ConfRoot | Out-Null
@@ -139,23 +167,33 @@ Write-Host "[4/6] Engine configuration written."
 New-Item -ItemType Directory -Force $SiteRoot | Out-Null
 Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
 
-# Grant the pool identity write access where audit/tmp files go.
+& $appcmd delete site    $SiteName 2>$null | Out-Null
+& $appcmd delete apppool $PoolName 2>$null | Out-Null
+& $appcmd add apppool /name:$PoolName
+& $appcmd set apppool $PoolName /processModel.loadUserProfile:false
+
+# The pool's virtual account (IIS AppPool\<name>) only resolves to a SID
+# after the pool exists, so grants must come after "add apppool".
 $poolId = "IIS AppPool\$PoolName"
 icacls "C:\inetpub\logs\modsec-audit" /grant "${poolId}:(OI)(CI)M" | Out-Null
 icacls "$ConfRoot\data"               /grant "${poolId}:(OI)(CI)M" | Out-Null
 
-& $appcmd delete site  $SiteName 2>$null | Out-Null
-& $appcmd delete apppool $PoolName 2>$null | Out-Null
-& $appcmd add apppool /name:$PoolName
-& $appcmd set apppool $PoolName /processModel.loadUserProfile:false
 & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot /bindings:"http/*:$($Port):"
-& $appcmd set site  $SiteName /[path='/'].applicationPool:$PoolName
-# Enable ModSecurity for this site only (schema was installed in step 3).
-& $appcmd set config $SiteName /section:ModSecurity `
-    /enabled:true /configFile:"C:\inetpub\modsec\modsecurity.conf" /commit:site
+& $appcmd set app "$SiteName/" /applicationPool:$PoolName
+
+# Enable ModSecurity for this site; retry a few times in case the schema
+# reload races us even after the service restart.
+$sectionOk = $false
+foreach ($try in 1..5) {
+    $out = & $appcmd set config $SiteName /section:ModSecurity `
+        /enabled:true /configFile:"C:\inetpub\modsec\modsecurity.conf" /commit:site 2>&1
+    if ($LASTEXITCODE -eq 0) { $sectionOk = $true; break }
+    Write-Warning "set config attempt $try failed: $out"
+    Start-Sleep -Seconds 3
+}
+Assert-True $sectionOk "ModSecurity section configured" "appcmd kept rejecting the section"
 & $appcmd start site $SiteName
 & $appcmd list sites
-& $appcmd list config $SiteName /section:ModSecurity
 Write-Host "[5/6] Site '$SiteName' listening on 127.0.0.1:$Port"
 
 # --- 6) functional assertions ---------------------------------------------------
