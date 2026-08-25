@@ -25,13 +25,28 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
         delete this;
     }
 
-    void FinishRequest()
+    // Must never let an exception escape: besides the explicit call from
+    // OnPostEndRequest this also runs from the destructor -- and a throwing
+    // step during another exception's stack unwinding would std::terminate
+    // the worker process.
+    void FinishRequest() noexcept
     {
         if (m_pTx != nullptr)
         {
-            // v3 finalizes logging at the end of the request lifecycle.
-            m_pTx->processLogging();
-            delete m_pTx;
+            try
+            {
+                // v3 finalizes logging at the end of the request lifecycle.
+                m_pTx->processLogging();
+                delete m_pTx;
+            }
+            catch (...)
+            {
+                // Static-literal only: anything fancier risks allocating
+                // while the likely failure mode IS an allocation failure.
+                iis::WriteEventViewerLog(
+                    "ModSecurityIIS: exception while finalizing transaction",
+                    EVENTLOG_ERROR_TYPE);
+            }
             m_pTx = nullptr;
         }
     }
