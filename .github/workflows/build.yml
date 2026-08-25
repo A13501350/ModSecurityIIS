@@ -65,6 +65,8 @@ jobs:
         with:
           arch: x64
 
+      - uses: ammaraskar/msvc-problem-matcher@master
+
       - name: Configure
         run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
