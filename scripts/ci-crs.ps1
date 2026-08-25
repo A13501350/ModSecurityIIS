@@ -153,10 +153,14 @@ choco install urlrewrite iis-arr -y --no-progress | Out-Null
 & $appcmd set config /section:system.webServer/proxy /enabled:true
 if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
 
+# IMPORTANT: keep the site-level <ModSecurity> element -- overwriting
+# web.config without it silently disables the module (GetConfig finds no
+# section and skips securing entirely; observed as zero audit output).
 @'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
   <system.webServer>
+    <ModSecurity enabled="true" configFile="C:\inetpub\modsec\modsecurity-crs.conf" />
     <rewrite>
       <rules>
         <rule name="ToAlbedo" stopProcessing="true">
