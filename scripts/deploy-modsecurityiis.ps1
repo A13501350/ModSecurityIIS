@@ -18,8 +18,12 @@ param(
     # Directory containing modsecurityiis.dll + libModSecurity.dll
     [string]$DllDir = ".\build",
 
-    # Where to place the DLLs (must be readable+loadable by w3wp.exe)
-    [string]$InstallDir = "$env:windir\System32\inetsrv\ModSecurityIIS"
+    # Where to place the DLLs. Defaults to the inetsrv ROOT on purpose:
+    # modsecurityiis.dll imports libModSecurity.dll, and the loader resolves
+    # dependencies starting from the *process executable* directory
+    # (w3wp.exe -> inetsrv), NOT from the loading DLL's own folder -- a
+    # subdirectory would break unless added to the system PATH.
+    [string]$InstallDir = "$env:windir\System32\inetsrv"
 )
 
 $ErrorActionPreference = "Stop"
