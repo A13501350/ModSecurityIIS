@@ -577,7 +577,11 @@ CMyHttpModule::OnSendResponse(
     HTTP_RESPONSE*             pRaw      = pResponse->GetRawHttpResponse();
 
     // --- response headers ---
-    // (processed for every response, including header-only/empty-body ones)
+    // Fed exactly once per request: RQ_SEND_RESPONSE fires again for every
+    // explicit handler flush, and re-adding the (unchanged) header set would
+    // pollute the transaction with duplicates.
+    if (!rsc->m_ResponseHeadersFed)
+    {
 #define _TRANSHEADER(id,str)                                               \
     if (pRaw->Headers.KnownHeaders[id].pRawValue != NULL)                   \
     {                                                                      \
@@ -647,8 +651,14 @@ CMyHttpModule::OnSendResponse(
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
+    rsc->m_ResponseHeadersFed = true;
+    }
 
     // --- response body ---
+    // Unlike the headers, body chunks are incremental: each RQ_SEND_RESPONSE
+    // notification carries only the entity chunks queued since the previous
+    // send, so append them all (appendResponseBody accumulates in the
+    // transaction) on every notification.
     for (ULONG c = 0; c < pRaw->EntityChunkCount; c++)
     {
         HTTP_DATA_CHUNK* chunk = &pRaw->pEntityChunks[c];

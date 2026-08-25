@@ -9,7 +9,8 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr), m_pProvider(nullptr),
-          m_pResponseBuffer(nullptr), m_pResponseLength(0), m_pResponsePosition(0)
+          m_pResponseBuffer(nullptr), m_pResponseLength(0), m_pResponsePosition(0),
+          m_ResponseHeadersFed(false)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -54,6 +55,11 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     modsecurity::Transaction* m_pTx;
     IHttpContext*             m_pHttpContext;
     IHttpEventProvider*       m_pProvider;
+    // RQ_SEND_RESPONSE can fire several times per request (every explicit
+    // handler Flush/SendResponse). Response headers must be fed to the
+    // transaction exactly once; entity chunks are delivered incrementally,
+    // one batch per notification.
+    bool                      m_ResponseHeadersFed;
     // HTTP version of the request line ("HTTP/1.1", "HTTP/2", ...). The
     // response protocol mirrors the request protocol, so it is reused when
     // feeding Transaction::processResponseHeaders.
