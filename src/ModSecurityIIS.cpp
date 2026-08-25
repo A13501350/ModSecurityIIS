@@ -247,6 +247,36 @@ static void AppendResponseFileChunk(modsecurity::Transaction* tx,
 // be finished.
 // ---------------------------------------------------------------------------
 
+// Reason phrases for the statuses a WAF typically emits (RFC 9110/6585).
+// Anything else falls back to a generic phrase instead of the previous
+// one-size-fits-all "ModSecurity Action".
+static PCSTR StandardReason(int status)
+{
+    switch (status)
+    {
+    case 200: return "OK";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
+    case 408: return "Request Timeout";
+    case 413: return "Content Too Large";
+    case 414: return "URI Too Long";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 503: return "Service Unavailable";
+    default:  return "Rejected by ModSecurity";
+    }
+}
+
 static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
     modsecurity::Transaction* tx = rsc->m_pTx;
@@ -283,10 +313,18 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 
     // A disruptive action was requested. Prefer a redirect when the rule
     // supplied one; otherwise honor the explicit status (defaulting to 403).
-    pHttpContext->GetResponse()->Clear();
+    IHttpResponse* pResponse = pHttpContext->GetResponse();
+    pResponse->Clear();
     if (url != nullptr && url[0] != '\0')
     {
-        pHttpContext->GetResponse()->Redirect(url, TRUE);
+        // IHttpResponse::Redirect always answers 302; keep the engine's
+        // redirect flavor (301/303/307/308) by overriding the status line
+        // afterwards -- the Location header set by Redirect() is kept.
+        pResponse->Redirect(url, TRUE);
+        if (status >= 301 && status <= 308 && status != 302)
+        {
+            pResponse->SetStatus((USHORT)status, StandardReason(status));
+        }
     }
     else
     {
@@ -294,7 +332,7 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         {
             status = 403;
         }
-        pHttpContext->GetResponse()->SetStatus(status, "ModSecurity Action");
+        pResponse->SetStatus((USHORT)status, StandardReason(status));
     }
     pHttpContext->SetRequestHandled();
     rsc->FinishRequest();
