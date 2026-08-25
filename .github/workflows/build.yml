@@ -67,3 +67,42 @@ jobs:
             build/Release/*.dll
             build/*.dll
             build/libmodsecurity_build/build_libmodsecurity.log
+
+  # Experimental: deploy the freshly built module to a live IIS on the runner
+  # and assert real blocking behavior (header rule, request-body rule,
+  # pass-through, audit log, event log). Failure here fails the workflow.
+  smoke-iis:
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built DLLs
+        uses: actions/download-artifact@v4
+        with:
+          name: modsecurityiis
+          path: artifact
+
+      # dumpbin (used by the smoke script to list libModSecurity imports)
+      # comes with the MSVC toolchain.
+      - name: Set up MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Run IIS smoke test
+        shell: pwsh
+        run: ./scripts/ci-smoke.ps1 -DllDir artifact
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iis-smoke-diagnostics
+          if-no-files-found: ignore
+          path: |
+            C:/inetpub/modsec/
+            C:/inetpub/logs/modsec-audit/
+            C:/inetpub/modsectest/
