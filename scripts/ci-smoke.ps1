@@ -75,14 +75,24 @@ Write-Host "== dumpbin /dependents libModSecurity.dll =="; Write-Host $depsOutpu
 
 # Stage the dynamic VC++ runtime the engine links against (/MD). Without
 # this, resolution relies on the VS toolchain being on PATH -- true on the
-# runner, not necessarily on a clean deployment host.
-$crtSrc = Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"
-foreach ($c in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
-    $p = Join-Path $crtSrc $c
-    if (($env:VCToolsRedistDir) -and (Test-Path $p)) {
-        Copy-Item $p $inetsrv -Force
+# runner, not necessarily on a clean deployment host. VS versions name the
+# redist folder differently (Microsoft.VC143.CRT / VC144...), so search it;
+# fall back to the OS copies in System32.
+$crtNames = "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
+$crtSrcDirs = @()
+if ($env:VCToolsRedistDir) {
+    $crtSrcDirs += Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory `
+                    -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty FullName
+}
+foreach ($c in $crtNames) {
+    $src = $crtSrcDirs | ForEach-Object { Join-Path $_ $c } |
+           Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $src) { $src = Join-Path $env:windir "System32\$c" }
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $inetsrv $c) -Force
     } else {
-        Write-Warning "VC runtime $c not found under $crtSrc"
+        Write-Warning "VC runtime $c not found anywhere"
     }
 }
 
@@ -185,7 +195,9 @@ SecRequestBodyAccess On
 SecResponseBodyAccess Off
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
-SecAuditEngine RelevantOnly
+# Full auditing during smoke runs: lets us verify in the uploaded artifacts
+# whether the engine actually received the request body for phase-2 rules.
+SecAuditEngine On
 SecAuditLog C:\inetpub\logs\modsec-audit\audit.log
 SecAuditLogType Serial
 SecTmpDir C:\inetpub\modsec\data
@@ -235,9 +247,21 @@ Assert-True $sectionOk "ModSecurity section configured" "appcmd kept rejecting t
 Write-Host "[5/6] Site '$SiteName' listening on 127.0.0.1:$Port"
 
 # --- 6) functional assertions ---------------------------------------------------
+New-Item -ItemType Directory -Force "$ConfRoot\diag" | Out-Null
 $curl = "$env:windir\System32\curl.exe"
+$script:diagN = 0
 function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
-    $code = & $curl @CurlArgs -s -o NUL -w "%{http_code}" 2>$null
+    $script:diagN++
+    $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
+    # Save status line + headers + first 2 KiB of body for post-mortem.
+    $code = & $curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
+                -w "%{http_code}" 2>$null
+    "--- STATUS: $code ---" | Add-Content $out
+    Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
+    "--- BODY (first 2048 bytes) ---" | Add-Content $out
+    Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
+    Write-Host "== $Name => HTTP $code (details: $out) =="
     return @{ Name = $Name; Status = [int]($code ?? "0") }
 }
 
@@ -275,6 +299,20 @@ try {
                 "provider 'ModSecurity' returned no events"
 } catch {
     Assert-True $false "F event-log entries via server-log callback" $_.Exception.Message
+}
+
+# Post-mortem aids: IIS access log for the test site (shows the FINAL status
+# each request ended with, module-blocked or handler-served) and the active
+# handler/module configuration.
+Write-Host "== W3SVC logs =="
+Get-ChildItem "C:\inetpub\logs\LogFiles" -Recurse -Filter "*.log" |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 2 |
+    ForEach-Object { Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 15 }
+Write-Host "== handlers/modules config =="
+& $appcmd list config $SiteName /section:handlers | Write-Host
+Get-ChildItem "$ConfRoot\diag" -File | ForEach-Object {
+    Write-Host "--- $($_.Name) ---"
+    Get-Content $_.FullName
 }
 
 Write-Host ""
