@@ -191,11 +191,33 @@ foreach ($i in 1..30) {
 if (-not $ready) { throw "albedo did not become ready on port 8080." }
 Restart-Service W3SVC -Force
 
-# End-to-end probe through WAF -> proxy -> albedo.
-$probe = Invoke-WebRequest "http://localhost/status/200" -UseBasicParsing `
+# End-to-end probe through WAF -> proxy -> albedo. NOTE: albedo answers 200
+# (empty body) for ANY unmatched URL, so any non-200 here means the request
+# never reached albedo -- dump everything needed to localize where it died.
+$probe = Invoke-WebRequest "http://localhost/anything" -UseBasicParsing `
              -SkipHttpErrorCheck -TimeoutSec 15
-Write-Host "[5/8] go-ftw + albedo ready; proxy probe /status/200 -> $($probe.StatusCode)"
-if ($probe.StatusCode -ne 200) { throw "reverse proxy probe failed." }
+Write-Host "[5/8] go-ftw + albedo ready; proxy probe /anything -> $($probe.StatusCode)"
+if ($probe.StatusCode -ne 200) {
+    Write-Host "--- probe response headers ---"
+    $probe.Headers.GetEnumerator() |
+        ForEach-Object { Write-Host ("    {0}: {1}" -f $_.Key, ($_.Value -join ', ')) }
+    Write-Host "--- probe body (first 1 KiB) ---"
+    $bodyText = if ($probe.Content -is [byte[]]) {
+        [System.Text.Encoding]::UTF8.GetString($probe.Content)
+    } else { "$($probe.Content)" }
+    Write-Host $bodyText.Substring(0, [Math]::Min(1024, $bodyText.Length))
+    Write-Host "--- rewrite/proxy modules registered ---"
+    & $appcmd list modules | Select-String -Pattern "Rewrite|Proxy|ARR" |
+        ForEach-Object { Write-Host "    $_" }
+    Write-Host "--- site web.config ---"
+    Get-Content (Join-Path $SiteRoot "web.config") | Write-Host
+    Write-Host "--- direct albedo GET /anything status ---"
+    try {
+        (Invoke-WebRequest "http://127.0.0.1:8080/anything" -UseBasicParsing `
+            -TimeoutSec 5).StatusCode
+    } catch { Write-Host "    direct albedo failed: $($_.Exception.Message)" }
+    throw "reverse proxy probe failed."
+}
 
 # --- 6) direct-attack sanity (DetectionOnly contract: 200 + audit-log hit) ------
 # The suite runs with ctl:ruleEngine=DetectionOnly, so probes must be LOGGED
