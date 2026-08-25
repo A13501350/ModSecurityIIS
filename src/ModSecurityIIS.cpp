@@ -22,6 +22,8 @@
 #include <strsafe.h>
 #include <string>
 #include <vector>
+#include <new>       // std::nothrow
+#include <exception> // std::exception
 
 #include "httpserv.h"
 
@@ -171,6 +173,24 @@ static std::string VersionToString(HTTP_VERSION version)
 
 
 // ---------------------------------------------------------------------------
+// Exception containment. libModSecurity and STL allocations can throw
+// (std::bad_alloc, regex errors from rules, ...). An exception escaping a
+// CHttpModule callback crosses the IIS module ABI boundary and tears down the
+// w3wp process, so every notification handler runs inside try/catch.
+// ---------------------------------------------------------------------------
+
+static void ReportException(const char* where, const char* what) noexcept
+{
+    char buf[512];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "ModSecurityIIS: unexpected exception in %s: %s",
+                where != NULL ? where : "?",
+                what != NULL ? what : "unknown error");
+    iis::WriteEventViewerLog(buf, EVENTLOG_ERROR_TYPE);
+}
+
+
+// ---------------------------------------------------------------------------
 // Intervention helper: if the transaction wants to disrupt, apply it to the
 // IIS response and finalize the request. Returns true if the request should
 // be finished.
@@ -288,6 +308,9 @@ CMyHttpModule::OnBeginRequest(
 
     UNREFERENCED_PARAMETER(pProvider);
 
+    try
+    {
+
     do
     {
     if (pHttpContext == NULL)
@@ -332,14 +355,23 @@ CMyHttpModule::OnBeginRequest(
 
     // v3 API: Transaction(ModSecurity*, RulesSet*, void*) where the 3rd arg is
     // the per-transaction log-callback data (passed back to ServerLogCallback).
-    modsecurity::Transaction* tx = new modsecurity::Transaction(&iis::engine(), rules, this);
+    // nothrow keeps the null check meaningful; internal engine allocations are
+    // covered by the try/catch around this handler.
+    modsecurity::Transaction* tx =
+        new (std::nothrow) modsecurity::Transaction(&iis::engine(), rules, this);
     if (tx == nullptr)
     {
-        hr = E_UNEXPECTED;
+        hr = E_OUTOFMEMORY;
         break;
     }
 
-    REQUEST_STORED_CONTEXT* rsc = new REQUEST_STORED_CONTEXT();
+    REQUEST_STORED_CONTEXT* rsc = new (std::nothrow) REQUEST_STORED_CONTEXT();
+    if (rsc == nullptr)
+    {
+        delete tx;
+        hr = E_OUTOFMEMORY;
+        break;
+    }
     rsc->m_pTx          = tx;
     rsc->m_pHttpContext = pHttpContext;
     rsc->m_pProvider    = pProvider;
@@ -493,6 +525,20 @@ CMyHttpModule::OnBeginRequest(
 
     } while (0);
 
+    }
+    catch (const std::exception& e)
+    {
+        // Fail-closed: finish the request (IIS emits 500) rather than letting
+        // an exception cross the module boundary and kill w3wp.
+        ReportException("OnBeginRequest", e.what());
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    catch (...)
+    {
+        ReportException("OnBeginRequest", NULL);
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+
     if (FAILED(hr))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
@@ -515,6 +561,9 @@ CMyHttpModule::OnSendResponse(
 
     REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)
         pHttpContext->GetModuleContextContainer()->GetModuleContext(g_pModuleContext);
+
+    try
+    {
 
     do
     {
@@ -649,6 +698,20 @@ CMyHttpModule::OnSendResponse(
 
     } while (0);
 
+    }
+    catch (const std::exception& e)
+    {
+        // Mid-response there is no clean way to abort the send; fail-open and
+        // let IIS finish delivering the already-inspected response.
+        ReportException("OnSendResponse", e.what());
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+    catch (...)
+    {
+        ReportException("OnSendResponse", NULL);
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
     return RQ_NOTIFICATION_CONTINUE;
 }
 
@@ -670,7 +733,18 @@ CMyHttpModule::OnPostEndRequest(
 
     if (rsc != NULL && rsc->m_pTx != NULL)
     {
-        rsc->FinishRequest();   // processLogging + delete tx
+        try
+        {
+            rsc->FinishRequest();   // processLogging + delete tx
+        }
+        catch (const std::exception& e)
+        {
+            ReportException("OnPostEndRequest", e.what());
+        }
+        catch (...)
+        {
+            ReportException("OnPostEndRequest", NULL);
+        }
     }
 
     return RQ_NOTIFICATION_CONTINUE;
@@ -703,7 +777,9 @@ RegisterModule(
     g_pModuleContext = pModuleInfo->GetId();
     g_pHttpServer    = pHttpServer;
 
-    pFactory = new CMyHttpModuleFactory();
+    try
+    {
+    pFactory = new (std::nothrow) CMyHttpModuleFactory();
     if (pFactory == NULL)
     {
         hr = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
@@ -723,6 +799,17 @@ RegisterModule(
     hr = pModuleInfo->SetPriorityForRequestNotification(RQ_SEND_RESPONSE, PRIORITY_ALIAS_LAST);
 
     pFactory = NULL;
+    }
+    catch (const std::exception& e)
+    {
+        ReportException("RegisterModule", e.what());
+        hr = E_UNEXPECTED;
+    }
+    catch (...)
+    {
+        ReportException("RegisterModule", NULL);
+        hr = E_UNEXPECTED;
+    }
 
 Finished:
     return hr;
