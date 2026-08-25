@@ -190,6 +190,57 @@ static void ReportException(const char* where, const char* what) noexcept
 }
 
 
+// Inspect a FromFileHandle response chunk. IIS hands out file handles that
+// may be shared with other consumers and are not guaranteed to be opened for
+// overlapped access, so pass a duplicated handle with its own file position:
+// DuplicateHandle + SetFilePointerEx on the copy, then stream the requested
+// byte range through the engine in bounded buffers (a whole-file allocation
+// would spike memory on large downloads).
+static void AppendResponseFileChunk(modsecurity::Transaction* tx,
+                                    HANDLE hFile,
+                                    ULONGLONG start,
+                                    ULONGLONG length)
+{
+    HANDLE hDup = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), hFile,
+                         GetCurrentProcess(), &hDup,
+                         0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        return;
+    }
+
+    LARGE_INTEGER li;
+    li.QuadPart = static_cast<LONGLONG>(start);
+    if (SetFilePointerEx(hDup, li, NULL, FILE_BEGIN))
+    {
+        if (length == (ULONGLONG)HTTP_BYTE_RANGE_TO_EOF)
+        {
+            LARGE_INTEGER fs;
+            length = GetFileSizeEx(hDup, &fs)
+                         ? (ULONGLONG)(fs.QuadPart - li.QuadPart)
+                         : 0;
+        }
+        char buf[65536];
+        while (length > 0)
+        {
+            DWORD want = (length > (ULONGLONG)sizeof(buf))
+                             ? (DWORD)sizeof(buf)
+                             : (DWORD)length;
+            DWORD got  = 0;
+            // Synchronous ReadFile on our private handle; partial reads are
+            // continued until the range is covered or EOF/error occurs.
+            if (!ReadFile(hDup, buf, want, &got, NULL) || got == 0)
+            {
+                break;
+            }
+            tx->appendResponseBody((const unsigned char*)buf, (size_t)got);
+            length -= got;
+        }
+    }
+    CloseHandle(hDup);
+}
+
+
 // ---------------------------------------------------------------------------
 // Intervention helper: if the transaction wants to disrupt, apply it to the
 // IIS response and finalize the request. Returns true if the request should
@@ -669,35 +720,14 @@ CMyHttpModule::OnSendResponse(
         }
         else if (chunk->DataChunkType == HttpDataChunkFromFileHandle)
         {
-            // Read the file range into memory, then append.
-            HANDLE  hFile = chunk->FromFileHandle.FileHandle;
-            ULONGLONG start = chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart;
-            ULONGLONG length = chunk->FromFileHandle.ByteRange.Length.QuadPart;
-            if (length == HTTP_BYTE_RANGE_TO_EOF)
-            {
-                LARGE_INTEGER fs;
-                if (GetFileSizeEx(hFile, &fs))
-                {
-                    length = fs.QuadPart - start;
-                }
-                else
-                {
-                    length = 0;
-                }
-            }
-            if (length > 0)
-            {
-                std::vector<char> fbuf((size_t)length);
-                DWORD got = 0;
-                OVERLAPPED ovl = { 0 };
-                ovl.Offset     = (DWORD)start;
-                ovl.OffsetHigh = (DWORD)(start >> 32);
-                if (ReadFile(hFile, fbuf.data(), (DWORD)length, &got, &ovl) || GetLastError() == ERROR_IO_PENDING)
-                {
-                    tx->appendResponseBody((const unsigned char*)fbuf.data(), (size_t)got);
-                }
-            }
+            AppendResponseFileChunk(tx,
+                                    chunk->FromFileHandle.FileHandle,
+                                    (ULONGLONG)chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart,
+                                    (ULONGLONG)chunk->FromFileHandle.ByteRange.Length.QuadPart);
         }
+        // HttpDataChunkFromFragmentCache: IIS exposes no API for a module to
+        // read another module's cached fragment bytes, so such content cannot
+        // be inspected here; it is skipped deliberately.
     }
 
     tx->processResponseBody();
