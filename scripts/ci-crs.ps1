@@ -317,10 +317,10 @@ foreach ($try in 1..3) {
     if ($newSlice -match '\[id "\d+"\]') { break }
     Start-Sleep -Seconds 3
 }
-if ($newSlice -notmatch '\[id "9421\d\d"\]') {
+if ($newSlice -notmatch '\[id "9421\d{3}"\]') {
     throw "SQLi probe was not logged by CRS 9421xx rules (DetectionOnly audit check failed)."
 }
-if ($newSlice -notmatch '\[id "941\d\d"\]') {
+if ($newSlice -notmatch '\[id "941\d{3}"\]') {
     throw "XSS probe was not logged by CRS 941xxx rules (DetectionOnly audit check failed)."
 }
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
