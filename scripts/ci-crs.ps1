@@ -52,27 +52,13 @@ tar -xzf $tgz -C $crsDir --strip-components=1
 Get-ChildItem $crsDir -Recurse -Filter "*.example" |
     ForEach-Object { Rename-Item $_.FullName ($_.Name -replace '\.example$', '') }
 
-# Engine configuration required by the regression suite
-# (tests/regression/README.md): PL4, test-tuned limits, remove the anomaly-
-# score enforcement rule, and flip every transaction into DetectionOnly --
-# tests assert audit-log rule hits, not HTTP blocking.
-Add-Content (Join-Path $crsDir "crs-setup.conf") @'
-SecAction "id:900005,\
-  phase:1,\
-  nolog,\
-  pass,\
-  ctl:ruleEngine=DetectionOnly,\
-  ctl:ruleRemoveById=910000,\
-  setvar:tx.blocking_paranoia_level=4,\
-  setvar:tx.crs_validate_utf8_encoding=1,\
-  setvar:tx.arg_name_length=100,\
-  setvar:tx.arg_length=400,\
-  setvar:tx.total_arg_length=64000,\
-  setvar:tx.max_num_args=255,\
-  setvar:tx.max_file_size=64100,\
-  setvar:tx.combined_file_sizes=65535"
-'@
-Write-Host "[1/8] CRS unpacked to $crsDir (test setup injected)"
+# NOTE on the test contract: the regression suite (and modern upstream CI)
+# runs against STOCK crs-setup.conf.example defaults -- SecRuleEngine On,
+# paranoia level 1 -- and its assertions include hard status codes
+# (403 blocks, native 4xx from the web server). The old README-era
+# DetectionOnly recipe (SecAction id:900005 with ctl:ruleEngine=...) is no
+# longer how the suite is calibrated, so we deliberately do NOT inject it.
+Write-Host "[1/8] CRS unpacked to $crsDir (stock example setup)"
 
 # --- 2) engine configuration ----------------------------------------------------
 $auditDir = "C:\inetpub\logs\modsec-crs-audit"
@@ -268,9 +254,7 @@ if ($probe.StatusCode -ne 200) {
     throw "reverse proxy probe failed even with a global rewrite rule."
 }
 
-# --- 6) direct-attack sanity (DetectionOnly contract: 200 + audit-log hit) ------
-# The suite runs with ctl:ruleEngine=DetectionOnly, so probes must be LOGGED
-# but NOT blocked. Assert both halves, per tests/regression/README.md.
+# --- 6) direct-attack sanity (blocking mode: 403 + audit-log hit) ---------------
 $auditLog = Join-Path $auditDir "audit.log"
 $offset   = (Test-Path $auditLog) ? (Get-Item $auditLog).Length : 0
 $sqli = Invoke-WebRequest "http://localhost/?id=1%27%20OR%20%271%27%3D%271" `
@@ -278,8 +262,8 @@ $sqli = Invoke-WebRequest "http://localhost/?id=1%27%20OR%20%271%27%3D%271" `
 $xss  = Invoke-WebRequest "http://localhost/?q=%3Cscript%3Ealert(1)%3C/script%3E" `
             -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 Write-Host "[6/8] sanity: SQLi -> $($sqli.StatusCode), XSS -> $($xss.StatusCode)"
-if ($sqli.StatusCode -ne 200) { throw "SQLi probe should pass through in DetectionOnly (got $($sqli.StatusCode))." }
-if ($xss.StatusCode  -ne 200) { throw "XSS probe should pass through in DetectionOnly (got $($xss.StatusCode))." }
+if ($sqli.StatusCode -ne 403) { throw "SQLi probe not blocked (got $($sqli.StatusCode))." }
+if ($xss.StatusCode  -ne 403) { throw "XSS probe not blocked (got $($xss.StatusCode))." }
 
 # Evidence pass: did the ruleset LOAD on libModSecurity v3 at all?
 # Parse failures are reported by the connector through the "ModSecurity"
