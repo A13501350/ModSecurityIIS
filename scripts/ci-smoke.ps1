@@ -197,7 +197,7 @@ SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
 # Full auditing during smoke runs: lets us verify in the uploaded artifacts
 # whether the engine actually received the request body for phase-2 rules.
-SecAuditEngine On
+SecAuditEngine RelevantOnly
 SecAuditLog C:\inetpub\logs\modsec-audit\audit.log
 SecAuditLogType Serial
 SecTmpDir C:\inetpub\modsec\data
@@ -209,6 +209,11 @@ Set-Content (Join-Path $ConfRoot "modsecurity.conf") $modsecConf -Encoding Ascii
 $rules = @"
 SecRule REQUEST_HEADERS:User-Agent "@streq modsec-test-block" "id:1001,phase:1,deny,status:403,msg:'smoke: blocked user-agent'"
 SecRule ARGS:evil "@rx <script>" "id:1002,phase:2,deny,status:403,msg:'smoke: blocked request body'"
+# Non-disruptive probe: libModSecurity only routes NON-disruptive matches to
+# the server-log callback (rule_with_actions.cc gates every serverLog call on
+# !m_isDisruptive); deny rules surface through the audit log instead. Rule
+# 1003 exists precisely to exercise the callback -> Event Viewer path.
+SecRule REQUEST_HEADERS:X-ModSec-Probe "@streq logme" "id:1003,phase:1,pass,log,msg:'smoke: non-disruptive probe'"
 "@
 Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
 Write-Host "[4/6] Engine configuration written."
@@ -261,7 +266,11 @@ function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
     "--- BODY (first 2048 bytes) ---" | Add-Content $out
     Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
         ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
-    Write-Host "== $Name => HTTP $code (details: $out) =="
+    # Console: status + response headers only (full details are uploaded as
+    # job artifacts; echoing whole HTML error pages floods the CI log).
+    Write-Host "== $Name => HTTP $code =="
+    Get-Content "$out.headers" -ErrorAction SilentlyContinue |
+        Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
     return @{ Name = $Name; Status = [int]($code ?? "0") }
 }
 
@@ -275,12 +284,17 @@ $cC = Invoke-Case "C phase-2 body block" @(
 $cD = Invoke-Case "D benign POST passes to handler" @(
     "-X","POST","-H","Content-Type: text/plain","--data","hello",
     "http://127.0.0.1:$Port/hello.txt")
+# Exercises the non-disruptive server-log path (rule 1003 -> callback ->
+# Event Viewer); response is a plain 200.
+$cP = Invoke-Case "P non-disruptive log probe" @(
+    "-H","X-ModSec-Probe: logme","http://127.0.0.1:$Port/hello.txt")
 
 Assert-True ($cA.Status -eq 200) $cA.Name "expected 200, got $($cA.Status)"
 Assert-True ($cB.Status -eq 403) $cB.Name "expected 403, got $($cB.Status)"
 Assert-True ($cC.Status -eq 403) $cC.Name "expected 403, got $($cC.Status)"
 Assert-True ($cD.Status -eq 405) $cD.Name ("expected 405 (static handler verb rejection," +
     " proves no false positive), got $($cD.Status)")
+Assert-True ($cP.Status -eq 200) $cP.Name "expected 200, got $($cP.Status)"
 
 Start-Sleep -Seconds 2   # give the audit writer a moment
 $audit = "C:\inetpub\logs\modsec-audit\audit.log"
@@ -309,11 +323,8 @@ Get-ChildItem "C:\inetpub\logs\LogFiles" -Recurse -Filter "*.log" |
     Sort-Object LastWriteTime -Descending | Select-Object -First 2 |
     ForEach-Object { Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 15 }
 Write-Host "== handlers/modules config =="
-& $appcmd list config $SiteName /section:handlers | Write-Host
-Get-ChildItem "$ConfRoot\diag" -File | ForEach-Object {
-    Write-Host "--- $($_.Name) ---"
-    Get-Content $_.FullName
-}
+& $appcmd list config $SiteName /section:handlers | Select-Object -First 3 | Write-Host
+# Full per-case details live in modsec/diag (uploaded as artifacts).
 
 Write-Host ""
 if ($failures.Count -gt 0) {
