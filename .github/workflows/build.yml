@@ -3,6 +3,15 @@ name: Build ModSecurityIIS
 on:
   push:
     branches: [ master ]
+    # Skip the ~40-min build on doc/meta-only changes. A push that touches any
+    # source, build script, config or the submodule pointer still triggers;
+    # only commits where EVERY changed file matches paths-ignore are skipped.
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'docs/**'
+      - '**/*.editorconfig'
   workflow_dispatch:
 
 jobs:
