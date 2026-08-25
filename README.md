@@ -1,5 +1,7 @@
 # ModSecurityIIS
 
+> **Note:** This is a *vibe coding* project and is **not recommended for production environments**.
+
 A native **IIS 7+** module that runs [ModSecurity v3 (libModSecurity)](https://github.com/owasp-modsecurity/ModSecurity)
 as a connector. Unlike the older v2 `iis/` connector (which compiled the whole
 Apache C engine + `standalone/` shims into the DLL), this project links
@@ -80,36 +82,6 @@ module via appcmd. A WiX-based MSI does not exist yet.
    if desired). Note v3 rule semantics differ from v2 — adjust the config
    accordingly.
 
-## API verification status
-
-All ModSecurity call sites are implemented against the **verified** v3 API
-(checked against the `v3/master` submodule headers, libModSecurity 3.0.16):
-
-- `ModSecurity()` ctor; `setConnectorInformation(const std::string&)` (not
-  `setConnector`); logging via `setServerLogCb(ModSecLogCb)` where
-  `ModSecLogCb = void(*)(void*, const void*)` — there is **no** virtual `log()`
-  to override, so the engine is used as a plain instance, not subclassed.
-- Rules container is `modsecurity::RulesSet` (the public `Rules` subclass
-  inherits from it); `loadFromUri(const char*)` returns `int` (`< 0` = error);
-  `getParserError()` returns `std::string`.
-- `Transaction(ModSecurity*, RulesSet*, void*)` — 3rd arg is the per-transaction
-  log-callback data; `processConnection(const char*, int, const char*, int)`;
-  `processURI(const char*, const char*, const char*)`;
-  `addRequestHeader`/`addResponseHeader` (`unsigned char*` overloads);
-  `processRequestHeaders()` / `processRequestBody()` /
-  `appendRequestBody(const unsigned char*, size_t)`;
-  `processResponseHeaders(int, const std::string&)`;
-  `processResponseBody()` / `appendResponseBody(const unsigned char*, size_t)`;
-  `processLogging()`.
-- Intervention is read via `tx->intervention(ModSecurityIntervention*)` (returns
-  `bool`); the struct carries `disruptive`, `status`, `url`, `log`, and must be
-  released with `modsecurity::intervention::free(&it)`.
-- CMake target produced by libModSecurity is `modsecurity` (used by
-  `target_link_libraries` in `CMakeLists.txt`).
-
-The `extern "C"` `msc_*` equivalents exist in the same headers if a pure-C
-connector is ever needed, but this project intentionally uses the C++ API.
-
 ## Engine limitations (verified against libModSecurity 3.0.16)
 
 These are libModSecurity limitations, not connector bugs -- no connector can
@@ -125,9 +97,13 @@ work around them today:
   from the Host header only.
 - **`REMOTE_USER`**: the variable exists but there is no public API to
   populate it, so it always evaluates empty.
-- **GEO / IP reputation**: built here with `-DWITH_MAXMIND=OFF`, so `GEO`
-  lookups are unavailable; `-DWITH_LMDB=OFF` (the engine's default) means
-  persistent collections (`initcol:ip=...`) do not survive across worker
-  processes, weakening rate-limit style rules.
+- **GEO / IP reputation**: built here with `-DWITH_MAXMIND=ON` and
+  `-DWITH_LMDB=ON`, so `@geoLookup` and LMDB-backed persistent collections
+  (`initcol:ip=...`, rate-limit / brute-force style rules) work. GEO requires a
+  MaxMind GeoIP2 database supplied via `SecGeoLookupDB` in your
+  `modsecurity.conf` — `libmaxminddb` is pulled in automatically by the engine
+  build, but the `.mmdb` file itself is an external asset you must provide.
+  Persistent collections persist across worker processes (LMDB backend), unlike
+  the previous in-memory default.
 - **Rules reload**: rulesets are cached per config file for the lifetime of
   the worker process; recycle the application pool after editing them.
