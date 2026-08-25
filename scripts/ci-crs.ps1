@@ -91,11 +91,27 @@ SecRequestBodyAccess On
 SecResponseBodyAccess Off
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
-SecAuditEngine RelevantOnly
+# Audit EVERYTHING (not RelevantOnly): go-ftw locates test boundaries via
+# X-CRS-Test marker requests that end in 200 -- under RelevantOnly those are
+# never audited and the runner cannot find its markers. Rule alerts (with
+# ids) land in the audit H part of every entry, which is what go-ftw greps.
+SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecTmpDir $ConfRoot\data
 SecDataDir $ConfRoot\data
+# Log marker required by go-ftw outside the CRS docker images (see go-ftw
+# README, "How log parsing works"): echoes the X-CRS-Test UUID into the log
+# and disables ALL other rules for marker requests. Loaded BEFORE the CRS
+# includes so it fires first in phase 1 and the removal takes effect before
+# any CRS rule runs -- otherwise PL4 matches would pollute no_expect_ids.
+SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
+  "id:999999,\
+  pass,\
+  phase:1,\
+  log,\
+  msg:'X-CRS-Test %{MATCHED_VAR}',\
+  ctl:ruleRemoveById=1-999999"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -223,7 +239,8 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 @"
 ---
 logfile: '$auditPathForYaml'
-jsonlog: false
+logmarkerheadername: X-CRS-TEST
+mode: 'default'
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
