@@ -50,6 +50,43 @@ if (-not (Test-Path $appcmd)) { throw "IIS (appcmd.exe) not found -- is IIS inst
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
 Copy-Item $dll    $InstallDir -Force
 Copy-Item $engine $InstallDir -Force
+
+# Stage any Conan dynamic dependencies (e.g. libmaxminddb.dll, lmdb.dll) next
+# to the engine. ConanCenter packages are static by default, but if any was
+# built shared, w3wp would fail to load it. Mirrors the CI smoke staging:
+# resolve every non-system import and copy it from the build/Conan dirs.
+$dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+if ($dumpbin) {
+    $deps = & dumpbin /dependents $engine 2>&1 | Out-String
+    $systemDeps = @("kernel32","user32","advapi32","ws2_32","iphlpapi",
+                    "bcrypt","crypt32","msvcrt","ucrtbase","vcruntime140",
+                    "vcruntime140_1","msvcp140","ntdll","ole32","shell32")
+    foreach ($m in [regex]::Matches($deps, "(?im)^\s*(\S+\.dll)\s*$")) {
+        $dep  = $m.Groups[1].Value
+        $base = ($dep -replace "\.dll$", "")
+        if ($base -like "api-ms-win-crt*") { continue }
+        if ($systemDeps -contains $base) { continue }
+        if (Test-Path (Join-Path $env:windir "System32\$dep")) { continue }
+        $roots = @($DllDir, "$env:USERPROFILE\.conan2",
+                   "$env:GITHUB_WORKSPACE\build") |
+                 Where-Object { $_ -and (Test-Path $_) }
+        $found = if ($roots) {
+            Get-ChildItem $roots -Recurse -Filter $dep -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        } else { $null }
+        if ($found) {
+            Copy-Item $found.FullName $InstallDir -Force
+            Write-Host "  staged dependency: $dep"
+        } else {
+            Write-Warning "Dependency $dep not found -- module load may fail."
+        }
+    }
+} else {
+    Write-Warning ("dumpbin not found; skipped dynamic dependency staging. " +
+                   "If lmdb/libmaxminddb were built shared, copy their DLLs " +
+                   "to $InstallDir manually.")
+}
+
 Write-Host "[1/4] DLLs copied to $InstallDir"
 
 # --- 2) config schema --------------------------------------------------------

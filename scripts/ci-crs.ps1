@@ -41,11 +41,22 @@ Write-Host "[1/8] CRS unpacked to $crsDir (stock example setup)"
 $auditDir = "C:\inetpub\logs\modsec-crs-audit"
 New-Item -ItemType Directory -Force $auditDir          | Out-Null
 New-Item -ItemType Directory -Force "$ConfRoot\data"   | Out-Null
+New-Item -ItemType Directory -Force "$ConfRoot\GeoIP"  | Out-Null
 # Pool identity needs write access for audit/tmp files (pool exists since the
-# smoke stage created it).
+# smoke stage created it); read access to GeoIP so @geoLookup can open the db.
 $poolId = "IIS AppPool\$PoolName"
 icacls $auditDir         /grant "${poolId}:(OI)(CI)M" | Out-Null
 icacls "$ConfRoot\data"  /grant "${poolId}:(OI)(CI)M" | Out-Null
+icacls "$ConfRoot\GeoIP" /grant "${poolId}:(OI)(CI)R" | Out-Null
+
+# GeoIP2: only emit SecGeoLookupDB if a MaxMind .mmdb is actually present, so
+# CI (no db) keeps its current behavior; deploying the db enables GEO rules.
+$geoDb   = "$ConfRoot\GeoIP\GeoIP2-Country.mmdb"
+$geoLine = if (Test-Path $geoDb) {
+    "SecGeoLookupDB $geoDb"
+} else {
+    "# SecGeoLookupDB $geoDb   (drop a MaxMind GeoIP2 database here to enable @geoLookup / GEO rules)"
+}
 
 $conf = Join-Path $ConfRoot "modsecurity-crs.conf"
 @"
@@ -63,6 +74,7 @@ SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecTmpDir $ConfRoot\data
 SecDataDir $ConfRoot\data
+$geoLine
 # Log marker required by go-ftw outside the CRS docker images (see go-ftw
 # README, "How log parsing works"): echoes the X-CRS-Test UUID into the log
 # and disables ALL other rules for marker requests. Loaded BEFORE the CRS

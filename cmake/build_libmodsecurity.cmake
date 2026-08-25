@@ -99,7 +99,11 @@ if(NOT CMAKE_GEN STREQUAL "Ninja")
     list(APPEND _gen_args -A ${CMAKE_ARCH})
 endif()
 
-run("cmake;--fresh;-S;${LM_WIN32};-B;${LM_BUILD};${_gen_args};${_launcher_args};-DCMAKE_TOOLCHAIN_FILE=${LM_BUILD}/conan_toolchain.cmake;-DCMAKE_BUILD_TYPE=Release;-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${LM_BUILD}/bin;-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${LM_BUILD}/lib;-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${LM_BUILD}/lib;-DWITH_LMDB=OFF;-DWITH_MAXMIND=OFF")
+run("cmake;--fresh;-S;${LM_WIN32};-B;${LM_BUILD};${_gen_args};${_launcher_args};-DCMAKE_TOOLCHAIN_FILE=${LM_BUILD}/conan_toolchain.cmake;-DCMAKE_BUILD_TYPE=Release;-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${LM_BUILD}/bin;-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${LM_BUILD}/lib;-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${LM_BUILD}/lib;# WITH_LMDB=ON: persistent collections (IP/USER/GLOBAL/SESSION) use the LMDB
+# backend instead of in-process memory (src/modsecurity.cc). WITH_MAXMIND=ON:
+# enables the @geoLookup operator + SecGeoLookupDB (GeoIP2 via libmaxminddb).
+# Both deps are already declared in libmodsecurity/build/win32/conanfile.txt.
+-DWITH_LMDB=ON;-DWITH_MAXMIND=ON")
 
 # 3) Build the engine (shared libModSecurity target).
 run("cmake;--build;${LM_BUILD};--config;Release")

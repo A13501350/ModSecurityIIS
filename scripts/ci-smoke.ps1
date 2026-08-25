@@ -187,6 +187,16 @@ Write-Host "[3/6] Module registered, config stack restarted for schema."
 New-Item -ItemType Directory -Force $ConfRoot | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $ConfRoot "data") | Out-Null
 New-Item -ItemType Directory -Force "C:\inetpub\logs\modsec-audit" | Out-Null
+# GeoIP2 database directory. The @geoLookup operator and GEO-based CRS rules
+# need a MaxMind GeoIP2 .mmdb here; the directive is only emitted when the file
+# actually exists, so CI (no db) keeps its current behavior and stays green.
+New-Item -ItemType Directory -Force "C:\inetpub\modsec\GeoIP" | Out-Null
+$geoDb   = "C:\inetpub\modsec\GeoIP\GeoIP2-Country.mmdb"
+$geoLine = if (Test-Path $geoDb) {
+    "SecGeoLookupDB $geoDb"
+} else {
+    "# SecGeoLookupDB $geoDb   (drop a MaxMind GeoIP2 database here to enable @geoLookup / GEO rules)"
+}
 
 $modsecConf = @"
 SecRuleEngine On
@@ -201,6 +211,7 @@ SecAuditLog C:\inetpub\logs\modsec-audit\audit.log
 SecAuditLogType Serial
 SecTmpDir C:\inetpub\modsec\data
 SecDataDir C:\inetpub\modsec\data
+$geoLine
 Include C:\inetpub\modsec\rules.conf
 "@
 Set-Content (Join-Path $ConfRoot "modsecurity.conf") $modsecConf -Encoding Ascii
@@ -231,6 +242,7 @@ Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding 
 $poolId = "IIS AppPool\$PoolName"
 icacls "C:\inetpub\logs\modsec-audit" /grant "${poolId}:(OI)(CI)M" | Out-Null
 icacls "$ConfRoot\data"               /grant "${poolId}:(OI)(CI)M" | Out-Null
+icacls "C:\inetpub\modsec\GeoIP"      /grant "${poolId}:(OI)(CI)R" | Out-Null
 
 & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot /bindings:"http/*:$($Port):"
 & $appcmd set app "$SiteName/" /applicationPool:$PoolName
