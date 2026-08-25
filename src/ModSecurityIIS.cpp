@@ -341,13 +341,27 @@ CMyHttpModule::OnBeginRequest(
     tx->processConnection(clientIp.c_str(), clientPort, serverIp.c_str(), serverPort);
 
     // --- URI / method / version ---
-    std::string path = WToUtf8(req->CookedUrl.pAbsPath, req->CookedUrl.AbsPathLength);
-    std::string uri  = path;
-    if (req->CookedUrl.QueryStringLength > 0)
+    // Prefer the raw (unprocessed) URL: IIS has not decoded/normalized it, so
+    // ModSecurity applies its own decoding/normalization -- essential for
+    // encoded-evasion and path-traversal detection, and consistent with the
+    // Apache connector's REQUEST_URI semantics. pRawUrl is ANSI and already
+    // includes the query string ("/path?query"). Fall back to the cooked URL
+    // only if the raw pointer is absent (malformed request line).
+    std::string uri;
+    if (req->pRawUrl != nullptr)
     {
-        uri += "?";
-        uri += WToUtf8(req->CookedUrl.pQueryString + 1,
-                       req->CookedUrl.QueryStringLength - (int)sizeof(WCHAR));
+        uri = AToUtf8(req->pRawUrl, req->RawUrlLength);
+    }
+    else
+    {
+        std::string path = WToUtf8(req->CookedUrl.pAbsPath, req->CookedUrl.AbsPathLength);
+        uri = path;
+        if (req->CookedUrl.QueryStringLength > 0)
+        {
+            uri += "?";
+            uri += WToUtf8(req->CookedUrl.pQueryString + 1,
+                           req->CookedUrl.QueryStringLength - (int)sizeof(WCHAR));
+        }
     }
     std::string method  = VerbToString(req);
     std::string version = VersionToString(req->Version);
