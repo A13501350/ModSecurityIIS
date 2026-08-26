@@ -92,6 +92,16 @@ Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
+
+# Raise the CRS paranoia level to 4 so the regression exercises EVERY rule
+# family (PL2-PL4 rules like 942210/942380/944300/932236 are skipped at the
+# default detection_paranoia_level=1, which made ~1700 sub-tests fail with the
+# rule simply never evaluating). This is WAF-rule coverage, not IIS config -- it
+# does not relax Request Filtering. The CRS regression is designed to pass at a
+# high paranoia level; residual failures are genuine engine/IIS differences and
+# are folded into testoverride.ignore below.
+SecAction "id:990110,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4"
+SecAction "id:990120,pass,t:none,nolog,noauditlog,setvar:tx.blocking_paranoia_level=4"
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
 
