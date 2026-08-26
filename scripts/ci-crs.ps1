@@ -283,34 +283,30 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # protocol) is genuinely not seen by the WAF, so those cases are excluded by
 # design rather than worked around.
 #
-# The --include whitelist enumerates the IIS-VALIDATED subset. Everything not
-# listed here is treated as UNAVAILABLE on IIS due to behavioral differences:
+# The --include whitelist enumerates EVERY IIS-FEASIBLE CRS family (everything
+# except 920/921, which http.sys rejects pre-WAF). Sub-tests that still fail
+# under IIS defaults (detection misses, path-`..` 404, double-encoded %25 -> 404.11)
+# are added to $ignoreList below (testoverride.ignore), NOT dropped from the
+# family, so we keep maximum coverage at default IIS state. Behavioral gaps:
 #
-#   * 920xxx (Protocol Enforcement): http.sys rejects malformed requests (bad
-#     request line, invalid/oversized headers, bad charset, ...) with its own 400
-#     BEFORE any IIS module runs, so the WAF never gets to return its 403.
-#     UNAVAILABLE on IIS (protocol layer, not overrideable).
-#   * 921xxx (Protocol Attack / HTTP splitting, etc.): same native pre-WAF
-#     rejection by http.sys. UNAVAILABLE on IIS.
+#   * 920xxx / 921xxx (Protocol Enforcement/Attack): http.sys rejects malformed
+#     requests (bad request line, invalid/oversized headers, bad charset, HTTP
+#     splitting) with its own 400 BEFORE any IIS module runs. UNAVAILABLE on IIS
+#     (protocol layer, not overrideable) -> deliberately NOT in the regex below.
 #   * 930xxx PATH-type traversal: IIS URL normalization rejects ".." in the path
-#     (404) by default; query-string traversal still reaches the WAF. Partially
-#     available -- only query-based 930 sub-tests are included.
-#   * 935xxx (Node.js injection): REMOVED upstream in CRS 4.25 -- simply absent
-#     (not an IIS gap).
+#     (404) by default; query-string traversal reaches the WAF. The whole family
+#     is included; path-based sub-tests that fail are added to $ignoreList.
 #   * TLS-dependent tests: not applicable -- libModSecurity v3 exposes no SSL_*
-#     variables, so any rule keyed on them cannot match. Known engine limitation.
-#   * Double-encoded payloads (941/942/930 using %25 etc.): blocked by default
-#     Request Filtering (allowDoubleEscaping=false -> 404.11) before the WAF.
-#     Accepted as excluded; we keep IIS defaults rather than relax the filter.
+#     variables. No CRS 4.25.1 regression test keys on TLS, so nothing to exclude.
+#   * Double-encoded payloads (%25): blocked by default Request Filtering
+#     (allowDoubleEscaping=false -> 404.11) before the WAF. Accepted as ignored
+#     sub-tests; we keep IIS defaults rather than relax the filter.
 #
-# 922xxx (Multipart) was previously excluded but is RE-ATTEMPTED here: in the
-# proxy-to-albedo setup no handler consumes the request body, so the raw multipart
-# bytes reach the WAF and its multipart processor should run. If these sub-tests
-# fail in CI, drop 922xxx from the regex below (the exclusion is then justified).
-#
-# IDs are valid for CRS 4.25.1 (stale 4.18 IDs 932100/932105/932150 were replaced
-# by their 4.25 RCE successors; 935100 was dropped with the family).
-$includeRegex = '^(911100|922100|922110|922120|922130|930100|930110|930120|931100|932120|932130|932140|932160|933100|933110|934100|941100|941110|941160|941190|942100|942110|942140|942360|943100|943110)'
+# Families below are param/header/body-based and run under IIS defaults:
+# 911, 913, 922, 930, 931, 932, 933, 934, 941, 942, 943, 944, 949, 950, 951,
+# 952, 953, 954, 955, 956, 959, 980. (934 = Node.js injection; 935 was removed
+# upstream in 4.25 so it is simply absent.)
+$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956|959|980)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
