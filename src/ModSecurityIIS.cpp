@@ -773,11 +773,14 @@ CMyHttpModule::OnSendResponse(
     rsc->m_ResponseHeadersFed = true;
     }
 
-    // --- response body ---
-    // Unlike the headers, body chunks are incremental: each RQ_SEND_RESPONSE
-    // notification carries only the entity chunks queued since the previous
-    // send, so append them all (appendResponseBody accumulates in the
-    // transaction) on every notification.
+    // --- response body (accumulate only) ---
+    // Chunks are incremental: each RQ_SEND_RESPONSE carries only the entity
+    // bytes queued since the previous send, so append them all to the
+    // transaction here. Do NOT process them yet -- v3's processResponseBody()
+    // has no re-run guard and appendResponseBody accumulates, so evaluating on
+    // every flush would re-run phase-4 rules over the whole growing body
+    // (duplicate alerts + O(n^2)). The single processResponseBody() call is
+    // made in OnPostEndRequest once the response is complete.
     for (ULONG c = 0; c < pRaw->EntityChunkCount; c++)
     {
         HTTP_DATA_CHUNK* chunk = &pRaw->pEntityChunks[c];
@@ -796,12 +799,6 @@ CMyHttpModule::OnSendResponse(
         // HttpDataChunkFromFragmentCache: IIS exposes no API for a module to
         // read another module's cached fragment bytes, so such content cannot
         // be inspected here; it is skipped deliberately.
-    }
-
-    tx->processResponseBody();
-    if (ApplyIntervention(rsc, pHttpContext))
-    {
-        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     } while (0);
@@ -843,6 +840,15 @@ CMyHttpModule::OnPostEndRequest(
     {
         try
         {
+            // Single, deferred response-body evaluation: phase-4 rules run once
+            // over the fully accumulated body (appended in OnSendResponse),
+            // avoiding duplicate alerts from per-flush re-processing.
+            rsc->m_pTx->processResponseBody();
+            if (ApplyIntervention(rsc, pHttpContext))
+            {
+                // Disruptive: ApplyIntervention already finalized the tx.
+                return RQ_NOTIFICATION_CONTINUE;
+            }
             rsc->FinishRequest();   // processLogging + delete tx
         }
         catch (const std::exception& e)
