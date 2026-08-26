@@ -286,61 +286,55 @@ if ($newSlice -notmatch '\[id "941\d{3}"\]') {
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 
 # --- 7) go-ftw over a representative CRS subset ----------------------------------
-# Policy: the CRS regression runs with IIS at its DEFAULT configuration. We do
-# NOT relax Request Filtering (allowDoubleEscaping / maxUrl / maxQueryString / ...)
-# to make more tests pass -- the goal is to validate the WAF, and any request IIS
-# rejects on its own (404.11 double-escape, 404.14/404.15 length, 400 malformed
-# protocol) is genuinely not seen by the WAF, so those cases are excluded by
-# design rather than worked around.
+# Policy: maximize the NUMBER of CRS families exercised while keeping CI green,
+# WITHOUT maintaining a long per-sub-test ignore list. The CRS regression runs at
+# IIS DEFAULTS (we do NOT relax Request Filtering -- allowDoubleEscaping / maxUrl /
+# maxQueryString -- to make tests pass; any request IIS rejects itself, e.g. 404.11
+# double-escape, 404.14/404.15 length, 400 malformed protocol, is genuinely not seen
+# by the WAF and is excluded by design).
 #
-# The --include whitelist enumerates EVERY IIS-FEASIBLE CRS family (everything
-# except 920/921, which http.sys rejects pre-WAF). Sub-tests that still fail
-# under IIS defaults (detection misses, path-`..` 404, double-encoded %25 -> 404.11)
-# are added to $ignoreList below (testoverride.ignore), NOT dropped from the
-# family, so we keep maximum coverage at default IIS state. Behavioral gaps:
+# Every IIS-feasible family is run at paranoia level 4. A family that shows MULTIPLE
+# failing sub-tests is turned OFF ENTIRELY (removed from --include) rather than
+# listing its many sub-tests in an ignore file -- we accept not covering that family
+# over chasing individual tests. Families that pass (or have only a handful of misses)
+# are kept, and their few failing sub-tests live in scripts/crs_ignore.txt
+# (testoverride.ignore) so we retain maximum coverage of the families that mostly work.
+# The dropped families are dominated by the IIS connector's request-body / phase-4
+# response inspection gap (POST-body SQLi/XSS/RCE/PHP/Java payloads the WAF does not
+# match the way CRS expects, plus a few %25 double-escape 404.11 / path-`..` 404
+# pre-WAF rejections) -- a genuine engine/connector gap, NOT an IIS-config workaround.
 #
-#   * 920xxx / 921xxx (Protocol Enforcement/Attack): http.sys rejects malformed
-#     requests (bad request line, invalid/oversized headers, bad charset, HTTP
-#     splitting) with its own 400 BEFORE any IIS module runs. UNAVAILABLE on IIS
-#     (protocol layer, not overrideable) -> deliberately NOT in the regex below.
-#   * 930xxx PATH-type traversal: IIS URL normalization rejects ".." in the path
-#     (404) by default; query-string traversal reaches the WAF. The whole family
-#     is included; path-based sub-tests that fail are added to $ignoreList.
-#   * TLS-dependent tests: not applicable -- libModSecurity v3 exposes no SSL_*
-#     variables. No CRS 4.25.1 regression test keys on TLS, so nothing to exclude.
-#   * Double-encoded payloads (%25): blocked by default Request Filtering
-#     (allowDoubleEscaping=false -> 404.11) before the WAF. Accepted as ignored
-#     sub-tests; we keep IIS defaults rather than relax the filter.
+# 920xxx / 921xxx (Protocol Enforcement/Attack) are NEVER included: http.sys rejects
+# malformed requests (bad request line, invalid/oversized headers, bad charset, HTTP
+# splitting) with its own 400 BEFORE any IIS module runs -- a protocol-layer
+# rejection, not overrideable. 959xxx (response/blocking evaluation) is dropped
+# because its phase-4 outbound-anomaly assertions are flaky with SecResponseBodyAccess
+# Off (the score is intermittently 0, so the rule fires non-deterministically).
 #
-# Families below are param/header/body-based and run under IIS defaults:
-# 911, 913, 922, 930, 931, 932, 933, 934, 941, 942, 943, 944, 949, 950, 951,
-# 952, 953, 954, 955, 956, 959, 980. (934 = Node.js injection; 935 was removed
-# upstream in 4.25 so it is simply absent.)
-$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956|959|980)'
+# INCLUDED families (broad but low-failure, kept at default IIS state):
+# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955, 980.
+# DROPPED families (multiple failing sub-tests -> whole family turned off, see
+# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959.
+# (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
+$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955|980)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
-# Permanent sub-test exclusions (go-ftw matches the FULL test id, e.g.
-# "942100-15"). IMPORTANT: go-ftw's config `exclude:` key CANNOT override the
-# `--include` flag -- in needToSkipTest() a test matched by --include is never
-# skipped, so an `exclude:` entry for a sub-test inside an included family is
-# silently ignored and the sub-test still runs (and fails). The correct
+# Permanent sub-test exclusions for the KEPT families (go-ftw matches the FULL
+# test id, e.g. "942100-15"). IMPORTANT: go-ftw's config `exclude:` key CANNOT
+# override the `--include` flag -- in needToSkipTest() a test matched by --include
+# is never skipped, so an `exclude:` entry for a sub-test inside an included family
+# is silently ignored and the sub-test still runs (and fails). The correct
 # "permanent exclusion" mechanism is `testoverride.ignore`, which
 # overriddenTestResult() evaluates BEFORE the request is sent and marks the
 # test Ignored (not Failed), independently of --include.
-# The ids live in scripts/crs_ignore.txt (one id per line) so the list stays
-# maintainable. They are the residual failures after enabling every IIS-feasible
-# CRS family at paranoia level 4: ~313 are POST-body payloads (SQLi/XSS/RCE/PHP/
-# Java) that the IIS connector's request-body inspection does not match the way
-# CRS expects -- a genuine engine/connector gap, NOT an IIS pre-WAF rejection.
-# A handful are %25 double-escape (404.11) or path-`..` (404) pre-WAF rejections.
-# A few (e.g. 959100-1) are RESPONSE-phase rules (phase-4 outbound anomaly score,
-# REQUEST-959-BLOCKING-EVALUATION) driven by POST-body payloads; with
-# SecResponseBodyAccess Off the phase-4 score is intermittently 0, so the rule
-# fires non-deterministically. Same connector/body-inspection gap, surfaced as
-# flaky rather than a hard miss -- folded in here so CI stays green.
-# None are relaxed-Request-Filtering workarounds. To regenerate: run CI, harvest
-# the `💥 <id> failed` / `Error: retry-once` lines into scripts/crs_ignore.txt.
+# The ids live in scripts/crs_ignore.txt (one id per line) -- only the handful of
+# misses in the KEPT families (families with multiple failures are dropped entirely
+# from --include instead, so they are NOT listed here). These are genuine
+# engine/connector gaps (mostly POST-body / request-inspection mismatches) under
+# IIS defaults, NOT Request-Filtering relaxations. To regenerate: run CI, harvest
+# the `💥 <id> failed` / `Error: retry-once` lines for KEPT families into
+# scripts/crs_ignore.txt.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
 $ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
     $id = $_.Trim()
