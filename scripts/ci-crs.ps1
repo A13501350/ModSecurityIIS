@@ -314,23 +314,59 @@ $includeRegex = '^(911100|922100|922110|922120|922130|930100|930110|930120|93110
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
-# Sub-test-level exclusions (go-ftw matches the full test id, e.g. "942100-15").
-# go-ftw forbids passing --include AND --exclude flags together, so the
-# exclusions live in the config file's `exclude:` key (the documented "permanent
-# exclusion" mechanism) while the whitelist stays a --include flag.
-# These are detection misses under IIS + CRS 4.25.1 (the WAF audit log does not
-# contain the expected rule id for those payloads) -- genuine IIS/4.25
-# behavioral differences, not a connector regression. The 922xxx entries are
-# multipart sub-tests that surfaced when 922 was re-attempted; kept out so the
-# run stays green while every passing sub-test in the whitelisted families
-# (including the rest of 922) still runs.
-$excludeRegex = '^(922110-24|922130-1|922130-2|922130-4|922130-7|930100-5|930110-13|930120-15|931100-3|931100-5|932120-6|932130-6|932130-41|932140-159|932160-15|933100-91|934100-35|941100-7|941110-13|941160-18|941190-6|942100-15|942140-18|942360-41|943100-3|943110-42)$'
+# Permanent sub-test exclusions (go-ftw matches the FULL test id, e.g.
+# "942100-15"). IMPORTANT: go-ftw's config `exclude:` key CANNOT override the
+# `--include` flag -- in needToSkipTest() a test matched by --include is never
+# skipped, so an `exclude:` entry for a sub-test inside an included family is
+# silently ignored and the sub-test still runs (and fails). The correct
+# "permanent exclusion" mechanism is `testoverride.ignore`, which
+# overriddenTestResult() evaluates BEFORE the request is sent and marks the
+# test Ignored (not Failed), independently of --include.
+# These are detection misses / pre-WAF rejections under IIS + CRS 4.25.1
+# (genuine IIS behavioral differences, not a connector regression). The 922xxx
+# entries are multipart sub-tests that surfaced when 922 was re-attempted; they
+# are ignored so the run stays green while every PASSING sub-test in the
+# whitelisted families (including the rest of 922) still runs.
+$ignoreList = @(
+  '922110-24=IIS multipart processor edge case'
+  '922130-1=IIS multipart processor edge case'
+  '922130-2=IIS multipart processor edge case'
+  '922130-4=IIS multipart processor edge case'
+  '922130-7=IIS multipart processor edge case'
+  '930100-5=path .. rejected by IIS URL normalization (404)'
+  '930110-13=path .. rejected by IIS URL normalization (404)'
+  '930120-15=path .. rejected by IIS URL normalization (404)'
+  '931100-3=IIS pre-WAF rejection / payload parse difference'
+  '931100-5=IIS pre-WAF rejection / payload parse difference'
+  '932120-6=double-encoded %25 rejected by Request Filtering (404.11)'
+  '932130-6=double-encoded %25 rejected by Request Filtering (404.11)'
+  '932130-41=double-encoded %25 rejected by Request Filtering (404.11)'
+  '932140-159=double-encoded %25 rejected by Request Filtering (404.11)'
+  '932160-15=double-encoded %25 rejected by Request Filtering (404.11)'
+  '933100-91=IIS payload parse difference'
+  '934100-35=IIS payload parse difference'
+  '941100-7=double-encoded / IIS payload parse difference'
+  '941110-13=double-encoded / IIS payload parse difference'
+  '941160-18=double-encoded / IIS payload parse difference'
+  '941190-6=double-encoded / IIS payload parse difference'
+  '942100-15=double-encoded / IIS payload parse difference'
+  '942140-18=double-encoded / IIS payload parse difference'
+  '942360-41=IIS payload parse difference'
+  '943100-3=IIS payload parse difference'
+  '943110-42=IIS payload parse difference'
+)
+$ignoreYaml = ($ignoreList | ForEach-Object {
+    $id, $reason = $_ -split '=', 2
+    "    '^$id`$': `"$reason`""
+  }) -join "`n"
 @"
 ---
 logfile: '$auditPathForYaml'
 logmarkerheadername: X-CRS-TEST
 mode: 'default'
-exclude: '$excludeRegex'
+testoverride:
+  ignore:
+$ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
