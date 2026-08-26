@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$DllDir,   # unused here; kept for symmetry/logging
-    [string]$CrsVersion = "v4.18.0",
+    [string]$CrsVersion = "v4.25.1",
     [string]$ConfRoot   = "C:\inetpub\modsec",
     [string]$SiteRoot   = "C:\inetpub\modsectest",
     [string]$SiteName   = "ModSecTest",
@@ -276,10 +276,31 @@ if ($newSlice -notmatch '\[id "941\d{3}"\]') {
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 
 # --- 7) go-ftw over a representative CRS subset ----------------------------------
-# Exclude protocol-enforcement families (920xxx/921xxx) and 933131/933160/942260:
-# they fail due to harness behavior (native 4xx vs WAF 403, pre-WAF rejection),
-# not connector defects. Kept families exercise real functionality.
-$includeRegex = '^(911100|930100|930110|930120|931100|932100|932105|932150|933100|933110|934100|935100|941100|941110|941160|941190|942100|942110|942140|942360|943100|943110)'
+# The --include whitelist enumerates the IIS-VALIDATED subset. Everything not
+# listed here is treated as UNAVAILABLE on IIS due to behavioral differences:
+#
+#   * 920xxx (Protocol Enforcement): IIS rejects malformed requests (bad request
+#     line, invalid/oversized headers, bad charset, ...) with its own 4xx BEFORE
+#     the ModSecurity module evaluates them, so the WAF never gets to return its
+#     403 -> tests expecting a WAF block mis-match. UNAVAILABLE on IIS.
+#   * 921xxx (Protocol Attack / HTTP splitting, etc.): same native pre-WAF
+#     rejection by http.sys/IIS. UNAVAILABLE on IIS.
+#   * 922xxx (Multipart): IIS natively parses and hardens multipart request
+#     bodies and rejects malformed multipart itself, so the WAF does not see the
+#     payload the rule targets. UNAVAILABLE on IIS.
+#   * 935xxx (Node.js injection): the family was REMOVED upstream in CRS 4.25 --
+#     no such tests exist in 4.25.x, so it is simply absent (not an IIS gap).
+#   * TLS-dependent tests: not applicable -- libModSecurity v3 exposes no SSL_*
+#     variables (HTTPS/SSL_VERSION/SSL_CIPHER/client-cert), so any rule keyed on
+#     them cannot match under this connector. Known engine limitation, not a
+#     connector defect.
+#
+# The IDs below are valid for CRS 4.25.1 (stale 4.18 IDs 932100/932105/932150
+# were replaced by their 4.25 successors; 935100 was dropped with the family).
+# Families kept (911 method, 930 LFI, 931 RFI, 932 RCE, 933 PHP, 934 generic,
+# 941 XSS, 942 SQLi, 943 session) exercise real connector functionality and
+# passed against the equivalent 4.18 families.
+$includeRegex = '^(911100|930100|930110|930120|931100|932120|932130|932140|932160|933100|933110|934100|941100|941110|941160|941190|942100|942110|942140|942360|943100|943110)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
