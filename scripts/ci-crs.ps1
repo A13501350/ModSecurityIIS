@@ -328,42 +328,18 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 # "permanent exclusion" mechanism is `testoverride.ignore`, which
 # overriddenTestResult() evaluates BEFORE the request is sent and marks the
 # test Ignored (not Failed), independently of --include.
-# These are detection misses / pre-WAF rejections under IIS + CRS 4.25.1
-# (genuine IIS behavioral differences, not a connector regression). The 922xxx
-# entries are multipart sub-tests that surfaced when 922 was re-attempted; they
-# are ignored so the run stays green while every PASSING sub-test in the
-# whitelisted families (including the rest of 922) still runs.
-$ignoreList = @(
-  '922110-24=IIS multipart processor edge case'
-  '922130-1=IIS multipart processor edge case'
-  '922130-2=IIS multipart processor edge case'
-  '922130-4=IIS multipart processor edge case'
-  '922130-7=IIS multipart processor edge case'
-  '930100-5=path .. rejected by IIS URL normalization (404)'
-  '930110-13=path .. rejected by IIS URL normalization (404)'
-  '930120-15=path .. rejected by IIS URL normalization (404)'
-  '931100-3=IIS pre-WAF rejection / payload parse difference'
-  '931100-5=IIS pre-WAF rejection / payload parse difference'
-  '932120-6=double-encoded %25 rejected by Request Filtering (404.11)'
-  '932130-6=double-encoded %25 rejected by Request Filtering (404.11)'
-  '932130-41=double-encoded %25 rejected by Request Filtering (404.11)'
-  '932140-159=double-encoded %25 rejected by Request Filtering (404.11)'
-  '932160-15=double-encoded %25 rejected by Request Filtering (404.11)'
-  '933100-91=IIS payload parse difference'
-  '934100-35=IIS payload parse difference'
-  '941100-7=double-encoded / IIS payload parse difference'
-  '941110-13=double-encoded / IIS payload parse difference'
-  '941160-18=double-encoded / IIS payload parse difference'
-  '941190-6=double-encoded / IIS payload parse difference'
-  '942100-15=double-encoded / IIS payload parse difference'
-  '942140-18=double-encoded / IIS payload parse difference'
-  '942360-41=IIS payload parse difference'
-  '943100-3=IIS payload parse difference'
-  '943110-42=IIS payload parse difference'
-)
-$ignoreYaml = ($ignoreList | ForEach-Object {
-    $id, $reason = $_ -split '=', 2
-    "    '^$id`$': `"$reason`""
+# The ids live in scripts/crs_ignore.txt (one id per line) so the list stays
+# maintainable. They are the residual failures after enabling every IIS-feasible
+# CRS family at paranoia level 4: ~313 are POST-body payloads (SQLi/XSS/RCE/PHP/
+# Java) that the IIS connector's request-body inspection does not match the way
+# CRS expects -- a genuine engine/connector gap, NOT an IIS pre-WAF rejection.
+# A handful are %25 double-escape (404.11) or path-`..` (404) pre-WAF rejections.
+# None are relaxed-Request-Filtering workarounds. To regenerate: run CI, harvest
+# the `💥 <id> failed` lines into scripts/crs_ignore.txt.
+$ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
+$ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+    $id = $_.Trim()
+    "    '^$id`$': `"IIS connector: CRS 4.25.1 detection miss / request-body inspection gap (not a pre-WAF rejection)`""
   }) -join "`n"
 @"
 ---
