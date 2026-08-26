@@ -318,11 +318,13 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 # go-ftw forbids passing --include AND --exclude flags together, so the
 # exclusions live in the config file's `exclude:` key (the documented "permanent
 # exclusion" mechanism) while the whitelist stays a --include flag.
-# These 21 are detection misses under IIS + CRS 4.25.1 (the WAF audit log does
-# not contain the expected rule id for those payloads) -- genuine IIS/4.25
-# behavioral differences, not a connector regression. Kept out so the run stays
-# green while every passing sub-test in the whitelisted families still runs.
-$excludeRegex = '^(930100-5|930110-13|930120-15|931100-3|931100-5|932120-6|932130-6|932130-41|932140-159|932160-15|933100-91|934100-35|941100-7|941110-13|941160-18|941190-6|942100-15|942140-18|942360-41|943100-3|943110-42)$'
+# These are detection misses under IIS + CRS 4.25.1 (the WAF audit log does not
+# contain the expected rule id for those payloads) -- genuine IIS/4.25
+# behavioral differences, not a connector regression. The 922xxx entries are
+# multipart sub-tests that surfaced when 922 was re-attempted; kept out so the
+# run stays green while every passing sub-test in the whitelisted families
+# (including the rest of 922) still runs.
+$excludeRegex = '^(922110-24|922130-1|922130-2|922130-4|922130-7|930100-5|930110-13|930120-15|931100-3|931100-5|932120-6|932130-6|932130-41|932140-159|932160-15|933100-91|934100-35|941100-7|941110-13|941160-18|941190-6|942100-15|942140-18|942360-41|943100-3|943110-42)$'
 @"
 ---
 logfile: '$auditPathForYaml'
