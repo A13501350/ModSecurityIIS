@@ -312,11 +312,13 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # Off (the score is intermittently 0, so the rule fires non-deterministically).
 #
 # INCLUDED families (broad but low-failure, kept at default IIS state):
-# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955, 980.
+# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955.
 # DROPPED families (multiple failing sub-tests -> whole family turned off, see
-# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959.
+# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959, 980.
+# (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
+# at PL4 under IIS defaults -- a request-inspection gap, not a pre-WAF rejection.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
-$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955|980)'
+$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
