@@ -341,6 +341,7 @@ $ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | For
     $id = $_.Trim()
     "    '^$id`$': `"IIS connector: CRS 4.25.1 detection miss / request-body inspection gap (not a pre-WAF rejection)`""
   }) -join "`n"
+Write-Host "[7/8] Loaded $(@($ignoreYaml -split "`n").Count) ignored CRS sub-tests from crs_ignore.txt"
 @"
 ---
 logfile: '$auditPathForYaml'
