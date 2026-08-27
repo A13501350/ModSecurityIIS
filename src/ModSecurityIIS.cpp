@@ -717,9 +717,16 @@ CMyHttpModule::OnBeginRequest(
                     inspected += take;
                 }
             }
-            if (read == 0 || read < sizeof(buf))
+            // A zero-length read is the reliable "entity body drained" signal.
+            // Do NOT break on a short (read < sizeof(buf)) read: synchronous
+            // ReadEntityBody normally fills the buffer until EOF, but if it ever
+            // returns a short read mid-body the loop must keep going, otherwise
+            // the unread remainder would never be InsertEntityBody'd and the
+            // backend would receive a truncated request. A short final read is
+            // simply followed by one harmless extra call that returns 0.
+            if (read == 0)
             {
-                break;              // drained (or clean EOF signaled via hrr)
+                break;
             }
             if (FAILED(hrr) && hrr != HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
             {
