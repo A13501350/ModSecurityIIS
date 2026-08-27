@@ -717,14 +717,18 @@ CMyHttpModule::OnBeginRequest(
                     inspected += take;
                 }
             }
-            // A zero-length read is the reliable "entity body drained" signal.
-            // Do NOT break on a short (read < sizeof(buf)) read: synchronous
-            // ReadEntityBody normally fills the buffer until EOF, but if it ever
-            // returns a short read mid-body the loop must keep going, otherwise
-            // the unread remainder would never be InsertEntityBody'd and the
-            // backend would receive a truncated request. A short final read is
-            // simply followed by one harmless extra call that returns 0.
-            if (read == 0)
+            // End of entity body: a zero-length read, or a short read under the
+            // synchronous ReadEntityBody contract (it fills the buffer up to EOF,
+            // so a short read only occurs at the true end). Breaking on the short
+            // read is required: looping to call ReadEntityBody again after a short
+            // read was observed to HANG in the CI IIS smoke environment (the
+            // extra call never returns), so we must not rely on a following
+            // zero-length read. Every chunk's bytes are InsertEntityBody'd and
+            // appendRequestBody'd above before this check, so nothing already read
+            // is ever dropped. The only residual risk is a hypothetical mid-body
+            // short read (not seen with sync ReadEntityBody); that is accepted
+            // over a hard hang.
+            if (read == 0 || read < sizeof(buf))
             {
                 break;
             }
