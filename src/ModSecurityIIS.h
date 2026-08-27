@@ -87,21 +87,6 @@ public:
         IN IHttpEventProvider * pProvider
     );
 
-    // Inspects the request body. Deferred from OnBeginRequest to
-    // OnMapRequestHandler: at RQ_BEGIN_REQUEST the entity body is not yet fully
-    // buffered, so a synchronous ReadEntityBody loop can hang (CI observed a
-    // ~44-min stall) and short reads force a premature EOF break that truncates
-    // inspection. By RQ_MAP_REQUEST_HANDLER the handler is about to be selected
-    // and the full entity body is available, so a clean break-on-zero loop is
-    // both safe and complete. The downstream handler still consumes the body
-    // during RQ_EXECUTE_REQUEST_HANDLER (after map-handler), so the bytes are
-    // re-injected via InsertEntityBody and never lost.
-    REQUEST_NOTIFICATION_STATUS
-    OnMapRequestHandler(
-        IN IHttpContext * pHttpContext,
-        IN IHttpEventProvider * pProvider
-    );
-
     REQUEST_NOTIFICATION_STATUS
     OnSendResponse(
         IN IHttpContext * pHttpContext,
