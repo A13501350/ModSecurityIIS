@@ -128,22 +128,25 @@ static int SockAddrToPort(PSOCKADDR pAddr)
 // MODSEC_IIS_MAX_INSPECT_BODY_BYTES environment variable (decimal bytes).
 static size_t GetMaxInspectBodyBytes()
 {
-    static size_t cached = 0;
-    static LONG   init   = 0;
-    if (InterlockedCompareExchange(&init, 1, 0) == 0)
+    // Inspected request/response body is buffered in the transaction's memory.
+    // Bound it to bound memory use (SecRequestBodyLimit only applies after the
+    // whole body is appended). Override via MODSEC_IIS_MAX_INSPECT_BODY_BYTES
+    // (decimal bytes). Default 128 MB. The function-local static is initialized
+    // exactly once, thread-safely (C++11 "magic statics", same InitOnce guard
+    // std::call_once uses) -- no data race, no hand-rolled spin/atomic.
+    static const size_t cached = []() -> size_t
     {
-        cached = 128 * 1024 * 1024;
+        size_t v = 128 * 1024 * 1024;
         char buf[32] = { 0 };
         DWORD n = GetEnvironmentVariableA("MODSEC_IIS_MAX_INSPECT_BODY_BYTES",
                                           buf, (DWORD)sizeof(buf));
         if (n > 0 && n < (DWORD)sizeof(buf))
         {
-            unsigned long long v = _strtoui64(buf, NULL, 10);
-            if (v > 0) cached = (size_t)v;
+            unsigned long long x = _strtoui64(buf, NULL, 10);
+            if (x > 0) v = (size_t)x;
         }
-        InterlockedExchange(&init, 2);
-    }
-    while (init != 2) Sleep(0);
+        return v;
+    }();
     return cached;
 }
 
@@ -155,20 +158,15 @@ static size_t GetMaxInspectBodyBytes()
 // unconfigured on some sites.
 static bool ConfigFailClosed()
 {
-    static LONG   init = 0;
-    static LONG   value = 1;   // default: fail closed
-    if (InterlockedCompareExchange(&init, 1, 0) == 0)
+    // Default fail-closed; MODSEC_IIS_FAIL_CLOSED=0 opt-out. Function-local
+    // static init is thread-safe (C++11 magic statics): no data race, no spin.
+    static const bool failClosed = []() -> bool
     {
         char buf[8] = { 0 };
         DWORD n = GetEnvironmentVariableA("MODSEC_IIS_FAIL_CLOSED", buf, (DWORD)sizeof(buf));
-        if (n > 0 && n < (DWORD)sizeof(buf) && (buf[0] == '0'))
-        {
-            value = 0;
-        }
-        InterlockedExchange(&init, 2);
-    }
-    while (init != 2) Sleep(0);
-    return value != 0;
+        return !(n > 0 && n < (DWORD)sizeof(buf) && buf[0] == '0');
+    }();
+    return failClosed;
 }
 
 static std::string VerbToString(HTTP_REQUEST* req)
