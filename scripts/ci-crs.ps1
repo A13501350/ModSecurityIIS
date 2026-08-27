@@ -312,13 +312,20 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # Off (the score is intermittently 0, so the rule fires non-deterministically).
 #
 # INCLUDED families (broad but low-failure, kept at default IIS state):
-# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955.
+# 911, 913, 922, 930, 931, 932, 933, 934, 941, 942, 943, 944, 949, 950, 951,
+# 952, 953, 954, 955, 956.
+# The request-body families (930 LFI, 932 RCE, 933 PHP, 934 Node, 941 XSS, 942
+# SQLi, 944 Java, 951 Java/Node, 956 PHP version) were re-enabled after the
+# connector moved request-body inspection to OnMapRequestHandler (where the full
+# entity body is buffered, so appendRequestBody sees the complete payload and the
+# body rules match the way CRS expects). They are measured fresh here; any that
+# still show MULTIPLE failing sub-tests are turned off again per family-drop policy.
 # DROPPED families (multiple failing sub-tests -> whole family turned off, see
-# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959, 980.
+# policy note below): 959, 980.
 # (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
 # at PL4 under IIS defaults -- a request-inspection gap, not a pre-WAF rejection.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
-$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
+$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
