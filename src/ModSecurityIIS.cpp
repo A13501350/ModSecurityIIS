@@ -683,11 +683,90 @@ CMyHttpModule::OnBeginRequest(
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
+    // Phase 1 (request headers) is complete here. The request body is inspected
+    // later, in OnMapRequestHandler, where the full entity body is available.
+    // (See the comment on OnMapRequestHandler in ModSecurityIIS.h.)
+
+    } while (0);
+
+    }
+    catch (const std::exception& e)
+    {
+        // Fail-closed: finish the request (IIS emits 500) rather than letting
+        // an exception cross the module boundary and kill w3wp.
+        ReportException("OnBeginRequest", e.what());
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    catch (...)
+    {
+        ReportException("OnBeginRequest", NULL);
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+
+    if (FAILED(hr))
+    {
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    return RQ_NOTIFICATION_CONTINUE;
+}
+
+
+// ---------------------------------------------------------------------------
+// OnMapRequestHandler
+// ---------------------------------------------------------------------------
+
+REQUEST_NOTIFICATION_STATUS
+CMyHttpModule::OnMapRequestHandler(
+    IN IHttpContext * pHttpContext,
+    IN IHttpEventProvider * pProvider
+)
+{
+    HRESULT hr = S_OK;
+
+    UNREFERENCED_PARAMETER(pProvider);
+
+    try
+    {
+    do
+    {
+    if (pHttpContext == NULL)
+    {
+        hr = E_UNEXPECTED;
+        break;
+    }
+
+    // The transaction was created and stashed in OnBeginRequest. If it is
+    // missing (module disabled, config failure, or a re-entrant context),
+    // there is nothing to inspect -- pass through.
+    IHttpModuleContextContainer* pCtxContainer =
+        pHttpContext->GetModuleContextContainer();
+    if (pCtxContainer == NULL)
+    {
+        break;
+    }
+    REQUEST_STORED_CONTEXT* rsc =
+        (REQUEST_STORED_CONTEXT*)pCtxContainer->GetModuleContext(g_pModuleContext);
+    if (rsc == NULL || rsc->m_pTx == NULL)
+    {
+        break;
+    }
+    modsecurity::Transaction* tx = rsc->m_pTx;
+
+    IHttpRequest* pRequest = pHttpContext->GetRequest();
+    if (pRequest == NULL)
+    {
+        hr = E_UNEXPECTED;
+        break;
+    }
+
     // --- request body ---
-    // Do NOT gate the loop on GetRemainingEntityBytes(): at RQ_BEGIN_REQUEST
-    // it can legitimately report 0 while chunks are still in flight, which
-    // silently skips inspection. Drive the loop off ReadEntityBody results;
-    // ERROR_HANDLE_EOF marks the clean end of the entity.
+    // At RQ_MAP_REQUEST_HANDLER the full entity body is available (the handler
+    // that will consume it is selected after this notification). A zero-length
+    // read marks the clean EOF; the ERR_HANDLE_EOF HRESULT is also a valid end.
+    // Unlike at RQ_BEGIN_REQUEST, looping after a short read is safe here -- the
+    // body is already buffered, so the next ReadEntityBody returns promptly
+    // rather than hanging. Do NOT gate on GetRemainingEntityBytes(): it can
+    // report 0 while chunks are still in flight and silently skip inspection.
     {
         char  buf[65536];
         DWORD read = 0;
@@ -717,18 +796,11 @@ CMyHttpModule::OnBeginRequest(
                     inspected += take;
                 }
             }
-            // End of entity body: a zero-length read, or a short read under the
-            // synchronous ReadEntityBody contract (it fills the buffer up to EOF,
-            // so a short read only occurs at the true end). Breaking on the short
-            // read is required: looping to call ReadEntityBody again after a short
-            // read was observed to HANG in the CI IIS smoke environment (the
-            // extra call never returns), so we must not rely on a following
-            // zero-length read. Every chunk's bytes are InsertEntityBody'd and
-            // appendRequestBody'd above before this check, so nothing already read
-            // is ever dropped. The only residual risk is a hypothetical mid-body
-            // short read (not seen with sync ReadEntityBody); that is accepted
-            // over a hard hang.
-            if (read == 0 || read < sizeof(buf))
+            // Clean end of entity body: a zero-length read, or the EOF HRESULT.
+            // (At map-handler we can wait for the true zero read, so no
+            // short-read break is needed -- that avoids the mid-body truncation
+            // risk seen with the earlier BeginRequest loop.)
+            if (read == 0)
             {
                 break;
             }
@@ -745,18 +817,17 @@ CMyHttpModule::OnBeginRequest(
     }
 
     } while (0);
-
     }
     catch (const std::exception& e)
     {
         // Fail-closed: finish the request (IIS emits 500) rather than letting
         // an exception cross the module boundary and kill w3wp.
-        ReportException("OnBeginRequest", e.what());
+        ReportException("OnMapRequestHandler", e.what());
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     catch (...)
     {
-        ReportException("OnBeginRequest", NULL);
+        ReportException("OnMapRequestHandler", NULL);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
@@ -1032,7 +1103,7 @@ RegisterModule(
 
     hr = pModuleInfo->SetRequestNotifications(
             pFactory,
-            RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE,
+            RQ_BEGIN_REQUEST | RQ_MAP_REQUEST_HANDLER | RQ_SEND_RESPONSE,
             RQ_END_REQUEST);
     if (FAILED(hr))
     {
@@ -1040,6 +1111,11 @@ RegisterModule(
     }
 
     hr = pModuleInfo->SetPriorityForRequestNotification(RQ_BEGIN_REQUEST, PRIORITY_ALIAS_FIRST);
+    if (FAILED(hr))
+    {
+        goto Finished;
+    }
+    hr = pModuleInfo->SetPriorityForRequestNotification(RQ_MAP_REQUEST_HANDLER, PRIORITY_ALIAS_FIRST);
     if (FAILED(hr))
     {
         goto Finished;
