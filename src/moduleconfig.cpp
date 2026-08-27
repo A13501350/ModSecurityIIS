@@ -5,6 +5,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 
+#include <new>       // std::nothrow
+
 #include "httpserv.h"
 
 #include "ModSecurityIIS.h"
@@ -27,7 +29,7 @@ MODSECURITY_STORED_CONTEXT::Initialize(
 
     pAdminManager = g_pHttpServer->GetAdminManager();
 
-    if ( ( FAILED( hr ) ) || ( pAdminManager == NULL ) )
+    if ( pAdminManager == NULL )
     {
         hr = E_UNEXPECTED;
         goto Failure;
@@ -100,6 +102,11 @@ MODSECURITY_STORED_CONTEXT::Initialize(
     }
 
 Failure:
+    if ( pSessionTrackingElement != NULL )
+    {
+        pSessionTrackingElement->Release();
+        pSessionTrackingElement = NULL;
+    }
     SysFreeString( bstrUrlPath );
     return hr;
 }
@@ -178,7 +185,7 @@ MODSECURITY_STORED_CONTEXT::GetStringPropertyValue(
     if ( ( *pException ) != NULL ) goto Failure;
 
     dwLength = SysStringLen( vPropertyValue.bstrVal );
-    *ppszValue = new WCHAR[ dwLength + 1 ];
+    *ppszValue = new (std::nothrow) WCHAR[ dwLength + 1 ];
     if ( ( *ppszValue ) == NULL ) { hr = E_OUTOFMEMORY; goto Failure; }
 
     wcsncpy( *ppszValue, vPropertyValue.bstrVal, dwLength );
@@ -234,7 +241,7 @@ MODSECURITY_STORED_CONTEXT::GetConfig(
 
     // First request (or first after a config change -- IIS discards the
     // stored context when a change notification arrives for this path).
-    pModuleConfig = new MODSECURITY_STORED_CONTEXT();
+    pModuleConfig = new (std::nothrow) MODSECURITY_STORED_CONTEXT();
     if ( pModuleConfig == NULL )
     {
         return E_OUTOFMEMORY;
@@ -243,6 +250,11 @@ MODSECURITY_STORED_CONTEXT::GetConfig(
     hr = pModuleConfig->Initialize( pContext, &pException );
     if ( FAILED( hr )  || pException != NULL )
     {
+        if ( pException != NULL )
+        {
+            pException->Release();
+            pException = NULL;
+        }
         pModuleConfig->CleanupStoredContext();
         pModuleConfig = NULL;
         hr = E_UNEXPECTED;

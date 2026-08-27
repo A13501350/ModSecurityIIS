@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <memory>
 #include <windows.h>   // WORD (used by WriteEventViewerLog)
 
 // libModSecurity v3 public headers (submodule: libmodsecurity/headers/).
@@ -17,10 +18,16 @@ namespace iis {
 modsecurity::ModSecurity& engine();
 
 // Loads (and caches, keyed by config file path) a RulesSet. Returns nullptr on
-// parse error and fills *err with the parser message. The returned object is
+// a parse error that cannot be recovered from (file missing/unreadable) and
+// fills *err with the parser message. The cache is invalidated when the rules
+// file's last-write time changes, so editing rules takes effect without
+// recycling the application pool; on a reload parse failure the previous
+// good config is kept so requests stay protected. The returned object is
 // read-only after load and is safe to share across transactions/threads, so
-// caching is both correct and desirable.
-modsecurity::RulesSet* getRules(const std::string& configFile, std::string* err);
+// caching is both correct and desirable. The caller should hold the returned
+// shared_ptr for as long as the Transaction using the rules is alive.
+std::shared_ptr<modsecurity::RulesSet> getRules(const std::string& configFile,
+                                                std::string* err);
 
 // Write a message to the Windows Event Viewer (source "ModSecurity").
 void WriteEventViewerLog(const char* message, WORD category);

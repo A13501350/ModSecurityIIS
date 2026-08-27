@@ -22,6 +22,7 @@
 #include <strsafe.h>
 #include <string>
 #include <vector>
+#include <memory>    // std::shared_ptr
 #include <new>       // std::nothrow
 #include <exception> // std::exception
 
@@ -119,13 +120,64 @@ static int SockAddrToPort(PSOCKADDR pAddr)
     return 0;
 }
 
+// Upper bound (bytes) of request/response body we allow the engine to buffer
+// for inspection. Without this the full body is copied into the transaction's
+// memory (bounded only by IIS maxAllowedContentLength), so a large upload can
+// exhaust worker-process memory. SecRequestBodyLimit is only checked AFTER the
+// whole body has been appended, hence the explicit cap here. Override with the
+// MODSEC_IIS_MAX_INSPECT_BODY_BYTES environment variable (decimal bytes).
+static size_t GetMaxInspectBodyBytes()
+{
+    static size_t cached = 0;
+    static LONG   init   = 0;
+    if (InterlockedCompareExchange(&init, 1, 0) == 0)
+    {
+        cached = 128 * 1024 * 1024;
+        char buf[32] = { 0 };
+        DWORD n = GetEnvironmentVariableA("MODSEC_IIS_MAX_INSPECT_BODY_BYTES",
+                                          buf, (DWORD)sizeof(buf));
+        if (n > 0 && n < (DWORD)sizeof(buf))
+        {
+            unsigned long long v = _strtoui64(buf, NULL, 10);
+            if (v > 0) cached = (size_t)v;
+        }
+        InterlockedExchange(&init, 2);
+    }
+    while (init != 2) Sleep(0);
+    return cached;
+}
+
+// When the module is registered but a request's configuration cannot be read,
+// a WAF must not silently serve the request unprotected (that is a rule bypass).
+// By default we therefore fail-closed (reject). Set the environment variable
+// MODSEC_IIS_FAIL_CLOSED=0 to revert to the old fail-open behavior for
+// deployments where the module is globally registered but intentionally
+// unconfigured on some sites.
+static bool ConfigFailClosed()
+{
+    static LONG   init = 0;
+    static LONG   value = 1;   // default: fail closed
+    if (InterlockedCompareExchange(&init, 1, 0) == 0)
+    {
+        char buf[8] = { 0 };
+        DWORD n = GetEnvironmentVariableA("MODSEC_IIS_FAIL_CLOSED", buf, (DWORD)sizeof(buf));
+        if (n > 0 && n < (DWORD)sizeof(buf) && (buf[0] == '0'))
+        {
+            value = 0;
+        }
+        InterlockedExchange(&init, 2);
+    }
+    while (init != 2) Sleep(0);
+    return value != 0;
+}
+
 static std::string VerbToString(HTTP_REQUEST* req)
 {
     switch (req->Verb)
     {
     case HttpVerbOPTIONS: return "OPTIONS";
-    case HttpVerbGET:
-    case HttpVerbHEAD:    return "GET";
+    case HttpVerbGET:     return "GET";
+    case HttpVerbHEAD:    return "HEAD";
     case HttpVerbPOST:    return "POST";
     case HttpVerbPUT:     return "PUT";
     case HttpVerbDELETE:  return "DELETE";
@@ -146,10 +198,18 @@ static std::string VerbToString(HTTP_REQUEST* req)
         // bytes in pUnknownVerb. Report the real method so rules matching
         // REQUEST_METHOD (e.g. @streq PATCH) keep working; fall back to
         // "INVALID" only when the raw bytes are unavailable.
+        //
+        // NOTE: UnknownVerbLength is the verb length in BYTES, NOT including
+        // any NUL terminator (see http.h). pUnknownVerb is therefore not
+        // guaranteed to be NUL-terminated, so we pass exactly that length and
+        // never read one byte past it. The previous "+1" caused an out-of-bounds
+        // read and, when that trailing byte was the space after the verb on the
+        // request line, silently turned e.g. "PATCH" into "PATCH ", breaking
+        // rules such as @streq PATCH.
         if (req->Verb == HttpVerbUnknown && req->pUnknownVerb != NULL)
         {
             std::string verb = AToUtf8(req->pUnknownVerb,
-                                       (int)req->UnknownVerbLength + 1);
+                                       (int)req->UnknownVerbLength);
             if (!verb.empty())
             {
                 return verb;
@@ -308,8 +368,11 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 
     bool disruptive = (it.disruptive != 0);
     int  status     = it.status;
-    const char* url = it.url;
 
+    // Copy the redirect URL out of the intervention BEFORE freeing it:
+    // intervention::free() (intervention.h:59-62) calls free() on it.url, so
+    // keeping a raw pointer into the struct would be a use-after-free.
+    std::string redirectUrl = (it.url != nullptr) ? std::string(it.url) : std::string();
     modsecurity::intervention::free(&it);   // release url/log owned by libmodsecurity
 
     if (!disruptive)
@@ -321,12 +384,12 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     // supplied one; otherwise honor the explicit status (defaulting to 403).
     IHttpResponse* pResponse = pHttpContext->GetResponse();
     pResponse->Clear();
-    if (url != nullptr && url[0] != '\0')
+    if (!redirectUrl.empty())
     {
         // IHttpResponse::Redirect always answers 302; keep the engine's
         // redirect flavor (301/303/307/308) by overriding the status line
         // afterwards -- the Location header set by Redirect() is kept.
-        pResponse->Redirect(url, TRUE);
+        pResponse->Redirect(redirectUrl.c_str(), TRUE);
         if (status >= 301 && status <= 308 && status != 302)
         {
             pResponse->SetStatus((USHORT)status, StandardReason(status));
@@ -424,8 +487,25 @@ CMyHttpModule::OnBeginRequest(
     hr = MODSECURITY_STORED_CONTEXT::GetConfig(pHttpContext, &pConfig);
     if (FAILED(hr))
     {
-        hr = S_OK;          // config not present -> simply don't secure
-        break;
+        // The configuration could not be read. A WAF must fail-closed: serving
+        // the request unprotected (the previous behavior) silently bypasses all
+        // rules. Reject the request and surface the failure in the Event Viewer.
+        // Set MODSEC_IIS_FAIL_CLOSED=0 to opt back into fail-open.
+        WriteEventViewerLog(
+            "ModSecurityIIS: failed to read module configuration; "
+            "failing closed (request rejected).",
+            EVENTLOG_ERROR_TYPE);
+        if (!ConfigFailClosed())
+        {
+            hr = S_OK;          // operator opted out -> pass through
+            break;
+        }
+        IHttpResponse* pResponse = pHttpContext->GetResponse();
+        if (pResponse != NULL)
+        {
+            pResponse->SetStatus(500, "Internal Server Error");
+        }
+        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     if (pConfig->GetIsEnabled() == false)
@@ -441,7 +521,7 @@ CMyHttpModule::OnBeginRequest(
 
     std::string configFile = WToUtf8(wpath, (int)wcslen(wpath) * (int)sizeof(WCHAR));
     std::string rulesErr;
-    modsecurity::RulesSet* rules = iis::getRules(configFile, &rulesErr);
+    std::shared_ptr<modsecurity::RulesSet> rules = iis::getRules(configFile, &rulesErr);
     if (rules == nullptr)
     {
         WriteEventViewerLog(rulesErr.c_str(), EVENTLOG_ERROR_TYPE);
@@ -451,9 +531,11 @@ CMyHttpModule::OnBeginRequest(
     // v3 API: Transaction(ModSecurity*, RulesSet*, void*) where the 3rd arg is
     // the per-transaction log-callback data (passed back to ServerLogCallback).
     // nothrow keeps the null check meaningful; internal engine allocations are
-    // covered by the try/catch around this handler.
+    // covered by the try/catch around this handler. We keep a shared_ptr to the
+    // RulesSet on the request context so the cached rules object outlives this
+    // transaction even if connector.cpp reloads the cache mid-flight.
     modsecurity::Transaction* tx =
-        new (std::nothrow) modsecurity::Transaction(&iis::engine(), rules, this);
+        new (std::nothrow) modsecurity::Transaction(&iis::engine(), rules.get(), this);
     if (tx == nullptr)
     {
         hr = E_OUTOFMEMORY;
@@ -468,8 +550,8 @@ CMyHttpModule::OnBeginRequest(
         break;
     }
     rsc->m_pTx          = tx;
+    rsc->m_pRules       = rules;
     rsc->m_pHttpContext = pHttpContext;
-    rsc->m_pProvider    = pProvider;
     IHttpModuleContextContainer* pCtxContainer =
         pHttpContext->GetModuleContextContainer();
     HRESULT shr = pCtxContainer->SetModuleContext(rsc, g_pModuleContext);
@@ -611,17 +693,31 @@ CMyHttpModule::OnBeginRequest(
     {
         char  buf[65536];
         DWORD read = 0;
+        size_t inspected = 0;
+        const size_t maxInspect = GetMaxInspectBodyBytes();
         for (;;)
         {
             HRESULT hrr = pRequest->ReadEntityBody(buf, sizeof(buf), FALSE, &read, NULL);
             if (read > 0)
             {
-                tx->appendRequestBody((const unsigned char*)buf, (size_t)read);
                 // ReadEntityBody consumes the entity-body pipe, so the downstream
                 // handler (ASP.NET/PHP/ISAPI) would otherwise receive an empty
                 // body. Re-insert the bytes so the application still sees the
                 // original request body.
                 pRequest->InsertEntityBody(buf, read);
+                // Bound the memory the engine buffers for inspection; the full
+                // body is still forwarded to the backend regardless (IIS enforces
+                // its own maxAllowedContentLength on the real request).
+                if (inspected < maxInspect)
+                {
+                    size_t take = (size_t)read;
+                    if (inspected + take > maxInspect)
+                    {
+                        take = maxInspect - inspected;
+                    }
+                    tx->appendRequestBody((const unsigned char*)buf, take);
+                    inspected += take;
+                }
             }
             if (read == 0 || read < sizeof(buf))
             {
@@ -781,24 +877,49 @@ CMyHttpModule::OnSendResponse(
     // every flush would re-run phase-4 rules over the whole growing body
     // (duplicate alerts + O(n^2)). The single processResponseBody() call is
     // made in OnPostEndRequest once the response is complete.
+    {
+    size_t respInspected = 0;
+    const size_t maxInspect = GetMaxInspectBodyBytes();
     for (ULONG c = 0; c < pRaw->EntityChunkCount; c++)
     {
         HTTP_DATA_CHUNK* chunk = &pRaw->pEntityChunks[c];
         if (chunk->DataChunkType == HttpDataChunkFromMemory)
         {
-            tx->appendResponseBody((const unsigned char*)chunk->FromMemory.pBuffer,
-                                   (size_t)chunk->FromMemory.BufferLength);
+            size_t len = (size_t)chunk->FromMemory.BufferLength;
+            if (respInspected < maxInspect && len > 0)
+            {
+                size_t take = (respInspected + len > maxInspect)
+                                  ? (maxInspect - respInspected) : len;
+                tx->appendResponseBody((const unsigned char*)chunk->FromMemory.pBuffer, take);
+                respInspected += take;
+            }
         }
         else if (chunk->DataChunkType == HttpDataChunkFromFileHandle)
         {
-            AppendResponseFileChunk(tx,
-                                    chunk->FromFileHandle.FileHandle,
-                                    (ULONGLONG)chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart,
-                                    (ULONGLONG)chunk->FromFileHandle.ByteRange.Length.QuadPart);
+            ULONGLONG start = (ULONGLONG)chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart;
+            ULONGLONG length = (ULONGLONG)chunk->FromFileHandle.ByteRange.Length.QuadPart;
+            if (length == (ULONGLONG)HTTP_BYTE_RANGE_TO_EOF)
+            {
+                // Unknown total size; only inspect up to the remaining cap.
+                length = maxInspect - respInspected;
+            }
+            else if (respInspected + length > maxInspect)
+            {
+                length = maxInspect - respInspected;
+            }
+            if (length > 0)
+            {
+                AppendResponseFileChunk(tx,
+                                        chunk->FromFileHandle.FileHandle,
+                                        start,
+                                        length);
+                respInspected += (size_t)length;
+            }
         }
         // HttpDataChunkFromFragmentCache: IIS exposes no API for a module to
         // read another module's cached fragment bytes, so such content cannot
         // be inspected here; it is skipped deliberately.
+    }
     }
 
     } while (0);
@@ -910,7 +1031,15 @@ RegisterModule(
     }
 
     hr = pModuleInfo->SetPriorityForRequestNotification(RQ_BEGIN_REQUEST, PRIORITY_ALIAS_FIRST);
+    if (FAILED(hr))
+    {
+        goto Finished;
+    }
     hr = pModuleInfo->SetPriorityForRequestNotification(RQ_SEND_RESPONSE, PRIORITY_ALIAS_LAST);
+    if (FAILED(hr))
+    {
+        goto Finished;
+    }
 
     pFactory = NULL;
     }
@@ -925,6 +1054,11 @@ RegisterModule(
         hr = E_UNEXPECTED;
     }
 
-Finished:
+ Finished:
+    if (pFactory != NULL)
+    {
+        delete pFactory;
+        pFactory = NULL;
+    }
     return hr;
 }

@@ -4,11 +4,13 @@
 #include "connector.h"        // brings in modsecurity::Transaction + iis:: namespace
 #include "moduleconfig.h"
 
+#include <memory>
+
 class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 {
  public:
     REQUEST_STORED_CONTEXT()
-        : m_pTx(nullptr), m_pHttpContext(nullptr), m_pProvider(nullptr),
+        : m_pTx(nullptr), m_pHttpContext(nullptr),
           m_ResponseHeadersFed(false)
     { }
 
@@ -50,11 +52,18 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
             }
             m_pTx = nullptr;
         }
+        // Release the rules reference only after the transaction that used it
+        // is gone, so the cached RulesSet can never be freed while in use.
+        m_pRules.reset();
     }
 
-    modsecurity::Transaction* m_pTx;
-    IHttpContext*             m_pHttpContext;
-    IHttpEventProvider*       m_pProvider;
+    modsecurity::Transaction*           m_pTx;
+    IHttpContext*                       m_pHttpContext;
+    // Keeps the RulesSet alive for the lifetime of this transaction. The engine
+    // caches RulesSet objects by config-file path; holding a shared_ptr here
+    // lets the cache safely reload (and free the old copy) without dangling the
+    // raw pointer the Transaction was constructed with.
+    std::shared_ptr<modsecurity::RulesSet> m_pRules;
     // RQ_SEND_RESPONSE can fire several times per request (every explicit
     // handler Flush/SendResponse). Response headers must be fed to the
     // transaction exactly once; entity chunks are delivered incrementally,
