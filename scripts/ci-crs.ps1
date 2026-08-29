@@ -338,33 +338,38 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # at PL4 under IIS defaults -- same request-execution class of failure.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
 #
-# MEASUREMENT of the phase:1 paranoia-ordering fix (this branch): all previously
-# dropped families were re-enabled. RESULT: the five phase:1 PL2+ rules that were
-# silently skipped (942101/942152/942321/942420/942421) now FIRE (audit hits
-# 10/9/8/12/37 vs 0 before), and total "Access denied with code 403" rose from
-# 3427 to 4094. BUT the 9 dropped families STILL fail in bulk -- and still as
-# "failed to run" (transport), not as logic mismatches. So the phase:1 fix is a
-# real detection-correctness win, yet it does not rescue those families; they
-# remain dropped per family-drop policy. Reverted to the 11-family green set:
-$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
+# MEASUREMENT of the phase:1 paranoia-ordering fix (run 33257792265): all
+# families were enabled. RESULT: the five phase:1 PL2+ rules that were silently
+# skipped (942101/942152/942321/942420/942421) now FIRE (audit hits 10/9/8/12/37
+# vs 0 before), and total "Access denied with code 403" rose 3427 -> 4094.
+#
+# The 9 request-body families (930/932/933/934/941/942/944/951/956) STILL fail in
+# bulk -- but every one of the 288 failing sub-tests is a go-ftw "failed to run"
+# (request transport/connector handling), NOT a rule-logic mismatch. So instead
+# of dropping whole families (which throws away the passing sub-tests too), we now
+# run ALL families and hardcode-exclude exactly those 288 known-bad sub-tests via
+# scripts/crs_ignore.txt (the testoverride.ignore mechanism, see below). That
+# maximizes coverage: every family's passing sub-tests are still exercised.
+$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
-# Permanent sub-test exclusions for the KEPT families (go-ftw matches the FULL
-# test id, e.g. "942100-15"). IMPORTANT: go-ftw's config `exclude:` key CANNOT
-# override the `--include` flag -- in needToSkipTest() a test matched by --include
-# is never skipped, so an `exclude:` entry for a sub-test inside an included family
-# is silently ignored and the sub-test still runs (and fails). The correct
+# Hardcoded per-sub-test exclusions. go-ftw matches the FULL test id, e.g.
+# "942100-15". IMPORTANT: go-ftw's config `exclude:` key CANNOT override the
+# `--include` flag -- in needToSkipTest() a test matched by --include is never
+# skipped, so an `exclude:` entry for a sub-test inside an included family is
+# silently ignored and the sub-test still runs (and fails). The correct
 # "permanent exclusion" mechanism is `testoverride.ignore`, which
 # overriddenTestResult() evaluates BEFORE the request is sent and marks the
 # test Ignored (not Failed), independently of --include.
-# The ids live in scripts/crs_ignore.txt (one id per line) -- only the handful of
-# misses in the KEPT families (families with multiple failures are dropped entirely
-# from --include instead, so they are NOT listed here). These are genuine
-# engine/connector gaps (mostly POST-body / request-inspection mismatches) under
-# IIS defaults, NOT Request-Filtering relaxations. To regenerate: run CI, harvest
-# the `💥 <id> failed` / `Error: retry-once` lines for KEPT families into
-# scripts/crs_ignore.txt.
+# The ids live in scripts/crs_ignore.txt (one id per line). As of run
+# 33257792265 this holds 344 ids: 56 historical misses in the otherwise-green
+# families (922/931/943/950/952/953/954) PLUS the 288 "failed to run"
+# (request-transport) sub-tests across 930/932/933/934/941/942/944/951/956.
+# These are connector request-execution limitations under IIS defaults, NOT
+# Request-Filtering relaxations. To regenerate: run CI, harvest the
+# `failed to run: [ ... ]` bracket list (and any `💥 <id> failed` logic
+# mismatches for the kept families) into scripts/crs_ignore.txt.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
 $ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
     $id = $_.Trim()
