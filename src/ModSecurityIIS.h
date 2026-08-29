@@ -5,13 +5,16 @@
 #include "moduleconfig.h"
 
 #include <memory>
+#include <vector>
 
 class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 {
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false)
+          m_ResponseHeadersFed(false),
+          m_BodyInspected(0), m_BodyReadActive(false), m_BodyPhaseDone(false),
+          m_BodyFinalStatus(RQ_NOTIFICATION_CONTINUE)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -73,6 +76,24 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // response protocol mirrors the request protocol, so it is reused when
     // feeding Transaction::processResponseHeaders.
     std::string               m_Protocol;
+
+    // --- asynchronous entity-body read state ---------------------------------
+    // The entity body is drained chunk by chunk into m_Body (ReadEntityBody with
+    // fAsync=TRUE) and handed back to IIS with a SINGLE InsertEntityBody() once
+    // the body is complete. Rationale:
+    //   * InsertEntityBody() inserts BEFORE any remaining unread entity body, so
+    //     calling it while we are still reading would make the next
+    //     ReadEntityBody return our own copy (duplication / endless loop).
+    //   * IIS does not copy the buffer -- it must live until the end of the
+    //     request, so the final insert uses request-scoped memory
+    //     (IHttpContext::AllocateRequestMemory), never the read buffer.
+    std::vector<char>         m_Body;
+    char                      m_ReadBuf[65536];
+    size_t                    m_BodyInspected;   // bytes handed to the engine
+    bool                      m_BodyReadActive;  // async read in flight
+    bool                      m_BodyPhaseDone;   // processRequestBody() has run
+    // Outcome to return when IIS re-enters OnBeginRequest after PostCompletion().
+    REQUEST_NOTIFICATION_STATUS m_BodyFinalStatus;
 };
 
 
@@ -99,10 +120,37 @@ public:
         IN IHttpEventProvider * pProvider
     );
 
+    // Called by IIS when an asynchronous operation started from OnBeginRequest
+    // completes. That is how the entity body is drained without blocking the
+    // worker thread: ReadEntityBody(fAsync=TRUE) returns
+    // fCompletionPending=TRUE when the rest of the body has not arrived yet,
+    // and we resume here instead of stalling the pipeline.
+    REQUEST_NOTIFICATION_STATUS
+    OnAsyncCompletion(
+        IN IHttpContext * pHttpContext,
+        IN DWORD          dwNotification,
+        IN BOOL           fPostNotification,
+        IN IHttpEventProvider * pProvider,
+        IN IHttpCompletionInfo * pCompletionInfo
+    );
+
     CMyHttpModule();
     ~CMyHttpModule();
 
     void Dispose();
 
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
+
+private:
+    // Issues ReadEntityBody calls until the entity body ends or a read goes
+    // asynchronous. Returns RQ_NOTIFICATION_PENDING while a read is in flight
+    // (resumes in OnAsyncCompletion), otherwise the final notification status.
+    REQUEST_NOTIFICATION_STATUS
+    DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
+
+    // Runs the request-body phase exactly once per request: restores the entity
+    // body for the downstream handler, feeds it to the engine and applies any
+    // intervention. Safe to call from both OnBeginRequest and OnAsyncCompletion.
+    REQUEST_NOTIFICATION_STATUS
+    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 };
