@@ -159,6 +159,21 @@ jobs:
           restore-keys: |
             gotools-${{ runner.os }}-
 
+      # Cache the Go tools installed by ci-crs.ps1 (go-ftw, albedo) and the Go
+      # module download cache, so the `go install ...@latest` steps are fast on
+      # cache hit. ci-crs.ps1 skips `go install` when the binary is already on
+      # PATH (restored from here). Key includes the Go version so a toolchain
+      # bump invalidates it; restore-keys fall back to any cached Go tools.
+      - name: Cache Go tools (go-ftw, albedo)
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:\Users\runneradmin\go\bin
+            C:\Users\runneradmin\go\pkg\mod
+          key: gotools-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}
+          restore-keys: |
+            gotools-${{ runner.os }}-
+
       - name: Test against OWASP CRS (go-ftw + albedo)
         shell: pwsh
         run: ./scripts/ci-crs.ps1 -DllDir artifact

@@ -174,10 +174,22 @@ foreach ($i in 1..30) {
 Write-Host "[4/8] URL Rewrite + ARR installed, proxy enabled."
 
 # --- 5) go-ftw + albedo ----------------------------------------------------------
-go install github.com/coreruleset/go-ftw@latest
-if ($LASTEXITCODE -ne 0) { throw "go install go-ftw failed." }
-go install github.com/coreruleset/albedo@latest
-if ($LASTEXITCODE -ne 0) { throw "go install albedo failed." }
+# Skip `go install` when the binary is already on PATH (restored from the
+# cached GOPATH/bin by the "Cache Go tools" workflow step). `go install ...@latest`
+# always rebuilds from source, so the guard is what actually makes the cache pay
+# off; on a cold cache the install still runs.
+if (Get-Command go-ftw -ErrorAction SilentlyContinue) {
+    Write-Host "[5/8] go-ftw already on PATH (cached) -- skipping install."
+} else {
+    go install github.com/coreruleset/go-ftw@latest
+    if ($LASTEXITCODE -ne 0) { throw "go install go-ftw failed." }
+}
+if (Get-Command albedo -ErrorAction SilentlyContinue) {
+    Write-Host "[5/8] albedo already on PATH (cached) -- skipping install."
+} else {
+    go install github.com/coreruleset/albedo@latest
+    if ($LASTEXITCODE -ne 0) { throw "go install albedo failed." }
+}
 $ftwExe    = "go-ftw"
 $albedoExe = "albedo"
 
