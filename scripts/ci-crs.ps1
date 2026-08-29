@@ -101,8 +101,15 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # showed ZERO audit hits), while phase:2 PL2-PL4 rules ran fine because the
 # variable was set by the time phase 2 started. Setting it here, before the
 # includes, makes 901125's "@eq 0" test false and both gates see 4.
-SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4"
-SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.blocking_paranoia_level=4"
+# We also fold in the request/body/arg tuning that the official CRS regression
+# suite (coreruleset/coreruleset@main/tests/regression, rule id 900005) pins
+# before running go-ftw -- arg/body length limits and UTF-8 validation that the
+# regression tests are written against. We deliberately DO NOT copy upstream's
+# `ctl:ruleEngine=DetectionOnly` (our run asserts real 403 blocks) nor
+# `ctl:ruleRemoveById=910000` (would only trim coverage). 901125 makes
+# detection_paranoia_level follow blocking_paranoia_level when unset, so setting
+# BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
+SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
