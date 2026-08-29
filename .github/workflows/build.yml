@@ -125,9 +125,39 @@ jobs:
         run: ./scripts/ci-smoke.ps1 -DllDir artifact
 
       - name: Set up Go
+        id: setup-go
         uses: actions/setup-go@v7
         with:
           go-version: '1.24'
+          # We cache GOPATH/bin + GOPATH/pkg/mod ourselves below, so disable the
+          # action's built-in module cache (it scans for go.mod, which this repo
+          # lacks, and logs a noisy "Restore cache failed: ... go.mod" warning).
+          cache: false
+
+      - name: Export GOPATH
+        id: go-env
+        shell: pwsh
+        run: |
+          $gp = (go env GOPATH)
+          Add-Content $env:GITHUB_ENV "GOPATH=$gp"
+          echo "GOPATH=$gp"
+
+      # Cache the Go tools installed by ci-crs.ps1 (go-ftw, albedo) and the Go
+      # module download cache, so the `go install ...@latest` steps are fast on
+      # cache hit. ci-crs.ps1 skips `go install` when the binary is already on
+      # PATH (restored from here). Path uses ${{ env.GOPATH }} (set above from
+      # `go env GOPATH`) instead of a hardcoded profile path. Key includes the Go
+      # version so a toolchain bump invalidates it; restore-keys fall back to any
+      # cached Go tools.
+      - name: Cache Go tools (go-ftw, albedo)
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.GOPATH }}/bin
+            ${{ env.GOPATH }}/pkg/mod
+          key: gotools-${{ runner.os }}-${{ steps.setup-go.outputs.go-version }}
+          restore-keys: |
+            gotools-${{ runner.os }}-
 
       - name: Test against OWASP CRS (go-ftw + albedo)
         shell: pwsh
