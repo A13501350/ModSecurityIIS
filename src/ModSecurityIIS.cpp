@@ -382,6 +382,7 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     // supplied one; otherwise honor the explicit status (defaulting to 403).
     IHttpResponse* pResponse = pHttpContext->GetResponse();
     pResponse->Clear();
+    int finalStatus = status;
     if (!redirectUrl.empty())
     {
         // IHttpResponse::Redirect always answers 302; keep the engine's
@@ -392,6 +393,10 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         {
             pResponse->SetStatus((USHORT)status, StandardReason(status));
         }
+        else
+        {
+            finalStatus = 302;   // what Redirect() actually answers
+        }
     }
     else
     {
@@ -400,7 +405,26 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
             status = 403;
         }
         pResponse->SetStatus((USHORT)status, StandardReason(status));
+        finalStatus = status;
     }
+
+    // Tell the ENGINE which status we actually returned. Without this the
+    // engine keeps m_httpCodeReturned at its constructor default of 200
+    // (transaction.cc:125) for every phase-1/phase-2 block, because
+    // processResponseHeaders() -- the only other place that assigns it
+    // (transaction.cc:992) -- never runs once we finish the request here.
+    // That default poisons three things:
+    //   * audit part F / "Access denied with code %d" render as 200
+    //     (transaction.cc:1522/1541), which is why a request the client saw
+    //     as 403 was logged as a 200 success;
+    //   * SecAuditEngine RelevantOnly filtering tests isRelevant(200)
+    //     (audit_log/audit_log.cc:298), so blocked requests can be dropped
+    //     from the audit log entirely -- a real visibility loss;
+    //   * the RESPONSE_STATUS variable, which phase-3+ rules may key on.
+    // updateStatusCode() sets both m_httpCodeReturned and RESPONSE_STATUS,
+    // and must run BEFORE FinishRequest() triggers processLogging().
+    tx->updateStatusCode(finalStatus);
+
     pHttpContext->SetRequestHandled();
     rsc->FinishRequest();
     return true;
