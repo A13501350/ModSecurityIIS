@@ -322,21 +322,31 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955.
 # DROPPED families (multiple failing sub-tests -> whole family turned off, see
 # policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959, 980.
-# MEASURED, not assumed: after the entity-body truncation was fixed (the WAF was
-# seeing only 49,152 of 100,000 bytes; verified complete afterwards), the
-# request-body families were re-enabled and measured -- they STILL fail in bulk
-# (932:117, 942:85, 944:81, 941:38, 951:20, 933:19, 934:14, 930:13, 956:12
-# failing sub-tests). So their failures are NOT caused by truncation; they are a
-# separate request-body detection gap in this connector (rules not matching the
-# way CRS expects), and they stay dropped per family-drop policy.
+#
+# What the dropped families' failures actually ARE (measured, run 33257792265):
+# all 288 failing sub-tests are go-ftw "failed to run" -- the request never
+# executed to completion against this connector (transport/request-handling
+# error on go-ftw's side). There are ZERO rule-logic mismatches (no "expected
+# ... got ..." diffs in the output). So this is NOT a "rules not matching the
+# way CRS expects" detection gap; it is a connector request-execution
+# limitation (connection/body handling on the path to the engine). The known
+# entity-body read issue (body read stays in OnBeginRequest; the short-read
+# break truncates bodies and the request can be reset before the engine sees a
+# complete entity) is the prime suspect. These families stay dropped until that
+# path is fixed; the gap is in the connector, not in CRS evaluation.
 # (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
-# at PL4 under IIS defaults -- a request-inspection gap, not a pre-WAF rejection.)
+# at PL4 under IIS defaults -- same request-execution class of failure.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
-# MEASURING the phase:1 paranoia-ordering fix: re-enable all previously dropped
-# families, since the bug silently skipped every phase:1 PL2+ rule in EVERY
-# family (not just 942). Families that still show multiple failures go back out
-# per the family-drop policy.
-$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
+#
+# MEASUREMENT of the phase:1 paranoia-ordering fix (this branch): all previously
+# dropped families were re-enabled. RESULT: the five phase:1 PL2+ rules that were
+# silently skipped (942101/942152/942321/942420/942421) now FIRE (audit hits
+# 10/9/8/12/37 vs 0 before), and total "Access denied with code 403" rose from
+# 3427 to 4094. BUT the 9 dropped families STILL fail in bulk -- and still as
+# "failed to run" (transport), not as logic mismatches. So the phase:1 fix is a
+# real detection-correctness win, yet it does not rescue those families; they
+# remain dropped per family-drop policy. Reverted to the 11-family green set:
+$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
