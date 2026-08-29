@@ -353,7 +353,9 @@ if (Test-Path $audit) {
 # Audit part C = request body. Section headers are "--<unique-id>-<letter>--",
 # so part C is "--<id>-C--" .. next section's "--".
 $cBody = $null
-if ($slice -match '(?s)--[^-]+-C--\r?\n(.*?)\r?\n--') { $cBody = $Matches[1] }
+if ($slice -match '(?sm)^-+[A-Za-z0-9]+-+C--\r?\n(.*?)\r?\n-+[A-Za-z0-9]+-+[A-Z]--') {
+    $cBody = $Matches[1]
+}
 $cLen   = if ($cBody) { $cBody.Length } else { 0 }
 $cZeros = if ($cBody) { ([regex]::Matches($cBody, "Z")).Count } else { 0 }
 $expected = $probeBody.Length
