@@ -394,11 +394,10 @@ $ignoreYaml
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
 Write-Host "[7/8] Running go-ftw (single diagnostic test 942100-15)..."
-# -o github: emit GitHub Actions annotations (::error::) with the full failure
-# detail; --show-failures-only is dropped so the single test's complete result
-# (expected vs actual / transport error) is captured, not just a summary.
+# Default output (NOT -o github) so the complete failure reason for "failed to
+# run" is captured -- the github format collapses it to a placeholder.
 & $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig -o github 2>&1 |
+    --config $ftwConfig 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
 $ftwCode = $LASTEXITCODE
 Write-Host "go-ftw exit code: $ftwCode"
