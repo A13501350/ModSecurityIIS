@@ -224,6 +224,11 @@ SecRule ARGS:evil "@rx <script>" "id:1002,phase:2,deny,status:403,msg:'smoke: bl
 # !m_isDisruptive); deny rules surface through the audit log instead. Rule
 # 1003 exists precisely to exercise the callback -> Event Viewer path.
 SecRule REQUEST_HEADERS:X-ModSec-Probe "@streq logme" "id:1003,phase:1,pass,log,msg:'smoke: non-disruptive probe'"
+# Body-completeness probe helper (non-disruptive): matches the probe body so the
+# transaction is audited under SecAuditEngine RelevantOnly and the request body
+# (audit part C) is written to the log. The marker sits at the START of the body
+# so it still matches even if the body was truncated.
+SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe: request body completeness'"
 "@
 Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
 Write-Host "[4/6] Engine configuration written."
@@ -314,6 +319,56 @@ Assert-True $auditOk "E audit log written" "$audit missing or empty"
 if ($auditOk) {
     $hits = Select-String -Path $audit -Pattern '"100[12]"' -Quiet
     Assert-True $hits "E audit log contains rules 1001/1002" "no id entries found"
+}
+
+# --- 6b) request-body completeness probe -------------------------------------
+# Does the FULL entity body reach the audit log (part C) when the body is read
+# at RQ_BEGIN_REQUEST? The body is deliberately larger than the loop's 64 KiB
+# ReadEntityBody buffer (so a complete read needs >1 iteration) and is uploaded
+# slowly via --limit-rate, so it arrives in several TCP segments -- the exact
+# condition under which a synchronous ReadEntityBody can return a partial
+# (short) read and the loop's short-read break would truncate inspection.
+# Reported (not asserted): we want the measurement either way.
+$probePad    = 100000
+$probeBody   = "bodyprobe=1&pad=" + ("Z" * $probePad)
+$bodyFile    = Join-Path $ConfRoot "bodyprobe-request.txt"
+$probeOut    = Join-Path $ConfRoot "body-completeness.txt"
+Set-Content -Path $bodyFile -Value $probeBody -NoNewline -Encoding ascii
+
+$auditOff = if (Test-Path $audit) { (Get-Item $audit).Length } else { 0 }
+$probeResp = Join-Path $ConfRoot "bodyprobe-response.bin"
+$probeCode = & $curl -s -o $probeResp -w "%{http_code}" --limit-rate 30k `
+                 -X POST -H "Content-Type: application/x-www-form-urlencoded" `
+                 --data-binary "@$bodyFile" "http://127.0.0.1:$Port/" 2>$null
+Start-Sleep -Seconds 3   # let the audit writer flush
+
+$slice = $null
+if (Test-Path $audit) {
+    $fs = [System.IO.File]::Open($audit, "Open", "Read", "ReadWrite")
+    try {
+        $fs.Position = [Math]::Min($auditOff, $fs.Length)
+        $slice = (New-Object System.IO.StreamReader($fs)).ReadToEnd()
+    } finally { $fs.Close() }
+}
+# Audit part C = request body. Section headers are "--<unique-id>-<letter>--",
+# so part C is "--<id>-C--" .. next section's "--".
+$cBody = $null
+if ($slice -match '(?s)--[^-]+-C--\r?\n(.*?)\r?\n--') { $cBody = $Matches[1] }
+$cLen   = if ($cBody) { $cBody.Length } else { 0 }
+$cZeros = if ($cBody) { ([regex]::Matches($cBody, "Z")).Count } else { 0 }
+$expected = $probeBody.Length
+$verdict  = if ($cZeros -ge $probePad) { "COMPLETE" } `
+            else { "TRUNCATED (missing $($probePad - $cZeros) of $probePad pad bytes)" }
+$line = ("body-completeness: probe HTTP $probeCode | body sent=$expected B " +
+         "| audit part C=$cLen B | pad 'Z' seen=$cZeros / $probePad -> $verdict")
+Write-Host "[6b] $line"
+$line | Set-Content $probeOut -Encoding Ascii
+("expected body bytes: $expected") | Add-Content $probeOut -Encoding Ascii
+if ($cBody) {
+    ("part C head: " + $cBody.Substring(0, [Math]::Min(120, $cBody.Length))) |
+        Add-Content $probeOut -Encoding Ascii
+    ("part C tail: " + $cBody.Substring([Math]::Max(0, $cBody.Length - 80))) |
+        Add-Content $probeOut -Encoding Ascii
 }
 
 try {
