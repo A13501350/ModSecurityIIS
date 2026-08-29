@@ -12,7 +12,7 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false)
+          m_ResponseHeadersFed(false), m_BodyReadActive(false)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -86,6 +86,9 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     //     (IHttpContext::AllocateRequestMemory), never the read buffer.
     std::vector<char>         m_Body;
     char                      m_ReadBuf[65536];
+    // True while an asynchronous ReadEntityBody() is in flight. OnAsyncCompletion
+    // uses it to tell our own completions apart from any other async operation.
+    bool                      m_BodyReadActive;
 };
 
 
@@ -112,6 +115,22 @@ public:
         IN IHttpEventProvider * pProvider
     );
 
+    // Called by IIS when an asynchronous operation started from OnBeginRequest
+    // completes -- that is how the entity body is drained without ever blocking a
+    // worker thread. Only operations WE started are handled (RQ_BEGIN_REQUEST,
+    // non-post, with a read of ours in flight); everything else is passed back
+    // untouched. The status is returned directly from here: PostCompletion() is
+    // deliberately NOT used, because that is for module-owned async work and
+    // would double-signal this IIS-tracked I/O.
+    REQUEST_NOTIFICATION_STATUS
+    OnAsyncCompletion(
+        IN IHttpContext * pHttpContext,
+        IN DWORD          dwNotification,
+        IN BOOL           fPostNotification,
+        IN IHttpEventProvider * pProvider,
+        IN IHttpCompletionInfo * pCompletionInfo
+    );
+
     CMyHttpModule();
     ~CMyHttpModule();
 
@@ -120,10 +139,11 @@ public:
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
 private:
-    // Drains the request entity body with synchronous ReadEntityBody() calls,
-    // continuing through short reads and stopping once the declared
-    // Content-Length has been consumed (or on EOF / error), then runs the
-    // request-body phase.
+    // Drains the request entity body with asynchronous ReadEntityBody() calls,
+    // continuing through short reads (they do NOT mean end-of-body) and stopping
+    // on EOF / error / once the declared Content-Length is consumed. Returns
+    // RQ_NOTIFICATION_PENDING while a read is in flight; resumes in
+    // OnAsyncCompletion.
     REQUEST_NOTIFICATION_STATUS
     DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 

@@ -458,35 +458,59 @@ BOOL CMyHttpModule::WriteEventViewerLog(LPCSTR szNotification, WORD category)
 // EOF -- the WAF inspected less than half the body, which is both a detection
 // gap and an evasion (trickle the body to hide payloads).
 //
-// So the loop must keep reading through short reads, which the old code could
-// not do safely: stopping only on a zero-length read made it call
-// ReadEntityBody() again after the body had ended, and that call BLOCKS -- a
+// So the loop must keep reading through short reads, which a SYNCHRONOUS
+// ReadEntityBody() cannot do safely: once the buffered data runs out it BLOCKS
+// waiting for more, and after the body has ended that never returns -- the
 // deadlock that stalled CI for ~44 minutes.
 //
-// The fix: read until the length the client DECLARED (Content-Length) has been
-// consumed, and stop there WITHOUT issuing another read. That both keeps short
-// reads from truncating and never over-reads past the end of the body.
+// Reading ASYNCHRONOUSLY lets us keep going without ever blocking:
+// ReadEntityBody(fAsync=TRUE) returns fCompletionPending=TRUE when the next
+// chunk has not arrived yet, we return RQ_NOTIFICATION_PENDING, and IIS calls
+// OnAsyncCompletion() when it lands. We stop at EOF / a zero-length read, or
+// once the declared Content-Length has been consumed.
+//
+// Two rules the first async attempt got wrong, both of which matter:
+//   * Do NOT call IHttpContext::PostCompletion(). That is for MODULE-OWNED async
+//     work (e.g. your own threadpool) and makes IIS re-enter the original
+//     notification. Here the I/O is IIS-tracked: IIS calls OnAsyncCompletion and
+//     we simply return the status from there. Doing both double-signals a single
+//     pending operation.
+//   * Filter on dwNotification / fPostNotification in OnAsyncCompletion: it is
+//     called for async operations started from ANY notification, so only handle
+//     the ones we began, and never PostCompletion for the rest (that would
+//     resume an operation that is not ours).
 // ---------------------------------------------------------------------------
 
-// Declared entity-body length in bytes; 0 means unknown (chunked / absent).
-static ULONGLONG RequestEntityBodyLength(HTTP_REQUEST* req)
+// What the request declares about its entity body. length is 0 when unknown
+// (chunked, or no body declared).
+struct EntityBodyInfo
 {
+    bool      hasBody;   // Transfer-Encoding present, or Content-Length > 0
+    ULONGLONG length;    // declared Content-Length; 0 == unknown
+};
+
+static EntityBodyInfo GetEntityBodyInfo(HTTP_REQUEST* req)
+{
+    EntityBodyInfo info;
+    info.hasBody = false;
+    info.length  = 0;
     if (req == NULL)
     {
-        return 0;
+        return info;
     }
-    // Chunked bodies have no Content-Length: length is unknown up front.
     const HTTP_KNOWN_HEADER& te =
         req->Headers.KnownHeaders[HttpHeaderTransferEncoding];
     if (te.pRawValue != NULL && te.RawValueLength > 0)
     {
-        return 0;
+        // Chunked: there is a body but no declared length.
+        info.hasBody = true;
+        return info;
     }
     const HTTP_KNOWN_HEADER& cl =
         req->Headers.KnownHeaders[HttpHeaderContentLength];
     if (cl.pRawValue == NULL || cl.RawValueLength <= 0)
     {
-        return 0;
+        return info;
     }
     // pRawValue is ANSI and NOT guaranteed to be NUL-terminated, so copy into a
     // bounded buffer before parsing.
@@ -498,7 +522,9 @@ static ULONGLONG RequestEntityBodyLength(HTTP_REQUEST* req)
     }
     memcpy(tmp, cl.pRawValue, n);
     tmp[n] = '\0';
-    return _strtoui64(tmp, NULL, 10);
+    info.length  = _strtoui64(tmp, NULL, 10);
+    info.hasBody = (info.length > 0);
+    return info;
 }
 
 REQUEST_NOTIFICATION_STATUS
@@ -510,15 +536,33 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         return FinishBodyRead(rsc, pHttpContext);
     }
 
-    HTTP_REQUEST* req    = pRequest->GetRawHttpRequest();
-    const ULONGLONG expected = RequestEntityBodyLength(req);
+    const EntityBodyInfo info =
+        GetEntityBodyInfo(pRequest->GetRawHttpRequest());
+    if (!info.hasBody)
+    {
+        // No entity body: run the body phase with an empty body. Avoids an
+        // async round-trip for the common bodyless request.
+        return FinishBodyRead(rsc, pHttpContext);
+    }
 
     for (;;)
     {
-        DWORD   read = 0;
-        HRESULT hrr  = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                                (DWORD)sizeof(rsc->m_ReadBuf),
-                                                FALSE /* sync */, &read, NULL);
+        DWORD read     = 0;
+        BOOL  fPending = FALSE;
+        // fAsync = TRUE: never block the worker thread. If the next chunk has not
+        // arrived yet we get fPending = TRUE and resume in OnAsyncCompletion.
+        HRESULT hrr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
+                                               (DWORD)sizeof(rsc->m_ReadBuf),
+                                               TRUE /* async */, &read, &fPending);
+        if (fPending)
+        {
+            // m_ReadBuf lives on the per-request context, so it stays valid until
+            // OnAsyncCompletion reports the completion.
+            rsc->m_BodyReadActive = true;
+            return RQ_NOTIFICATION_PENDING;
+        }
+        rsc->m_BodyReadActive = false;
+
         if (read > 0)
         {
             rsc->m_Body.insert(rsc->m_Body.end(),
@@ -528,25 +572,22 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         // End of body: zero-length read, or explicit EOF.
         if (read == 0 || hrr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
         {
-            break;
+            return FinishBodyRead(rsc, pHttpContext);
         }
-        // Hard error: stop rather than risk blocking or spinning. Whatever we
-        // already have is still inspected below.
+        // Hard error: stop rather than risk spinning. What we have is inspected.
         if (FAILED(hrr))
         {
-            break;
+            return FinishBodyRead(rsc, pHttpContext);
         }
-        // We have everything the client declared: stop WITHOUT issuing another
-        // read. A short read is NOT a stop condition -- more bytes may still be
-        // in flight, and stopping there is exactly the truncation bug. The
-        // declared length is what makes continuing safe: we never ask for bytes
-        // past the end of the body, which is what used to deadlock CI.
-        if (expected > 0 && (ULONGLONG)rsc->m_Body.size() >= expected)
+        // Everything the client declared has arrived: stop without another read.
+        // A SHORT read is NOT a stop condition -- more may still be in flight,
+        // and stopping there is exactly the truncation bug.
+        if (info.length > 0 && (ULONGLONG)rsc->m_Body.size() >= info.length)
         {
-            break;
+            return FinishBodyRead(rsc, pHttpContext);
         }
+        // Otherwise loop for the next chunk.
     }
-    return FinishBodyRead(rsc, pHttpContext);
 }
 
 REQUEST_NOTIFICATION_STATUS
@@ -877,6 +918,89 @@ CMyHttpModule::OnBeginRequest(
 
 // ---------------------------------------------------------------------------
 // OnAsyncCompletion -- resumes an asynchronous entity-body read started from
+// ---------------------------------------------------------------------------
+// OnAsyncCompletion -- resumes an asynchronous entity-body read started from
+// OnBeginRequest (see the "Request entity body" comment block).
+// ---------------------------------------------------------------------------
+
+REQUEST_NOTIFICATION_STATUS
+CMyHttpModule::OnAsyncCompletion(
+    IN IHttpContext * pHttpContext,
+    IN DWORD          dwNotification,
+    IN BOOL           fPostNotification,
+    IN IHttpEventProvider * pProvider,
+    IN IHttpCompletionInfo * pCompletionInfo
+)
+{
+    UNREFERENCED_PARAMETER(pProvider);
+
+    // OnAsyncCompletion is called for asynchronous operations started from ANY
+    // notification, so handle only the ones we began: an entity-body read from
+    // RQ_BEGIN_REQUEST, and never a post-event. Anything else is not ours --
+    // return without touching it. In particular do NOT call PostCompletion()
+    // here: that resumes an operation we did not start.
+    if (pHttpContext == NULL || pCompletionInfo == NULL ||
+        !(dwNotification & RQ_BEGIN_REQUEST) || fPostNotification)
+    {
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    REQUEST_STORED_CONTEXT* rsc = NULL;
+    IHttpModuleContextContainer* pContainer =
+        pHttpContext->GetModuleContextContainer();
+    if (pContainer != NULL)
+    {
+        rsc = (REQUEST_STORED_CONTEXT*)pContainer->GetModuleContext(
+                  g_pModuleContext);
+    }
+
+    // No transaction, or no read of ours in flight: not ours either.
+    if (rsc == NULL || rsc->m_pTx == NULL || !rsc->m_BodyReadActive)
+    {
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    const DWORD   cb = pCompletionInfo->GetCompletionBytes();
+    const HRESULT ch = pCompletionInfo->GetCompletionStatus();
+
+    try
+    {
+        // The chunk that just completed is in the per-request read buffer.
+        if (cb > 0)
+        {
+            rsc->m_Body.insert(rsc->m_Body.end(),
+                               rsc->m_ReadBuf, rsc->m_ReadBuf + cb);
+        }
+        rsc->m_BodyReadActive = false;
+
+        if (cb == 0 || ch == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) || FAILED(ch))
+        {
+            // Body complete (or a read error): finish with what we have and
+            // return the status directly -- no PostCompletion().
+            return FinishBodyRead(rsc, pHttpContext);
+        }
+
+        // More body expected: issue the next read. Returns PENDING if that read
+        // goes asynchronous again, otherwise the final status. The declared
+        // Content-Length stop condition is re-derived inside DriveBodyRead(), so
+        // it still applies across completions.
+        return DriveBodyRead(rsc, pHttpContext);
+    }
+    catch (const std::exception& e)
+    {
+        // Fail-closed: finish the request rather than let an exception cross the
+        // module boundary and kill w3wp.
+        ReportException("OnAsyncCompletion", e.what());
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    catch (...)
+    {
+        ReportException("OnAsyncCompletion", NULL);
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // OnSendResponse
 // ---------------------------------------------------------------------------
