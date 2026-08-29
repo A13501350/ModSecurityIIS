@@ -451,46 +451,42 @@ BOOL CMyHttpModule::WriteEventViewerLog(LPCSTR szNotification, WORD category)
 // ---------------------------------------------------------------------------
 // Request entity body
 //
-// At RQ_BEGIN_REQUEST the entity body is usually NOT fully buffered yet. A
-// SYNCHRONOUS ReadEntityBody() therefore returns only the bytes buffered so
-// far, and a SHORT read does not mean end-of-body. Measured: a 100,016-byte
-// body trickled at 30 KB/s was cut off at 49,152 bytes because the old loop
-// treated that short read as EOF -- the WAF inspected less than half the body,
-// which is both a detection gap and an evasion (trickle the body to hide
-// payloads).
+// At RQ_BEGIN_REQUEST the entity body is usually NOT fully buffered yet: a
+// ReadEntityBody() returns only the bytes buffered so far, and a SHORT read
+// does NOT mean end-of-body. Measured: a 100,016-byte body trickled at 30 KB/s
+// was cut off at 49,152 bytes because the old loop treated that short read as
+// EOF -- the WAF inspected less than half the body, which is both a detection
+// gap and an evasion (trickle the body to hide payloads).
 //
-// The old loop broke on the short read because continuing synchronously HANGS:
-// after the buffered data runs out, a sync ReadEntityBody() blocks waiting for
-// bytes that (notably with Expect: 100-continue) cannot arrive until the
-// blocked pipeline sends the 100 response -- a deadlock (~44 min in CI).
+// So the loop must keep reading through short reads, which the old code could
+// not do safely: stopping only on a zero-length read made it call
+// ReadEntityBody() again after the body had ended, and that call BLOCKS -- a
+// deadlock that stalled CI for ~44 minutes.
 //
-// Reading ASYNCHRONOUSLY fixes both: ReadEntityBody(fAsync=TRUE) returns
-// fCompletionPending=TRUE instead of blocking, we return
-// RQ_NOTIFICATION_PENDING, the pipeline keeps running, and IIS calls
-// OnAsyncCompletion() when the next chunk lands. We continue until
-// ERROR_HANDLE_EOF / a zero-length read, so short reads no longer truncate.
+// The fix: read until the length the client DECLARED (Content-Length) has been
+// consumed, and stop there WITHOUT issuing another read. That both keeps short
+// reads from truncating and never over-reads past the end of the body.
 // ---------------------------------------------------------------------------
 
-// Does the request carry an entity body? Lets bodyless requests (the vast
-// majority) skip the async read entirely.
-static bool RequestHasEntityBody(HTTP_REQUEST* req)
+// Declared entity-body length in bytes; 0 means unknown (chunked / absent).
+static ULONGLONG RequestEntityBodyLength(HTTP_REQUEST* req)
 {
     if (req == NULL)
     {
-        return false;
+        return 0;
     }
-    // Transfer-Encoding present => chunked body (no Content-Length needed).
+    // Chunked bodies have no Content-Length: length is unknown up front.
     const HTTP_KNOWN_HEADER& te =
         req->Headers.KnownHeaders[HttpHeaderTransferEncoding];
     if (te.pRawValue != NULL && te.RawValueLength > 0)
     {
-        return true;
+        return 0;
     }
     const HTTP_KNOWN_HEADER& cl =
         req->Headers.KnownHeaders[HttpHeaderContentLength];
     if (cl.pRawValue == NULL || cl.RawValueLength <= 0)
     {
-        return false;
+        return 0;
     }
     // pRawValue is ANSI and NOT guaranteed to be NUL-terminated, so copy into a
     // bounded buffer before parsing.
@@ -502,7 +498,7 @@ static bool RequestHasEntityBody(HTTP_REQUEST* req)
     }
     memcpy(tmp, cl.pRawValue, n);
     tmp[n] = '\0';
-    return _strtoui64(tmp, NULL, 10) > 0;
+    return _strtoui64(tmp, NULL, 10);
 }
 
 REQUEST_NOTIFICATION_STATUS
@@ -514,45 +510,43 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         return FinishBodyRead(rsc, pHttpContext);
     }
 
+    HTTP_REQUEST* req    = pRequest->GetRawHttpRequest();
+    const ULONGLONG expected = RequestEntityBodyLength(req);
+
     for (;;)
     {
-        DWORD read     = 0;
-        BOOL  fPending = FALSE;
-        // fAsync = TRUE: never block the worker thread. If the rest of the body
-        // has not arrived yet we get fPending = TRUE and resume in
-        // OnAsyncCompletion instead of stalling the request.
-        HRESULT hrr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                               (DWORD)sizeof(rsc->m_ReadBuf),
-                                               TRUE, &read, &fPending);
-        if (fPending)
-        {
-            // m_ReadBuf lives on the per-request context, so it stays valid
-            // until OnAsyncCompletion reports the completion.
-            rsc->m_BodyReadActive = true;
-            return RQ_NOTIFICATION_PENDING;
-        }
-        rsc->m_BodyReadActive = false;
-
+        DWORD   read = 0;
+        HRESULT hrr  = pRequest->ReadEntityBody(rsc->m_ReadBuf,
+                                                (DWORD)sizeof(rsc->m_ReadBuf),
+                                                FALSE /* sync */, &read, NULL);
         if (read > 0)
         {
             rsc->m_Body.insert(rsc->m_Body.end(),
                                rsc->m_ReadBuf, rsc->m_ReadBuf + read);
         }
 
-        // End of body: zero-length read or EOF. A SHORT read is NOT the end --
-        // more bytes may still be in flight (that is exactly the old bug).
+        // End of body: zero-length read, or explicit EOF.
         if (read == 0 || hrr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
         {
-            return FinishBodyRead(rsc, pHttpContext);
+            break;
         }
+        // Hard error: stop rather than risk blocking or spinning. Whatever we
+        // already have is still inspected below.
         if (FAILED(hrr))
         {
-            // Hard error: stop reading rather than risk blocking or spinning.
-            // Whatever we already have is still inspected.
-            return FinishBodyRead(rsc, pHttpContext);
+            break;
         }
-        // Otherwise loop for the next chunk.
+        // We have everything the client declared: stop WITHOUT issuing another
+        // read. A short read is NOT a stop condition -- more bytes may still be
+        // in flight, and stopping there is exactly the truncation bug. The
+        // declared length is what makes continuing safe: we never ask for bytes
+        // past the end of the body, which is what used to deadlock CI.
+        if (expected > 0 && (ULONGLONG)rsc->m_Body.size() >= expected)
+        {
+            break;
+        }
     }
+    return FinishBodyRead(rsc, pHttpContext);
 }
 
 REQUEST_NOTIFICATION_STATUS
@@ -560,63 +554,58 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 {
     try
     {
-        if (!rsc->m_BodyPhaseDone)
+        // Hand the FULL body back so the downstream handler still receives it.
+        // InsertEntityBody() inserts BEFORE any remaining unread entity body, so
+        // it is called exactly ONCE and only after the body has been drained --
+        // inserting per chunk while still reading would make the next
+        // ReadEntityBody() return our own copy. IIS does not copy the buffer, so
+        // it must outlive the request: allocate it from request-scoped memory
+        // rather than using the read buffer.
+        IHttpRequest* pRequest = pHttpContext->GetRequest();
+        if (pRequest != NULL && !rsc->m_Body.empty())
         {
-            rsc->m_BodyPhaseDone  = true;
-            rsc->m_BodyReadActive = false;
-
-            // Hand the FULL body back so the downstream handler still receives
-            // it. InsertEntityBody() inserts BEFORE any remaining unread entity
-            // body, so it is called exactly ONCE and only after the body has
-            // been drained -- inserting per chunk while still reading would make
-            // the next ReadEntityBody() return our own copy. IIS does not copy
-            // the buffer, so it must outlive the request: allocate it from
-            // request-scoped memory rather than using the read buffer.
-            IHttpRequest* pRequest = pHttpContext->GetRequest();
-            if (pRequest != NULL && !rsc->m_Body.empty())
+            void* pBody = pHttpContext->AllocateRequestMemory(
+                              (DWORD)rsc->m_Body.size());
+            if (pBody != NULL)
             {
-                void* pBody = pHttpContext->AllocateRequestMemory(
-                                  (DWORD)rsc->m_Body.size());
-                if (pBody != NULL)
-                {
-                    memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
-                    pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
-                }
-                // Allocation failure: there is nothing safe to forward, so the
-                // handler simply sees an empty body. Never fail the request here.
+                memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
+                pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
             }
-
-            // Feed the body to the engine, bounded to bound memory use.
-            const size_t maxInspect = GetMaxInspectBodyBytes();
-            size_t take = rsc->m_Body.size();
-            if (take > maxInspect)
-            {
-                take = maxInspect;
-            }
-            if (take > 0)
-            {
-                rsc->m_pTx->appendRequestBody(
-                    (const unsigned char*)rsc->m_Body.data(), take);
-            }
-            rsc->m_pTx->processRequestBody();
+            // Allocation failure: there is nothing safe to forward, so the
+            // handler simply sees an empty body. Never fail the request here.
         }
 
-        rsc->m_BodyFinalStatus = ApplyIntervention(rsc, pHttpContext)
-                                     ? RQ_NOTIFICATION_FINISH_REQUEST
-                                     : RQ_NOTIFICATION_CONTINUE;
+        // Feed the body to the engine, bounded to bound memory use.
+        const size_t maxInspect = GetMaxInspectBodyBytes();
+        size_t take = rsc->m_Body.size();
+        if (take > maxInspect)
+        {
+            take = maxInspect;
+        }
+        if (take > 0)
+        {
+            rsc->m_pTx->appendRequestBody(
+                (const unsigned char*)rsc->m_Body.data(), take);
+        }
+        rsc->m_pTx->processRequestBody();
     }
     catch (const std::exception& e)
     {
         // Fail-closed: deny rather than let an exception escape the module.
         ReportException("FinishBodyRead", e.what());
-        rsc->m_BodyFinalStatus = RQ_NOTIFICATION_FINISH_REQUEST;
+        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     catch (...)
     {
         ReportException("FinishBodyRead", NULL);
-        rsc->m_BodyFinalStatus = RQ_NOTIFICATION_FINISH_REQUEST;
+        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
-    return rsc->m_BodyFinalStatus;
+
+    if (ApplyIntervention(rsc, pHttpContext))
+    {
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    return RQ_NOTIFICATION_CONTINUE;
 }
 
 
@@ -652,25 +641,6 @@ CMyHttpModule::OnBeginRequest(
     {
         hr = E_UNEXPECTED;
         break;
-    }
-
-    // Re-entrancy guard: IHttpContext::PostCompletion() makes IIS re-enter this
-    // notification so the module can capture an async completion. If the body
-    // phase already ran for this request, return the stored outcome instead of
-    // running phase 1 again (which would try to build a second transaction).
-    {
-        IHttpModuleContextContainer* pPrevContainer =
-            pHttpContext->GetModuleContextContainer();
-        if (pPrevContainer != NULL)
-        {
-            REQUEST_STORED_CONTEXT* pPrev =
-                (REQUEST_STORED_CONTEXT*)pPrevContainer->GetModuleContext(
-                    g_pModuleContext);
-            if (pPrev != NULL && pPrev->m_BodyPhaseDone)
-            {
-                return pPrev->m_BodyFinalStatus;
-            }
-        }
     }
 
     hr = MODSECURITY_STORED_CONTEXT::GetConfig(pHttpContext, &pConfig);
@@ -875,15 +845,10 @@ CMyHttpModule::OnBeginRequest(
     }
 
     // --- request body ---
-    // Drain the entity body asynchronously and run the request-body phase.
-    // See the "Request entity body" comment block above for why this must not
-    // be a synchronous loop that stops on a short read.
-    if (!RequestHasEntityBody(req))
-    {
-        // No entity body: run the body phase with an empty body. Skips an async
-        // round-trip for bodyless requests.
-        return FinishBodyRead(rsc, pHttpContext);
-    }
+    // Drain the entity body and run the request-body phase. See the "Request
+    // entity body" comment block above: the loop must keep going through short
+    // reads (they do not mean end-of-body) and must stop at the declared length
+    // rather than asking for bytes past the end of the body.
     return DriveBodyRead(rsc, pHttpContext);
 
     } while (0);
@@ -912,94 +877,6 @@ CMyHttpModule::OnBeginRequest(
 
 // ---------------------------------------------------------------------------
 // OnAsyncCompletion -- resumes an asynchronous entity-body read started from
-// OnBeginRequest (see the "Request entity body" comment block).
-// ---------------------------------------------------------------------------
-
-REQUEST_NOTIFICATION_STATUS
-CMyHttpModule::OnAsyncCompletion(
-    IN IHttpContext * pHttpContext,
-    IN DWORD          dwNotification,
-    IN BOOL           fPostNotification,
-    IN IHttpEventProvider * pProvider,
-    IN IHttpCompletionInfo * pCompletionInfo
-)
-{
-    UNREFERENCED_PARAMETER(dwNotification);
-    UNREFERENCED_PARAMETER(fPostNotification);
-    UNREFERENCED_PARAMETER(pProvider);
-
-    if (pHttpContext == NULL || pCompletionInfo == NULL)
-    {
-        return RQ_NOTIFICATION_CONTINUE;
-    }
-
-    REQUEST_STORED_CONTEXT* rsc = NULL;
-    IHttpModuleContextContainer* pContainer =
-        pHttpContext->GetModuleContextContainer();
-    if (pContainer != NULL)
-    {
-        rsc = (REQUEST_STORED_CONTEXT*)pContainer->GetModuleContext(
-                  g_pModuleContext);
-    }
-
-    if (rsc == NULL || rsc->m_pTx == NULL || rsc->m_BodyPhaseDone)
-    {
-        // Nothing of ours is pending (or the body phase already finished): hand
-        // the request back to the pipeline unchanged.
-        pHttpContext->PostCompletion(0);
-        return RQ_NOTIFICATION_CONTINUE;
-    }
-
-    const DWORD   cb = pCompletionInfo->GetCompletionBytes();
-    const HRESULT ch = pCompletionInfo->GetCompletionStatus();
-
-    try
-    {
-        // The chunk that just completed is in the per-request read buffer.
-        if (cb > 0)
-        {
-            rsc->m_Body.insert(rsc->m_Body.end(),
-                               rsc->m_ReadBuf, rsc->m_ReadBuf + cb);
-        }
-        rsc->m_BodyReadActive = false;
-
-        if (cb == 0 || ch == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) || FAILED(ch))
-        {
-            // End of body (or a read error): finish with what we have.
-            REQUEST_NOTIFICATION_STATUS finalStatus =
-                FinishBodyRead(rsc, pHttpContext);
-            pHttpContext->PostCompletion(0);
-            return finalStatus;
-        }
-
-        // More body expected: issue the next read.
-        REQUEST_NOTIFICATION_STATUS next = DriveBodyRead(rsc, pHttpContext);
-        if (next == RQ_NOTIFICATION_PENDING)
-        {
-            // Another async read is in flight: stay pending WITHOUT posting a
-            // completion -- IIS will call OnAsyncCompletion again.
-            return RQ_NOTIFICATION_PENDING;
-        }
-        pHttpContext->PostCompletion(0);
-        return next;
-    }
-    catch (const std::exception& e)
-    {
-        // Fail-closed: finish the request rather than let an exception cross the
-        // module boundary and kill w3wp.
-        ReportException("OnAsyncCompletion", e.what());
-        pHttpContext->PostCompletion(0);
-        return RQ_NOTIFICATION_FINISH_REQUEST;
-    }
-    catch (...)
-    {
-        ReportException("OnAsyncCompletion", NULL);
-        pHttpContext->PostCompletion(0);
-        return RQ_NOTIFICATION_FINISH_REQUEST;
-    }
-}
-
-
 // ---------------------------------------------------------------------------
 // OnSendResponse
 // ---------------------------------------------------------------------------

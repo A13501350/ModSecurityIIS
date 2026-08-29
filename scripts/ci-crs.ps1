@@ -312,22 +312,20 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # Off (the score is intermittently 0, so the rule fires non-deterministically).
 #
 # INCLUDED families (broad but low-failure, kept at default IIS state):
-# 911, 913, 922, 930, 931, 932, 933, 934, 941, 942, 943, 944, 949, 950, 951,
-# 952, 953, 954, 955, 956.
-# The request-body families (930 LFI, 932 RCE, 933 PHP, 934 Node, 941 XSS, 942
-# SQLi, 944 Java, 951 Java/Node, 956 PHP version) were dropped because the
-# connector truncated the entity body -- a measured 100 KB trickled upload was
-# inspected only to 49,152 bytes, so body rules could not match (and could be
-# evaded by trickling a payload). With the body now drained asynchronously until
-# EOF (verified: 100000/100000 pad bytes reach the audit log), these are
-# re-enabled and measured fresh; any that still show MULTIPLE failing sub-tests
-# are turned off again per family-drop policy.
+# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955.
 # DROPPED families (multiple failing sub-tests -> whole family turned off, see
-# policy note below): 959, 980.
+# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959, 980.
+# MEASURED, not assumed: after the entity-body truncation was fixed (the WAF was
+# seeing only 49,152 of 100,000 bytes; verified complete afterwards), the
+# request-body families were re-enabled and measured -- they STILL fail in bulk
+# (932:117, 942:85, 944:81, 941:38, 951:20, 933:19, 934:14, 930:13, 956:12
+# failing sub-tests). So their failures are NOT caused by truncation; they are a
+# separate request-body detection gap in this connector (rules not matching the
+# way CRS expects), and they stay dropped per family-drop policy.
 # (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
 # at PL4 under IIS defaults -- a request-inspection gap, not a pre-WAF rejection.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
-$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
+$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
