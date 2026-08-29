@@ -87,21 +87,28 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
   log,\
   msg:'X-CRS-Test %{MATCHED_VAR}',\
   ctl:ruleRemoveById=1-999999"
+# Raise the CRS paranoia level to 4 so the regression exercises EVERY rule
+# family. This MUST come BEFORE the includes and MUST say phase:1 explicitly:
+#   * CRS gates each paranoia block with a PAIR of skipAfter rules, one per
+#     phase (e.g. 942013 phase:1 / 942014 phase:2, both "PL @lt 2").
+#   * REQUEST-901-INITIALIZATION.conf rule 901125 (phase:1) defaults the level
+#     with "&TX:detection_paranoia_level @eq 0", i.e. only if not already set.
+# Emitted after the includes (and without a phase), these SecActions inherited
+# crs-setup.conf's last SecDefaultAction and ran at the END of phase 1 -- after
+# 901125 had already defaulted the level to 1 and after the phase:1 gates had
+# already fired skipAfter. Result: every phase:1 PL2+ rule was silently skipped
+# (942101 URI-path, 942152/942321 Referer/User-Agent, 942420/942421 Cookie all
+# showed ZERO audit hits), while phase:2 PL2-PL4 rules ran fine because the
+# variable was set by the time phase 2 started. Setting it here, before the
+# includes, makes 901125's "@eq 0" test false and both gates see 4.
+SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4"
+SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.blocking_paranoia_level=4"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
 
-# Raise the CRS paranoia level to 4 so the regression exercises EVERY rule
-# family (PL2-PL4 rules like 942210/942380/944300/932236 are skipped at the
-# default detection_paranoia_level=1, which made ~1700 sub-tests fail with the
-# rule simply never evaluating). This is WAF-rule coverage, not IIS config -- it
-# does not relax Request Filtering. The CRS regression is designed to pass at a
-# high paranoia level; residual failures are genuine engine/IIS differences and
-# are folded into testoverride.ignore below.
-SecAction "id:990110,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4"
-SecAction "id:990120,pass,t:none,nolog,noauditlog,setvar:tx.blocking_paranoia_level=4"
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
 
@@ -325,7 +332,11 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
 # at PL4 under IIS defaults -- a request-inspection gap, not a pre-WAF rejection.)
 # (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
-$includeRegex = '^(911|913|922|931|943|949|950|952|953|954|955)'
+# MEASURING the phase:1 paranoia-ordering fix: re-enable all previously dropped
+# families, since the bug silently skipped every phase:1 PL2+ rule in EVERY
+# family (not just 942). Families that still show multiple failures go back out
+# per the family-drop policy.
+$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
