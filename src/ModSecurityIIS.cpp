@@ -545,6 +545,27 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         return FinishBodyRead(rsc, pHttpContext);
     }
 
+    // Pre-size the accumulator so multi-chunk bodies do not pay repeated
+    // reallocation + copy as they grow. The declared Content-Length is
+    // CLIENT-CONTROLLED, so it must never be used as an allocation size
+    // directly: a bogus "Content-Length: 4294967295" with no body would make us
+    // eagerly allocate gigabytes per request (a trivial memory-exhaustion DoS).
+    // Clamp: cover the common case (< 1 MiB) in one allocation, and let anything
+    // larger grow geometrically as it actually arrives. Chunked bodies declare no
+    // length, so they get no reserve.
+    // reserve() is a no-op once capacity is sufficient, which also makes this
+    // harmless when OnAsyncCompletion re-enters DriveBodyRead.
+    if (info.length > 0)
+    {
+        const size_t kPreReserveCap = 1024 * 1024;   // 1 MiB
+        ULONGLONG    want = info.length;
+        if (want > kPreReserveCap)
+        {
+            want = kPreReserveCap;
+        }
+        rsc->m_Body.reserve((size_t)want);
+    }
+
     for (;;)
     {
         DWORD read     = 0;
