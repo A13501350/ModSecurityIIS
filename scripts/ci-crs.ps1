@@ -350,7 +350,13 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # run ALL families and hardcode-exclude exactly those 288 known-bad sub-tests via
 # scripts/crs_ignore.txt (the testoverride.ignore mechanism, see below). That
 # maximizes coverage: every family's passing sub-tests are still exercised.
-$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
+# DIAGNOSTIC OVERRIDE (diag/single-body-test branch): run exactly ONE failing
+# request-body test so its full go-ftw output + audit log are readable without
+# 4883 tests of noise. 942100-15 POSTs an application/xml body and expects rule
+# 942100; it is one of the 288 "failed to run" sub-tests (transport/connector
+# handling, not a rule-logic mismatch). It is removed from crs_ignore.txt below
+# so testoverride.ignore does not skip it.
+$includeRegex = '^942100-15$'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
@@ -387,17 +393,20 @@ $ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
-Write-Host "[7/8] Running go-ftw (representative subset)..."
+Write-Host "[7/8] Running go-ftw (single diagnostic test 942100-15)..."
+# -o github: emit GitHub Actions annotations (::error::) with the full failure
+# detail; --show-failures-only is dropped so the single test's complete result
+# (expected vs actual / transport error) is captured, not just a summary.
 & $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig --show-failures-only 2>&1 |
+    --config $ftwConfig -o github 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
 $ftwCode = $LASTEXITCODE
 Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
-Write-Host "--- TAIL OF AUDIT LOG AFTER go-ftw ---"
-Get-Content $auditSrc -Tail 30 -ErrorAction SilentlyContinue
+Write-Host "--- FULL CRS AUDIT LOG (single test) ---"
+Get-Content $auditSrc -ErrorAction SilentlyContinue
 
 # --- 8) event-log hygiene (loader/config problems surface here) -------------------
 $bad = Get-WinEvent -FilterHashtable @{ LogName = "Application";
