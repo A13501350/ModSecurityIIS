@@ -101,8 +101,15 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # showed ZERO audit hits), while phase:2 PL2-PL4 rules ran fine because the
 # variable was set by the time phase 2 started. Setting it here, before the
 # includes, makes 901125's "@eq 0" test false and both gates see 4.
-SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4"
-SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.blocking_paranoia_level=4"
+# We also fold in the request/body/arg tuning that the official CRS regression
+# suite (coreruleset/coreruleset@main/tests/regression, rule id 900005) pins
+# before running go-ftw -- arg/body length limits and UTF-8 validation that the
+# regression tests are written against. We deliberately DO NOT copy upstream's
+# `ctl:ruleEngine=DetectionOnly` (our run asserts real 403 blocks) nor
+# `ctl:ruleRemoveById=910000` (would only trim coverage). 901125 makes
+# detection_paranoia_level follow blocking_paranoia_level when unset, so setting
+# BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
+SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -362,13 +369,15 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # run ALL families and hardcode-exclude exactly those 288 known-bad sub-tests via
 # scripts/crs_ignore.txt (the testoverride.ignore mechanism, see below). That
 # maximizes coverage: every family's passing sub-tests are still exercised.
-# DIAGNOSTIC OVERRIDE (diag/single-body-test branch): run exactly ONE failing
-# request-body test so its full go-ftw output + audit log are readable without
-# 4883 tests of noise. 942100-15 POSTs an application/xml body and expects rule
-# 942100; it is one of the 288 "failed to run" sub-tests (transport/connector
-# handling, not a rule-logic mismatch). It is removed from crs_ignore.txt below
-# so testoverride.ignore does not skip it.
-$includeRegex = '^942100-15$'
+# MEASUREMENT OVERRIDE (diag/single-body-test branch): run ALL CRS families with
+# the new canonical tuning and NO per-sub-test exclusions, so we can measure the
+# raw number of failing sub-tests and compare against the 344 hardcoded on
+# master (old tuning). When $MeasureMode is $true we skip testoverride.ignore
+# entirely and let every test run to completion (go-ftw then prints the full
+# `failed to run: [ ... ]` list). Set to $false to restore the green run using
+# scripts/crs_ignore.txt.
+$MeasureMode = $true
+$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
@@ -393,19 +402,36 @@ $ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | For
     $id = $_.Trim()
     "    '^$id`$': `"IIS connector: CRS 4.25.1 detection miss / request-body inspection gap (not a pre-WAF rejection)`""
   }) -join "`n"
-Write-Host "[7/8] Loaded $(@($ignoreYaml -split "`n").Count) ignored CRS sub-tests from crs_ignore.txt"
-@"
+if ($MeasureMode) {
+    Write-Host "[7/8] MEASUREMENT MODE: ignoring scripts/crs_ignore.txt -- every included test runs to completion."
+    $ignoreYaml = ''
+} else {
+    Write-Host "[7/8] Loaded $(@($ignoreYaml -split "`n").Count) ignored CRS sub-tests from crs_ignore.txt"
+}
+$ftwHeader = @"
 ---
 logfile: '$auditPathForYaml'
 logmarkerheadername: X-CRS-TEST
 mode: 'default'
+"@
+if ($ignoreYaml.Trim() -ne '') {
+    $ftwConfigContent = $ftwHeader + @"
+
 testoverride:
   ignore:
 $ignoreYaml
-"@ | Set-Content $ftwConfig -Encoding Ascii
+"@
+} else {
+    $ftwConfigContent = $ftwHeader
+}
+$ftwConfigContent | Set-Content $ftwConfig -Encoding Ascii
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
-Write-Host "[7/8] Running go-ftw (single diagnostic test 942100-15)..."
+if ($MeasureMode) {
+    Write-Host "[7/8] Running go-ftw (MEASUREMENT: all 20 families, no exclusions)..."
+} else {
+    Write-Host "[7/8] Running go-ftw (all families, exclusions applied)..."
+}
 # Default output (NOT -o github) so the complete failure reason for "failed to
 # run" is captured -- the github format collapses it to a placeholder.
 & $ftwExe run -d $testsDir --include $includeRegex `
@@ -416,8 +442,13 @@ Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
-Write-Host "--- FULL CRS AUDIT LOG (single test) ---"
-Get-Content $auditSrc -ErrorAction SilentlyContinue
+if ($MeasureMode) {
+    Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
+    Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }
+} else {
+    Write-Host "--- FULL CRS AUDIT LOG ---"
+    Get-Content $auditSrc -ErrorAction SilentlyContinue
+}
 
 # --- 8) event-log hygiene (loader/config problems surface here) -------------------
 $bad = Get-WinEvent -FilterHashtable @{ LogName = "Application";
