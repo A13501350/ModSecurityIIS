@@ -378,7 +378,9 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 # `failed to run: [ ... ]` bracket list (and any `💥 <id> failed` logic
 # mismatches for the kept families) into scripts/crs_ignore.txt.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
-$ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+# crs_ignore.txt may contain `#` comment / section-header lines; only treat
+# lines matching <rule>-<sub> (e.g. "942100-15") as exclusions.
+$ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -match '^[0-9]+-[0-9]+$' } | ForEach-Object {
     $id = $_.Trim()
     "    '^$id`$': `"IIS connector: CRS 4.25.1 detection miss / request-body inspection gap (not a pre-WAF rejection)`""
   }) -join "`n"
