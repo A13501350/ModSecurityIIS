@@ -395,6 +395,72 @@ testoverride:
 $ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC MODE (diag/all-failing-tests): run ONLY the known-failing sub-tests
+# and record each one together with its own audit-log slice.
+#   * One go-ftw invocation per test id, so the slice of audit.log written while
+#     that test ran is unambiguously attributable to that test id.
+#   * These tests are EXPECTED to fail -- the record is the deliverable -- so the
+#     mode is "wrapped": it always exits 0 and never fails the CI job.
+#   * testoverride.ignore is dropped for this mode, otherwise every test would be
+#     Ignored and emit no audit entries at all.
+# Set to $false to restore the normal green regression run.
+# ---------------------------------------------------------------------------
+$RunAllFailing = $true
+if ($RunAllFailing) {
+    $testsDir = Join-Path $crsDir "tests\regression\tests"
+    $auditSrc = Join-Path $auditDir "audit.log"
+    @"
+---
+logfile: '$auditPathForYaml'
+logmarkerheadername: X-CRS-TEST
+mode: 'default'
+"@ | Set-Content $ftwConfig -Encoding Ascii
+
+    $failingIds = @(Get-Content $ignoreFile |
+        Where-Object { $_.Trim() -match '^[0-9]+-[0-9]+$' } |
+        ForEach-Object { $_.Trim() })
+    $record = "$PWD\failing-tests-record.txt"
+    @"
+# Failing-test audit record -- ModSecurityIIS + OWASP CRS 4.25.1
+# ids    : scripts/crs_ignore.txt ($($failingIds.Count) known-failing sub-tests)
+# method : one go-ftw invocation per test id; the audit slice for a test is
+#          exactly the bytes appended to audit.log while that test ran.
+# note   : each slice also contains go-ftw's logmarker requests
+#          (GET /status/200 with X-CRS-TEST <uuid>-s / -e) that delimit the test.
+# status : these tests are expected to FAILED; PASSED means the exclusion is stale.
+"@ | Set-Content $record -Encoding UTF8
+
+    $offset = if (Test-Path $auditSrc) { (Get-Item $auditSrc).Length } else { 0 }
+    $i = 0; $passed = 0; $failed = 0
+    foreach ($id in $failingIds) {
+        $i++
+        $outText = (& $ftwExe run -d $testsDir --include "^$id`$" `
+            --config $ftwConfig 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+        $len = if (Test-Path $auditSrc) { (Get-Item $auditSrc).Length } else { 0 }
+        $slice = ''
+        if ($len -gt $offset) {
+            $fs = [System.IO.File]::Open($auditSrc, 'Open', 'Read', 'ReadWrite')
+            $fs.Position = $offset
+            $buf = New-Object byte[] ($len - $offset)
+            [void]$fs.Read($buf, 0, $buf.Length)
+            $fs.Close()
+            $slice = [System.Text.Encoding]::UTF8.GetString($buf)
+        }
+        $offset = $len
+        if ($code -eq 0) { $status = 'PASSED'; $passed++ } else { $status = 'FAILED'; $failed++ }
+        Write-Host "[$i/$($failingIds.Count)] $id -> $status"
+        Add-Content $record -Value "`n================= TEST $id  status=$status  go-ftw-exit=$code =================" -Encoding UTF8
+        Add-Content $record -Value $outText.TrimEnd() -Encoding UTF8
+        Add-Content $record -Value "`n----------------- audit log slice for $id -----------------" -Encoding UTF8
+        Add-Content $record -Value $slice.TrimEnd() -Encoding UTF8
+    }
+    Write-Host "[7/8] ALL-FAILING record: $($failingIds.Count) tests (PASSED=$passed FAILED=$failed) -> $record"
+    Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
+    exit 0
+}
+
 $testsDir = Join-Path $crsDir "tests\regression\tests"
 Write-Host "[7/8] Running go-ftw (representative subset)..."
 & $ftwExe run -d $testsDir --include $includeRegex `

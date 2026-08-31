@@ -183,3 +183,4 @@ jobs:
           path: |
             go-ftw-output.txt
             modsec_crs_audit.log
+            failing-tests-record.txt
