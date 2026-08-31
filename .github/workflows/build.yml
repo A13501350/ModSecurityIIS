@@ -104,8 +104,10 @@ jobs:
     needs: build
 
     steps:
-      - name: Checkout
+      - name: Checkout (with submodules, recursive)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Download built DLLs
         uses: actions/download-artifact@v8
