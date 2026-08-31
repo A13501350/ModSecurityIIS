@@ -1,21 +1,54 @@
 # OWASP CRS 4.25.1 regression exclusions -- ModSecurityIIS (libModSecurity v3, IIS defaults)
-# Source: measurement run 33265565369 (canonical tuning, all 20 families, no exclusions) = 341 failures.
-# These sub-tests are Ignored (not Failed) via testoverride.ignore in ci-crs.ps1 so CI stays green.
+# Source: run 33381996837 -- one go-ftw invocation per test, each test mapped to its own
+# audit-log slice (scripts/ci-crs.ps1 $RunAllFailing mode, branch diag/all-failing-tests).
+# These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays green.
 #
-# Root-cause classes:
-#   [T] transport / body-read gap  -- the request never reaches the engine as CRS expects
-#       (families 930/932/933/934/941/942/944/951/956; request-body / response inspection).
-#   [R] rule-evaluation nuance      -- the engine runs & blocks, but a specific CRS rule did not
-#       fire as the test expects (an individual detection difference, NOT a connector transport bug).
-# NOTE: family 942 is tagged [T] overall, but at least 942100-15 is a proven [R] rule-eval nuance
-#       (complete body delivered + 403 blocked, libinjection simply did not flag the payload).
+# Root-cause classes (MEASURED from the per-test audit slices, not inferred from families):
+#   [N] no request in engine (4) -- no audit entry at all for the test request; it never
+#       reached ModSecurity (pre-engine rejection).
+#   [D] attack rule never fired (303) -- the request DID reach the engine and WAS blocked
+#       (949110 inbound anomaly) via generic rules only: 920273 ValidateByteRange against
+#       REQUEST_BODY and/or 920300 missing-Accept against REQUEST_HEADERS. The specific
+#       attack rule the test expects never fired.
+#   [P] own-family rule fired, test still failed (34) -- partial / other mismatch.
 #
-# Total: 341  ([T] = 288, [R] = 53)
-# === [T] transport / body-read gap ===
+# WHY [D] HAPPENS -- one systemic cause:
+#   CRS attack rules inspect ARGS, but ARGS is essentially never populated from the request
+#   BODY. The body IS appended (REQUEST_BODY is available -- that is exactly why 920273 can
+#   match it), but it is never parsed into ARGS.
+#   Evidence across the 341 slices: ARGS/ARGS_NAMES were matched in only 8 tests. The 2 tests
+#   that send the payload in the QUERY STRING both DID produce ARGS matches (query-string
+#   parsing works), versus only 6 of the 335 body-based tests.
+#   => a single connector fix (parse the request body into ARGS) should recover most of [D].
+#
+# NOTE: the earlier [T] transport / [R] rule-eval split BY FAMILY was WRONG -- the two groups
+#       behave identically (request reaches the engine, generic rules fire, attack rule does not).
+#
+# Total: 341  ([N] = 4, [D] = 303, [P] = 34)
+
+# === [N] no request in engine (n=4) ===
+# --- 933 (n=1) ---
+933160-20
+# --- 934 (n=1) ---
+934101-5
+# --- 941 (n=1) ---
+941101-2
+# --- 942 (n=1) ---
+942101-6
+
+# === [D] attack rule never fired (generic 920273/920300 -> 949110 block) (n=303) ===
+# --- 922 (n=4) ---
+922130-1
+922130-2
+922130-4
+922130-7
 # --- 930 (n=3) ---
 930100-5
 930110-13
 930120-15
+# --- 931 (n=2) ---
+931100-3
+931100-5
 # --- 932 (n=40) ---
 932120-6
 932125-7
@@ -57,7 +90,7 @@
 932371-3
 932380-14
 932390-17
-# --- 933 (n=19) ---
+# --- 933 (n=18) ---
 933100-91
 933120-13
 933130-7
@@ -68,7 +101,6 @@
 933151-9
 933152-9
 933153-9
-933160-20
 933160-51
 933161-6
 933170-11
@@ -77,12 +109,10 @@
 933210-22
 933211-22
 9331200-11
-# --- 934 (n=14) ---
+# --- 934 (n=12) ---
 934100-35
-934101-5
 934101-11
 934110-10
-934120-43
 934120-53
 934130-2
 934130-15
@@ -92,9 +122,8 @@
 934170-5
 934180-4
 934190-21
-# --- 941 (n=36) ---
+# --- 941 (n=35) ---
 941100-7
-941101-2
 941110-13
 941120-52
 941130-22
@@ -129,14 +158,10 @@
 941380-2
 941390-12
 941400-8
-# --- 942 (n=63) ---
+# --- 942 (n=59) ---
 942100-15
-942101-6
 942120-45
 942130-11
-942131-3
-942131-5
-942131-7
 942131-8
 942140-18
 942150-20
@@ -193,31 +218,11 @@
 942540-8
 942550-49
 942560-4
-# --- 944 (n=81) ---
-944100-11
-944100-12
-944100-15
-944100-16
-944110-11
-944110-12
-944110-15
-944110-16
-944120-6
-944120-7
-944120-23
-944120-24
-944120-40
-944120-41
-944120-57
-944120-58
-944120-74
-944120-75
-944120-91
-944120-92
-944120-108
-944120-109
-944120-125
-944120-126
+# --- 943 (n=3) ---
+943100-3
+943110-42
+943120-2
+# --- 944 (n=51) ---
 944150-3
 944150-4
 944150-9
@@ -269,12 +274,16 @@
 944152-21
 944152-22
 944152-24
-944210-6
-944210-7
-944210-23
-944210-24
-944210-40
-944210-41
+# --- 950 (n=9) ---
+950150-1
+950150-2
+950150-3
+950150-4
+950150-5
+950150-6
+950150-7
+950150-8
+950150-9
 # --- 951 (n=20) ---
 951110-1
 951120-1
@@ -296,42 +305,6 @@
 951240-2
 951250-1
 951260-1
-# --- 956 (n=12) ---
-956100-1
-956100-2
-956100-3
-956100-4
-956100-5
-956100-6
-956100-7
-956100-8
-956100-9
-956110-1
-956110-2
-956110-3
-# === [R] rule-evaluation nuance ===
-# --- 922 (n=4) ---
-922130-1
-922130-2
-922130-4
-922130-7
-# --- 931 (n=2) ---
-931100-3
-931100-5
-# --- 943 (n=3) ---
-943100-3
-943110-42
-943120-2
-# --- 950 (n=9) ---
-950150-1
-950150-2
-950150-3
-950150-4
-950150-5
-950150-6
-950150-7
-950150-8
-950150-9
 # --- 952 (n=9) ---
 952110-1
 952110-2
@@ -371,3 +344,55 @@
 955400-1
 955400-2
 955400-3
+# --- 956 (n=12) ---
+956100-1
+956100-2
+956100-3
+956100-4
+956100-5
+956100-6
+956100-7
+956100-8
+956100-9
+956110-1
+956110-2
+956110-3
+
+# === [P] own-family rule fired but test still failed (n=34) ===
+# --- 934 (n=1) ---
+934120-43
+# --- 942 (n=3) ---
+942131-3
+942131-5
+942131-7
+# --- 944 (n=30) ---
+944100-11
+944100-12
+944100-15
+944100-16
+944110-11
+944110-12
+944110-15
+944110-16
+944120-6
+944120-7
+944120-23
+944120-24
+944120-40
+944120-41
+944120-57
+944120-58
+944120-74
+944120-75
+944120-91
+944120-92
+944120-108
+944120-109
+944120-125
+944120-126
+944210-6
+944210-7
+944210-23
+944210-24
+944210-40
+944210-41
