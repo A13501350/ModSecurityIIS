@@ -468,8 +468,17 @@ $txAll = [System.Text.StringBuilder]::new()
 Set-Content -Path "$PWD\go-ftw-output.txt" -Value $txAll.ToString() -Encoding UTF8
 
 # ---- go-ftw's OWN view: --debug on one [T] test to see why it reports 'failed to run' -
-Write-Host "[7/8] go-ftw --debug on 930100-5 (captures go-ftw client + audit-match view)"
-$dbg = (& $ftwExe run -d $testsDir --include "^930100-5`$" --config $ftwConfig --debug 2>&1 | Out-String)
+# Use a config WITHOUT testoverride.ignore, otherwise 930100-5 would be Ignored
+# ("no tests found") and we'd never see the real error.
+$dbgConfig = Join-Path $ConfRoot "ftw-debug.yaml"
+@"
+---
+logfile: '$auditPathForYaml'
+logmarkerheadername: X-CRS-TEST
+mode: 'default'
+"@ | Set-Content $dbgConfig -Encoding Ascii
+Write-Host "[7/8] go-ftw --debug on 930100-5 (clean config, captures go-ftw client + audit-match view)"
+$dbg = (& $ftwExe run -d $testsDir --include "^930100-5`$" --config $dbgConfig --debug 2>&1 | Out-String)
 [void]$txAll.AppendLine()
 [void]$txAll.AppendLine("=== go-ftw --debug for 930100-5 (why does it report 'failed to run'?) ===")
 [void]$txAll.AppendLine($dbg)
