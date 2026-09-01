@@ -133,7 +133,12 @@ SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_pa
 # path). We re-assert the rule engine AND the audit settings AFTER the Include,
 # since libModSecurity takes the LAST value for these directives.
 Include $recConf
-SecRuleEngine On
+# DIAGNOSTIC RUN: SecRuleEngine DetectionOnly replicates CRS CI exactly
+# (tests/docker-compose.yml sets MODSEC_RULE_ENGINE: DetectionOnly and go-ftw
+# judges by audit-log IDs, not status). Purpose: test whether blocking mode
+# (On) itself suppresses rule matches such as 930100 (user hypothesis), and
+# give the XML XPath diagnostics below a CRS-CI-identical baseline.
+SecRuleEngine DetectionOnly
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
@@ -157,6 +162,15 @@ SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "i
 # http.sys reset the connection); the fix parks it until FinishBodyRead().
 # Curl probes E/F below compare the client-visible outcome on both connectors.
 SecRule REQUEST_HEADERS:X-Phase1Probe "@streq block" "id:200020,phase:1,deny,status:403,log,msg:'phase1 block probe (body present)'"
+# XML XPath diagnostics: locate exactly where XML:* inspection breaks. 200023
+# proves the block loaded and phase 2 ran for XML content types; 200025 proves
+# the XML request-body processor engaged; 200022 proves the DOM doc exists and
+# root-element XPath works; 200021 proves attribute XPath (//@*) works -- the
+# exact variable CRS 930100/930110/930120 use to see XML attributes.
+SecRule REQUEST_HEADERS:Content-Type "@rx (?i)xml" "id:200023,phase:2,pass,log,auditlog,msg:'XMLDIAG-CONTROL loaded and phase2 ran'"
+SecRule REQBODY_PROCESSOR "@streq XML" "id:200025,phase:2,pass,log,auditlog,msg:'XMLDIAG-PROCESSOR-ENGAGED'"
+SecRule XML:/* "@rx .*" "id:200022,phase:2,pass,log,auditlog,msg:'XMLDIAG-ROOT-XPATH doc present'"
+SecRule XML://@* "@rx .*" "id:200021,phase:2,pass,log,auditlog,msg:'XMLDIAG-ATTR-XPATH attributes visible'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
