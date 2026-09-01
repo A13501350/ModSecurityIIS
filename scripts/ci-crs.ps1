@@ -465,6 +465,15 @@ $txAll = [System.Text.StringBuilder]::new()
 
 Set-Content -Path "$PWD\go-ftw-output.txt" -Value $txAll.ToString() -Encoding UTF8
 
+# ---- go-ftw's OWN view: --debug on one [T] test to see why it reports 'failed to run' -
+Write-Host "[7/8] go-ftw --debug on 930100-5 (captures go-ftw client + audit-match view)"
+$dbg = (& $ftwExe run -d $testsDir --include "^930100-5`$" --config $ftwConfig --debug 2>&1 | Out-String)
+[void]$txAll.AppendLine()
+[void]$txAll.AppendLine("=== go-ftw --debug for 930100-5 (why does it report 'failed to run'?) ===")
+[void]$txAll.AppendLine($dbg)
+Add-Content -Path "$PWD\go-ftw-output.txt" -Value $dbg -Encoding UTF8
+Write-Host $dbg
+
 # ---- harvest FREB logs into the audit dir (captured by iis-smoke-diagnostics) -
 $frebDst = "C:\inetpub\logs\modsec-audit\freb"
 New-Item -ItemType Directory -Force $frebDst | Out-Null
