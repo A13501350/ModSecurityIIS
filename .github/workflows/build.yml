@@ -26,10 +26,6 @@ on:
 
 jobs:
   build:
-    # When a prior DLL is reused via workflow input `build_run_id`, skip this job
-    # entirely (no runner, no checkout/Conan/MSVC/sccache setup). On a plain push
-    # (no dispatch inputs) we must still build, so guard with event_name.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_run_id == '' }}
     runs-on: windows-latest
 
     steps:
@@ -120,11 +116,10 @@ jobs:
   # pass-through, audit log, event log). Failure here fails the workflow.
   smoke-iis:
     runs-on: windows-latest
-    # Depend on `build` except when reusing a DLL via `build_run_id` (where build
-    # is skipped and we download that run's artifact directly). `needs` can only
-    # see the `github` named-value, hence `github.event.inputs`; the event_name
-    # guard keeps the dependency on push (no dispatch inputs exist then).
-    needs: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.build_run_id == '') && fromJSON('["build"]') || fromJSON('[]') }}
+    # The build job still runs on reuse, but its Configure/Build/Upload steps are
+    # gated (if: inputs.build_run_id == '') so the ~6-min compile + DLL upload are
+    # skipped; smoke-iis downloads the reused DLL directly via the run-id input.
+    needs: build
 
     steps:
       - name: Checkout (with submodules, recursive)
