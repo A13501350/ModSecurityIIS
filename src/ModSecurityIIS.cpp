@@ -341,21 +341,8 @@ static PCSTR StandardReason(int status)
     }
 }
 
-// Consumes any pending intervention WITHOUT writing a response, so that a block
-// decided before the entity body was read can be applied after the body has been
-// drained. Returns true when the engine asked for a disruptive action; the
-// status and redirect URL to apply are handed back through outStatus / outUrl
-// (an empty outUrl means "no redirect").
-//
-// intervention() is a CONSUMING read: once it has returned true the transaction
-// no longer reports that intervention, so a caller that gets true MUST apply it
-// via FinalizeBlock() -- possibly later, but exactly once.
-static bool ConsumeIntervention(REQUEST_STORED_CONTEXT* rsc,
-                                int& outStatus, std::string& outUrl)
+static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
-    outStatus = 0;
-    outUrl.clear();
-
     modsecurity::Transaction* tx = rsc->m_pTx;
     if (tx == nullptr)
     {
@@ -391,39 +378,9 @@ static bool ConsumeIntervention(REQUEST_STORED_CONTEXT* rsc,
         return false;
     }
 
-    outStatus = status;
-    outUrl    = redirectUrl;
-    return true;
-}
-
-
-// Writes the disruptive response and terminates the request.
-//
-// CALLERS MUST HAVE CONSUMED THE ENTITY BODY FIRST. Ending a request that still
-// has an unread body makes http.sys reset the connection (RST) instead of
-// delivering the response: the client then reports a transport error and never
-// sees the block. That is why a phase-1 block is deferred to FinishBodyRead()
-// and why FinishBodyRead() never hands the body back once it knows it will block.
-static void FinalizeBlock(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
-                          int status, const std::string& redirectUrl)
-{
-    modsecurity::Transaction* tx = rsc->m_pTx;
-
-    IHttpResponse* pResponse = pHttpContext->GetResponse();
-    if (pResponse == NULL)
-    {
-        // Nothing to write to; still record the status and close the request.
-        if (tx != nullptr)
-        {
-            tx->updateStatusCode(403);
-        }
-        pHttpContext->SetRequestHandled();
-        rsc->FinishRequest();
-        return;
-    }
-
     // A disruptive action was requested. Prefer a redirect when the rule
     // supplied one; otherwise honor the explicit status (defaulting to 403).
+    IHttpResponse* pResponse = pHttpContext->GetResponse();
     pResponse->Clear();
     int finalStatus = status;
     if (!redirectUrl.empty())
@@ -449,21 +406,7 @@ static void FinalizeBlock(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContex
         }
         pResponse->SetStatus((USHORT)status, StandardReason(status));
         finalStatus = status;
-        // Make the response self-delimited: we send no entity, so without an
-        // explicit Content-Length a keep-alive client cannot tell where the
-        // (empty) body ends and can wait for data that never arrives. Set it
-        // only here -- a redirect may carry an entity of its own, and asserting
-        // 0 there would truncate it.
-        pResponse->SetHeader("Content-Length", "0", (USHORT)1, TRUE);
     }
-
-    // Never hand this connection back to the keep-alive pool: the client may
-    // still be uploading, and the body is drained only on a best-effort basis
-    // (a read error ends the loop early), so the connection can still have
-    // unread request bytes queued on it.
-    // fReplace = TRUE so a value IIS already set is replaced, not duplicated
-    // into a second (conflicting) header.
-    pResponse->SetHeader("Connection", "close", (USHORT)5, TRUE);
 
     // Tell the ENGINE which status we actually returned. Without this the
     // engine keeps m_httpCodeReturned at its constructor default of 200
@@ -478,30 +421,12 @@ static void FinalizeBlock(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContex
     //     (audit_log/audit_log.cc:298), so blocked requests can be dropped
     //     from the audit log entirely -- a real visibility loss;
     //   * the RESPONSE_STATUS variable, which phase-3+ rules may key on.
-
     // updateStatusCode() sets both m_httpCodeReturned and RESPONSE_STATUS,
     // and must run BEFORE FinishRequest() triggers processLogging().
-    if (tx != nullptr)
-    {
-        tx->updateStatusCode(finalStatus);
-    }
+    tx->updateStatusCode(finalStatus);
 
     pHttpContext->SetRequestHandled();
     rsc->FinishRequest();
-}
-
-
-// Convenience wrapper for the paths where the request body has already been
-// consumed (the response phases): decide and apply in one step.
-static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
-{
-    int         status = 0;
-    std::string redirectUrl;
-    if (!ConsumeIntervention(rsc, status, redirectUrl))
-    {
-        return false;
-    }
-    FinalizeBlock(rsc, pHttpContext, status, redirectUrl);
     return true;
 }
 
@@ -713,19 +638,29 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
 REQUEST_NOTIFICATION_STATUS
 CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
-    // A block that was decided in phase 1 and parked so the body could be
-    // drained: the body is consumed now, so the response can finally go out.
-    // Deliberately neither run the body phase (the request is already denied)
-    // nor hand the body back to a handler that will never run.
-    if (rsc->m_PendingBlock)
-    {
-        FinalizeBlock(rsc, pHttpContext,
-                      rsc->m_PendingBlockStatus, rsc->m_PendingBlockUrl);
-        return RQ_NOTIFICATION_FINISH_REQUEST;
-    }
-
     try
     {
+        // Hand the FULL body back so the downstream handler still receives it.
+        // InsertEntityBody() inserts BEFORE any remaining unread entity body, so
+        // it is called exactly ONCE and only after the body has been drained --
+        // inserting per chunk while still reading would make the next
+        // ReadEntityBody() return our own copy. IIS does not copy the buffer, so
+        // it must outlive the request: allocate it from request-scoped memory
+        // rather than using the read buffer.
+        IHttpRequest* pRequest = pHttpContext->GetRequest();
+        if (pRequest != NULL && !rsc->m_Body.empty())
+        {
+            void* pBody = pHttpContext->AllocateRequestMemory(
+                              (DWORD)rsc->m_Body.size());
+            if (pBody != NULL)
+            {
+                memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
+                pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
+            }
+            // Allocation failure: there is nothing safe to forward, so the
+            // handler simply sees an empty body. Never fail the request here.
+        }
+
         // Feed the body to the engine, bounded to bound memory use.
         const size_t maxInspect = GetMaxInspectBodyBytes();
         size_t take = rsc->m_Body.size();
@@ -752,54 +687,10 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
-    // Decide whether to block BEFORE handing the body back. InsertEntityBody()
-    // queues the bytes as UNREAD entity again, and terminating a request that
-    // still has an unread body is exactly what makes http.sys reset the
-    // connection instead of delivering our response -- the client then sees a
-    // transport error ("failed to run") rather than the block. When we block,
-    // the bytes we already read stay consumed and nothing is queued back.
-    int         status      = 0;
-    std::string redirectUrl;
-    if (ConsumeIntervention(rsc, status, redirectUrl))
+    if (ApplyIntervention(rsc, pHttpContext))
     {
-        FinalizeBlock(rsc, pHttpContext, status, redirectUrl);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
-
-    // Not blocking: hand the FULL body back so the downstream handler still
-    // receives it. InsertEntityBody() inserts BEFORE any remaining unread entity
-    // body, so it is called exactly ONCE and only after the body has been
-    // drained -- inserting per chunk while still reading would make the next
-    // ReadEntityBody() return our own copy. IIS does not copy the buffer, so it
-    // must outlive the request: allocate it from request-scoped memory rather
-    // than using the read buffer.
-    try
-    {
-        IHttpRequest* pRequest = pHttpContext->GetRequest();
-        if (pRequest != NULL && !rsc->m_Body.empty())
-        {
-            void* pBody = pHttpContext->AllocateRequestMemory(
-                              (DWORD)rsc->m_Body.size());
-            if (pBody != NULL)
-            {
-                memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
-                pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
-            }
-            // Allocation failure: there is nothing safe to forward, so the
-            // handler simply sees an empty body. Never fail the request here.
-        }
-    }
-    catch (const std::exception& e)
-    {
-        ReportException("FinishBodyRead (InsertEntityBody)", e.what());
-        return RQ_NOTIFICATION_FINISH_REQUEST;
-    }
-    catch (...)
-    {
-        ReportException("FinishBodyRead (InsertEntityBody)", NULL);
-        return RQ_NOTIFICATION_FINISH_REQUEST;
-    }
-
     return RQ_NOTIFICATION_CONTINUE;
 }
 
@@ -1034,32 +925,9 @@ CMyHttpModule::OnBeginRequest(
     }
 
     tx->processRequestHeaders();
-
-    // A phase-1 block must NOT be written out while the request still carries an
-    // unread entity body: terminating a request that way makes http.sys reset the
-    // connection, so the client never gets to read our response (go-ftw reports
-    // that as "failed to run" -- a transport error, not a detection miss). Park
-    // the decision instead; the body-read path drains the body through the
-    // existing async loop and FinishBodyRead() writes the block afterwards.
+    if (ApplyIntervention(rsc, pHttpContext))
     {
-        int         ph1Status = 0;
-        std::string ph1Url;
-        if (ConsumeIntervention(rsc, ph1Status, ph1Url))
-        {
-            if (GetEntityBodyInfo(pRequest->GetRawHttpRequest()).hasBody)
-            {
-                rsc->m_PendingBlock       = true;
-                rsc->m_PendingBlockStatus = ph1Status;
-                rsc->m_PendingBlockUrl    = ph1Url;
-                // Fall through: DriveBodyRead() drains, FinishBodyRead() blocks.
-            }
-            else
-            {
-                // Nothing to drain, so the response can go out immediately.
-                FinalizeBlock(rsc, pHttpContext, ph1Status, ph1Url);
-                return RQ_NOTIFICATION_FINISH_REQUEST;
-            }
-        }
+        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     // --- request body ---
