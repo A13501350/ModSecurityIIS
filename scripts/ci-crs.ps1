@@ -140,11 +140,18 @@ SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
 # Parse XML bodies INTO the XML:/* collection. libModSecurity v3.0.x only
 # populates XML:/* (which CRS rules such as 930100 inspect) when
-# SecParseXmlIntoArgs is On; the property's merge default leaves it
-# PropertyNotSet, so XML bodies are parsed for well-formedness but never
-# turned into XML:* args -> XML content-inspection rules silently miss. The
-# JSON processor populates JSON:* unconditionally, so only XML needs this.
-SecParseXmlIntoArgs On
+# m_secXMLParseXmlIntoArgs is True/OnlyArgs; the property's merge default
+# leaves it PropertyNotSet, so the XML request-body processor parses for
+# well-formedness but never creates the XML:* args -> XML content-inspection
+# rules silently miss. The directive `SecParseXmlIntoArgs On` is accepted but
+# does NOT propagate to the transaction in this build (the merge macro is
+# never called), so we set it per-request instead: this phase-1 rule matches
+# the same Content-Type that modsecurity.conf-recommended rule 200000 uses to
+# select the XML processor, and ctl:parseXmlIntoArgs writes the property
+# directly onto the transaction before processRequestBody() reads it. The JSON
+# processor populates JSON:* unconditionally, so only XML needs this.
+SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" \
+  "id:200010,phase:1,t:none,t:lowercase,pass,nolog,ctl:parseXmlIntoArgs=on"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
