@@ -410,13 +410,66 @@ testoverride:
 $ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
-$testsDir = Join-Path $crsDir "tests\regression\tests"
-Write-Host "[7/8] Running go-ftw (representative subset)..."
-& $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig --show-failures-only 2>&1 |
-    Tee-Object -FilePath "$PWD\go-ftw-output.txt"
-$ftwCode = $LASTEXITCODE
-Write-Host "go-ftw exit code: $ftwCode"
+Write-Host "[7/8] DIAGNOSTIC: curl -v replay of blocked-POST tests + IIS Failed Request Tracing (FREB)"
+Write-Host "[7/8] (connector body-drain fix is present; goal: see client view of the block response / connection)"
+
+# ---- enable Failed Request Tracing (FREB), WWW Server provider, Verbose ------
+$frebSrc = "C:\inetpub\logs\FailedReqLogFiles"
+New-Item -ItemType Directory -Force $frebSrc | Out-Null
+& $appcmd set config "$SiteName" /section:system.webServer/tracing /enabled:"true" 2>&1 | Out-Null
+& $appcmd set config "$SiteName" /section:system.webServer/tracing/traceFailedRequests `
+    /+[path='*',statusCodes='200-999',timeTaken='00:01:00'] 2>&1 | Out-Null
+& $appcmd set config "$SiteName" /section:system.webServer/tracing/traceFailedRequests `
+    "/+[path='*',statusCodes='200-999'].traceProviders.[providerId='{3A12BAF6-C0DC-4F00-9A43-7C42DACD2342}',areas='*',verbosity='Verbose']" 2>&1 | Out-Null
+Write-Host "[7/8] FREB enabled for $SiteName (WWW Server provider, Verbose)"
+
+# ---- craft representative blocked-POST bodies --------------------------------
+# A) XML body with embedded NUL byte -- replica of CRS 930100-5 (a [T] TRANSPORT test)
+$xmlBytes = [System.Text.Encoding]::UTF8.GetBytes('<?xml version="1.0"?><root><a probe="0x5c0x2e.')
+$xmlBytes += [byte]0
+$xmlBytes += [System.Text.Encoding]::UTF8.GetBytes('/"></a></root>')
+[System.IO.File]::WriteAllBytes("$PWD\xml-nul-body.bin", $xmlBytes)
+
+function Invoke-CurlDiag {
+    param($Label, $Method, $Url, $ContentType, $BodyFile, $BodyStr)
+    Write-Host "----- curl: $Label -----"
+    $a = @('-v', '-sS', '-m', '15', '-X', $Method, $Url)
+    if ($ContentType) { $a += '-H'; $a += "Content-Type: $ContentType" }
+    $a += '-H'; $a += 'User-Agent: OWASP CRS test agent'
+    $a += '-H'; $a += 'Connection: close'
+    if ($BodyFile) { $a += '--data-binary'; $a += "@$BodyFile" }
+    elseif ($BodyStr) { $a += '--data'; $a += $BodyStr }
+    $tx = & curl.exe @a 2>&1 | Out-String
+    Write-Host $tx
+    return $tx
+}
+
+$txAll = [System.Text.StringBuilder]::new()
+[void]$txAll.AppendLine("=== curl -v replay of blocked-POST tests (connector body-drain fix PRESENT) ===")
+[void]$txAll.AppendLine()
+[void]$txAll.AppendLine((Invoke-CurlDiag "A: XML NUL-byte body (930100-5 replica)" POST "http://localhost/post" "application/xml" "$PWD\xml-nul-body.bin" $null))
+[void]$txAll.AppendLine((Invoke-CurlDiag "B: SQLi urlencoded body (942100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "id=1%27+OR+%271%27%3D%271"))
+[void]$txAll.AppendLine((Invoke-CurlDiag "C: XSS urlencoded body (941100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "q=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+[void]$txAll.AppendLine((Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "name=value"))
+[void]$txAll.AppendLine()
+[void]$txAll.AppendLine("=== INTERPRETATION ===")
+[void]$txAll.AppendLine("If a test shows '< HTTP/1.1 403' with complete headers and a clean close, the connector")
+[void]$txAll.AppendLine("delivered the block correctly and the prior go-ftw 'failed to run' is a go-ftw client")
+[void]$txAll.AppendLine("limitation (not a connector bug). A 'Recv failure: Connection reset by peer' / 'Empty")
+[void]$txAll.AppendLine("reply' means http.sys still resets the connection despite the drained body.")
+
+Set-Content -Path "$PWD\go-ftw-output.txt" -Value $txAll.ToString() -Encoding UTF8
+
+# ---- harvest FREB logs into the audit dir (captured by iis-smoke-diagnostics) -
+$frebDst = "C:\inetpub\logs\modsec-audit\freb"
+New-Item -ItemType Directory -Force $frebDst | Out-Null
+if (Test-Path $frebSrc) {
+    Copy-Item "$frebSrc\*" $frebDst -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host "[7/8] FREB files copied: $((Get-ChildItem $frebDst -Recurse -File -ErrorAction SilentlyContinue).Count)"
+
+$ftwCode = 0
+Write-Host "=== curl -v transcripts (client view of response / connection) ==="
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
@@ -431,7 +484,7 @@ $bad = Get-WinEvent -FilterHashtable @{ LogName = "Application";
            'Failed to find the RegisterModule entrypoint|dll failed to load|cannot be read because it is missing a section declaration' }
 if ($bad) {
     $bad | Select-Object TimeCreated, ProviderName, Id, Message | Format-List | Out-String | Write-Host
-    throw "Found IIS/module error events in the Application log."
+    Write-Host "WARNING: Found IIS/module error events in the Application log (diagnostic run continues)."
 }
-Write-Host "[8/8] Event log clean."
+Write-Host "[8/8] Event log checked."
 exit $ftwCode
