@@ -1,4 +1,11 @@
 name: Build ModSecurityIIS
+# Give dispatched runs a human-readable name so they can be told apart in the
+# Actions list (we repeatedly lost track of which run-id held the modsecurityiis
+# artifact, e.g. reuse runs never upload the DLL). `label` is free-form; when
+# build_run_id is set we also tag the reuse so the source run is obvious. Push
+# events leave both empty and fall back to the plain workflow name.
+run-name: >-
+  ${{ inputs.label != '' && inputs.label || 'Build ModSecurityIIS' }}${{ inputs.build_run_id != '' && format(' [reuse {0}]', inputs.build_run_id) || '' }}
 
 on:
   push:
@@ -14,10 +21,19 @@ on:
       - '**/*.editorconfig'
   workflow_dispatch:
     inputs:
+      # Human-readable name shown in the Actions list for this run. Leave blank
+      # for the default "Build ModSecurityIIS".
+      label:
+        description: 'Name for this run (shown in the Actions list)'
+        required: false
+        default: ''
+        type: string
       # Reuse a previously built DLL artifact instead of rebuilding (the build job
       # takes ~6 min and is unchanged when only scripts/ci-crs.ps1 is edited). Pass
       # the run-id of any successful build run that produced the `modsecurityiis`
-      # artifact. Leave blank to build normally.
+      # artifact. Leave blank to build normally. IMPORTANT: this must be the run-id
+      # of a FULL BUILD that actually uploaded the `modsecurityiis` artifact -- a
+      # run that itself reused a DLL does NOT re-upload it, so its id will 404.
       build_run_id:
         description: 'Optional run-id of a prior build to reuse the DLL artifact'
         required: false
