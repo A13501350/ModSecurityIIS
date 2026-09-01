@@ -12,7 +12,8 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false), m_BodyReadActive(false)
+          m_ResponseHeadersFed(false), m_BodyReadActive(false),
+          m_PendingBlock(false), m_PendingBlockStatus(0)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -89,6 +90,16 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // True while an asynchronous ReadEntityBody() is in flight. OnAsyncCompletion
     // uses it to tell our own completions apart from any other async operation.
     bool                      m_BodyReadActive;
+    // A disruptive intervention that was decided BEFORE the entity body had been
+    // read (a phase-1 rule). The response must not be written while the request
+    // still has an unread body -- ending a request that way makes http.sys reset
+    // the connection instead of delivering our response, so the client sees a
+    // transport error rather than the block. The decision is therefore parked
+    // here and applied by FinishBodyRead() once the body has been drained.
+    // Status 0 and an empty URL mean "block with the default 403".
+    bool                      m_PendingBlock;
+    int                       m_PendingBlockStatus;
+    std::string               m_PendingBlockUrl;
 };
 
 
