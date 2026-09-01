@@ -25,6 +25,8 @@ $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
 
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"
+# go-ftw test directory (the --debug invocation below depends on this).
+$testsDir = Join-Path $crsDir "tests/regression/tests"
 New-Item -ItemType Directory -Force $crsDir | Out-Null
 $tgz     = Join-Path $env:TEMP "crs-$CrsVersion.tar.gz"
 $url     = "https://github.com/coreruleset/coreruleset/archive/refs/tags/$CrsVersion.tar.gz"
