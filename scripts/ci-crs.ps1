@@ -138,6 +138,13 @@ SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
+# Parse XML bodies INTO the XML:/* collection. libModSecurity v3.0.x only
+# populates XML:/* (which CRS rules such as 930100 inspect) when
+# SecParseXmlIntoArgs is On; the property's merge default leaves it
+# PropertyNotSet, so XML bodies are parsed for well-formedness but never
+# turned into XML:* args -> XML content-inspection rules silently miss. The
+# JSON processor populates JSON:* unconditionally, so only XML needs this.
+SecParseXmlIntoArgs On
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
