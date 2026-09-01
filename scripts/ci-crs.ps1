@@ -171,6 +171,17 @@ SecRule REQUEST_HEADERS:Content-Type "@rx (?i)xml" "id:200023,phase:2,pass,log,a
 SecRule REQBODY_PROCESSOR "@streq XML" "id:200025,phase:2,pass,log,auditlog,msg:'XMLDIAG-PROCESSOR-ENGAGED'"
 SecRule XML:/* "@rx .*" "id:200022,phase:2,pass,log,auditlog,msg:'XMLDIAG-ROOT-XPATH doc present'"
 SecRule XML://@* "@rx .*" "id:200021,phase:2,pass,log,auditlog,msg:'XMLDIAG-ATTR-XPATH attributes visible'"
+# Discriminators for why 930100 itself never fires although (a) XML://@* sees
+# the attribute value and (b) the 930100 regex matches that exact value locally:
+# 200026 = 930100's exact VARIABLE LIST with a trivial regex -> isolates the
+# multi-variable resolution (REQUEST_URI_RAW|ARGS|...|!Referer|FILES|XML:/*|XML://@*);
+# 200027 = XML://@* alone with 930100's EXACT regex -> isolates PCRE compilation
+# of the huge pattern in this build; 200028 = full 930100 clone (same vars,
+# regex, actions) -> if 200026+200027 fire but 200028 does not, the action
+# combination (block/capture/setvar) is implicated.
+SecRule REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@* "@rx 0x5c0x2e" "id:200026,phase:2,pass,log,auditlog,msg:'XMLDIAG-MULTIVAR-LIST ok'"
+SecRule XML://@* "@rx (?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))" "id:200027,phase:2,pass,log,auditlog,msg:'XMLDIAG-930100-REGEX on XML://@* ok'"
+SecRule REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@* "@rx (?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))" "id:200028,phase:2,block,capture,t:none,msg:'XMLDIAG-FULL-CLONE of 930100',logdata:'Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}',ver:'OWASP_CRS/4.25.1',severity:'CRITICAL',setvar:'tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}',setvar:'tx.lfi_score=+%{tx.critical_anomaly_score}'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
