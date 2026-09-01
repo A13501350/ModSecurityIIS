@@ -147,6 +147,11 @@ SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
+# DIAGNOSTIC: engine debug log; ci-crs.ps1 greps it for "930100" below and
+# appends the lines to go-ftw-output.txt, so we can see whether/where the
+# engine evaluates the rule (level 9 is fine for this 1-test run).
+SecDebugLog $auditDir\debug.log
+SecDebugLogLevel 9
 # --- local rules. ALL SINGLE-LINE: PowerShell here-strings do not honor `\`
 # --- line continuations (a split rule once silently failed to load).
 # 200010: the SecParseXmlIntoArgs directive is accepted by the v3.0.16 parser
@@ -506,6 +511,11 @@ $rD = Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localho
 # F is the no-body baseline (both connectors should deliver a clean 403).
 $rE = Invoke-CurlDiag "E: phase-1 deny + POST body (A/B: master RST vs fix defers)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "x=1" "X-Phase1Probe: block"
 $rF = Invoke-CurlDiag "F: phase-1 deny + GET no body (baseline: clean 403 both)" GET "http://localhost/status/200" $null $null $null "X-Phase1Probe: block"
+# G: same 930100 payload in the QUERY STRING (no %00, http.sys-safe). If 930100
+# fires here via REQUEST_URI_RAW/ARGS but not on XML://@*, the rule is loaded
+# and the defect is specific to its XML variable evaluation; if it does not
+# fire here either, the rule is never executed at all.
+$rG = Invoke-CurlDiag "G: LFI payload in query string (930100 via URI/ARGS)" GET "http://localhost/post?x=0x5c0x2e0x2e0x2f" $null $null $null
 
 $txAll = [System.Text.StringBuilder]::new()
 [void]$txAll.AppendLine("=== curl -v replay of blocked-POST tests (connector body-drain fix PRESENT) ===")
@@ -516,6 +526,7 @@ $txAll = [System.Text.StringBuilder]::new()
 [void]$txAll.AppendLine($rD)
 [void]$txAll.AppendLine($rE)
 [void]$txAll.AppendLine($rF)
+[void]$txAll.AppendLine($rG)
 [void]$txAll.AppendLine()
 [void]$txAll.AppendLine("=== INTERPRETATION ===")
 [void]$txAll.AppendLine("If a test shows '< HTTP/1.1 403' with complete headers and a clean close, the connector")
@@ -542,6 +553,23 @@ $dbg = (& $ftwExe run -d $testsDir --include "^930100-5`$" --config $dbgConfig -
 [void]$txAll.AppendLine($dbg)
 Add-Content -Path "$PWD\go-ftw-output.txt" -Value $dbg -Encoding UTF8
 Write-Host $dbg
+
+# ---- engine's own account of rule 930100: grep the SecDebugLog ---------------
+# Level 9 logs each rule evaluation. If 930100 appears here, it runs and fails
+# to match; if it is absent, it is never evaluated (load or ordering problem).
+$dbgLogPath = Join-Path $auditDir "debug.log"
+if (Test-Path $dbgLogPath) {
+    $hits930 = @(Select-String -LiteralPath $dbgLogPath -Pattern '930100' |
+        Select-Object -First 300 | ForEach-Object { $_.Line })
+    Add-Content -Path "$PWD\go-ftw-output.txt" `
+        -Value "=== SecDebugLog lines mentioning 930100 (count: $($hits930.Count)) ==="
+    if ($hits930.Count -gt 0) {
+        Add-Content -Path "$PWD\go-ftw-output.txt" -Value $hits930
+    }
+    Write-Host "[7/8] debug-log lines mentioning 930100: $($hits930.Count)"
+} else {
+    Write-Host "[7/8] WARNING: SecDebugLog not found at $dbgLogPath"
+}
 
 # ---- harvest FREB logs into the audit dir (captured by iis-smoke-diagnostics) -
 $frebDst = "C:\inetpub\logs\modsec-audit\freb"
