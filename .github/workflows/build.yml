@@ -13,6 +13,16 @@ on:
       - 'docs/**'
       - '**/*.editorconfig'
   workflow_dispatch:
+    inputs:
+      # Reuse a previously built DLL artifact instead of rebuilding (the build job
+      # takes ~6 min and is unchanged when only scripts/ci-crs.ps1 is edited). Pass
+      # the run-id of any successful build run that produced the `modsecurityiis`
+      # artifact. Leave blank to build normally.
+      build_run_id:
+        description: 'Optional run-id of a prior build to reuse the DLL artifact'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
@@ -76,17 +86,22 @@ jobs:
 
       - uses: ammaraskar/msvc-problem-matcher@0.3.0
 
+      # When a prior build is reused via workflow input `build_run_id`, skip the
+      # ~6-min compile + upload; smoke-iis downloads that run's artifact instead.
       - name: Configure
+        if: ${{ inputs.build_run_id == '' }}
         run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
       - name: Build
+        if: ${{ inputs.build_run_id == '' }}
         run: cmake --build build --config Release
 
       - name: sccache stats
+        if: ${{ inputs.build_run_id == '' }}
         run: "& $env:SCCACHE_PATH --show-stats"
 
       - name: Upload artifacts
-        if: always()
+        if: ${{ inputs.build_run_id == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: modsecurityiis
@@ -114,6 +129,10 @@ jobs:
         with:
           name: modsecurityiis
           path: artifact
+          # Reuse a prior run's DLL when build_run_id is supplied; an empty value
+          # falls back to the current run's own artifact (produced by the build job).
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       # dumpbin (used by the smoke script to list libModSecurity imports)
       # comes with the MSVC toolchain.
