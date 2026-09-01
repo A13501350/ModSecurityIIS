@@ -405,6 +405,8 @@ Write-Host "[7/8] Loaded $(@($ignoreYaml -split "`n").Count) ignored CRS sub-tes
 logfile: '$auditPathForYaml'
 logmarkerheadername: X-CRS-TEST
 mode: 'default'
+basic:
+  address: 'http://localhost/'
 testoverride:
   ignore:
 $ignoreYaml

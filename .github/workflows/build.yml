@@ -26,6 +26,11 @@ on:
 
 jobs:
   build:
+    # When a prior DLL is reused via workflow input `build_run_id`, skip this job
+    # entirely (no runner, no checkout/Conan/MSVC/sccache setup). smoke-iis below
+    # drops its dependency on this job in that case and downloads the artifact
+    # directly from the supplied run-id.
+    if: ${{ inputs.build_run_id == '' }}
     runs-on: windows-latest
 
     steps:
@@ -116,7 +121,9 @@ jobs:
   # pass-through, audit log, event log). Failure here fails the workflow.
   smoke-iis:
     runs-on: windows-latest
-    needs: build
+    # Depend on `build` only when we are actually building it. When reusing a DLL
+    # via `build_run_id`, `build` is skipped and smoke-iis must run standalone.
+    needs: ${{ inputs.build_run_id == '' && fromJSON('["build"]') || fromJSON('[]') }}
 
     steps:
       - name: Checkout (with submodules, recursive)
