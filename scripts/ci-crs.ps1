@@ -150,7 +150,7 @@ SecAuditLogParts ABIJDEFHZ
 # select the XML processor, and ctl:parseXmlIntoArgs writes the property
 # directly onto the transaction before processRequestBody() reads it. The JSON
 # processor populates JSON:* unconditionally, so only XML needs this.
-SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200010,phase:1,t:none,t:lowercase,pass,log,auditlog,msg:'RULE200010-FIRED ctl parseXmlIntoArgs on',ctl:parseXmlIntoArgs=on"
+SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200010,phase:1,t:none,t:lowercase,pass,nolog,ctl:parseXmlIntoArgs=on"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
