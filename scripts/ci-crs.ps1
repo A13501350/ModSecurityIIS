@@ -82,6 +82,13 @@ if (-not (Test-Path $recConf)) {
 # backslash line continuations, and expandable here-strings would eat ${...}).
 $re930100 = '(?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))'
 $vars930100 = 'REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@*'
+# DIAGNOSTIC: a byte-identical clone of 930100 placed INSIDE the CRS rules dir,
+# so the `rules\*.conf` glob loads it right next to the real rule. If 200029
+# fails to match while the main-config clone 200028 does, the defect is
+# position/ordering dependent; if 200029 matches too, something targets the id.
+@"
+SecRule $vars930100 "@rx $re930100" "id:200029,phase:2,pass,log,auditlog,msg:'XMLDIAG-RULESDIR-CLONE of 930100'"
+"@ | Set-Content (Join-Path $crsDir "rules\999900-930100-clone.conf") -Encoding Ascii
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
@@ -559,8 +566,9 @@ Write-Host $dbg
 # to match; if it is absent, it is never evaluated (load or ordering problem).
 $dbgLogPath = Join-Path $auditDir "debug.log"
 if (Test-Path $dbgLogPath) {
-    $hits930 = @(Select-String -LiteralPath $dbgLogPath -Pattern '930100' |
-        Select-Object -First 300 | ForEach-Object { $_.Line })
+    $hits930 = @(Select-String -LiteralPath $dbgLogPath `
+        -Pattern '930100|XML:|ruleRemove|UpdateTarget' |
+        Select-Object -First 400 | ForEach-Object { $_.Line })
     Add-Content -Path "$PWD\go-ftw-output.txt" `
         -Value "=== SecDebugLog lines mentioning 930100 (count: $($hits930.Count)) ==="
     if ($hits930.Count -gt 0) {
