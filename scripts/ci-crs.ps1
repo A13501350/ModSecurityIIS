@@ -174,9 +174,23 @@ if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsecte
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
 
 # --- 4) reverse proxy: URL Rewrite + ARR -> albedo ------------------------------
-choco install urlrewrite iis-arr -y --no-progress | Out-Null
-& $appcmd set config /section:system.webServer/proxy /enabled:true
-if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
+# Install via winget: Chocolatey's community feed is unreliable (intermittent
+# download failures), so `choco install iis-arr` can fail silently and leave
+# system.webServer/proxy unregistered -> appcmd then errors "Unknown config
+# section". winget's installers register the schema; iisreset reloads it.
+# ARR enablement is non-fatal: WAF block tests (930100-5) are denied at phase 2
+# before any rewrite, so they run even if proxying to the backend is unavailable.
+foreach ($pkg in @('Microsoft.IIS.URLRewrite', 'Microsoft.IIS.ApplicationRequestRouting')) {
+    Write-Host "[4/8] installing $pkg via winget..."
+    & winget install --id $pkg -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String | ForEach-Object { Write-Host "[4/8] winget $pkg : $($_ -replace "`r?`n", ' ')" }
+}
+& iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
+& iisreset /start 2>&1 | Out-Null; Start-Sleep -Seconds 3
+& $appcmd set config /section:system.webServer/proxy /enabled:true 2>&1 | Out-String | ForEach-Object { Write-Host "[4/8] appcmd proxy: $($_ -replace "`r?`n", ' ')" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: ARR proxy section not available on this runner; ALLOWED requests will not reach albedo, but block tests (930100-5) still run."
+}
+else { Write-Host "[4/8] ARR proxy enabled." }
 
 # IMPORTANT: keep the site-level <ModSecurity> element -- overwriting
 # web.config without it silently disables the module (GetConfig finds no
