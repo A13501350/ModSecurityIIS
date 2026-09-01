@@ -76,6 +76,12 @@ $recConf = (Join-Path $PSScriptRoot "..\libmodsecurity\modsecurity.conf-recommen
 if (-not (Test-Path $recConf)) {
     throw "libmodsecurity/modsecurity.conf-recommended not found at $recConf (is the submodule checked out in this job?)"
 }
+# 930100's pattern verbatim (CRS 4.25.1, REQUEST-930-APPLICATION-ATTACK-LFI.conf).
+# Defined once and interpolated into the diagnostic rules below -- keep this a
+# SINGLE-QUOTED string and keep it on ONE line (PowerShell here-strings ignore
+# backslash line continuations, and expandable here-strings would eat ${...}).
+$re930100 = '(?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))'
+$vars930100 = 'REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@*'
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
@@ -133,55 +139,39 @@ SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_pa
 # path). We re-assert the rule engine AND the audit settings AFTER the Include,
 # since libModSecurity takes the LAST value for these directives.
 Include $recConf
-# DIAGNOSTIC RUN: SecRuleEngine DetectionOnly replicates CRS CI exactly
-# (tests/docker-compose.yml sets MODSEC_RULE_ENGINE: DetectionOnly and go-ftw
-# judges by audit-log IDs, not status). Purpose: test whether blocking mode
-# (On) itself suppresses rule matches such as 930100 (user hypothesis), and
-# give the XML XPath diagnostics below a CRS-CI-identical baseline.
+# SecRuleEngine DetectionOnly replicates CRS CI exactly (tests/docker-compose.yml
+# sets MODSEC_RULE_ENGINE: DetectionOnly; go-ftw judges by audit-log IDs, so
+# detection-only still exercises full rule matching).
 SecRuleEngine DetectionOnly
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
-# Parse XML bodies INTO the XML:/* collection. libModSecurity v3.0.x only
-# populates XML:/* (which CRS rules such as 930100 inspect) when
-# m_secXMLParseXmlIntoArgs is True/OnlyArgs; the property's merge default
-# leaves it PropertyNotSet, so the XML request-body processor parses for
-# well-formedness but never creates the XML:* args -> XML content-inspection
-# rules silently miss. The directive `SecParseXmlIntoArgs On` is accepted but
-# does NOT propagate to the transaction in this build (the merge macro is
-# never called), so we set it per-request instead: this phase-1 rule matches
-# the same Content-Type that modsecurity.conf-recommended rule 200000 uses to
-# select the XML processor, and ctl:parseXmlIntoArgs writes the property
-# directly onto the transaction before processRequestBody() reads it. The JSON
-# processor populates JSON:* unconditionally, so only XML needs this.
+# --- local rules. ALL SINGLE-LINE: PowerShell here-strings do not honor `\`
+# --- line continuations (a split rule once silently failed to load).
+# 200010: the SecParseXmlIntoArgs directive is accepted by the v3.0.16 parser
+# but never propagates to the transaction (the Driver->RulesSet merge macro is
+# not invoked), so set the property per-request via ctl, which writes it
+# directly. Same Content-Type that recConf rule 200000 uses to select the XML
+# processor. (930100-family rules read XML via XPath/DOM and work without
+# this; 200010 feeds the separate XML:* args path.)
 SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200010,phase:1,t:none,t:lowercase,pass,nolog,ctl:parseXmlIntoArgs=on"
-# A/B probe for the connector's defer-block fix (b733a65): a phase-1 deny on a
-# request that still carries an entity body. Master's connector writes the
-# block immediately (request ends with an unread body -- claimed to make
-# http.sys reset the connection); the fix parks it until FinishBodyRead().
-# Curl probes E/F below compare the client-visible outcome on both connectors.
+# 200020 + curl probes E/F below: phase-1 deny on a request that still carries
+# an entity body. Kept as a transport regression guard -- the A/B test showed
+# master already delivers a clean 403 here (defer-block fix b733a65 reverted).
 SecRule REQUEST_HEADERS:X-Phase1Probe "@streq block" "id:200020,phase:1,deny,status:403,log,msg:'phase1 block probe (body present)'"
-# XML XPath diagnostics: locate exactly where XML:* inspection breaks. 200023
-# proves the block loaded and phase 2 ran for XML content types; 200025 proves
-# the XML request-body processor engaged; 200022 proves the DOM doc exists and
-# root-element XPath works; 200021 proves attribute XPath (//@*) works -- the
-# exact variable CRS 930100/930110/930120 use to see XML attributes.
+# XML diagnostics -- where does 930100's inspection chain break?
+#   200023 control: rules loaded, phase 2 ran   200025: XML processor engaged
+#   200022 XML:/*   : DOM doc present           200021 XML://@*: attrs visible
+#   200026: 930100's variable list, trivial rx  200027: XML://@* + 930100 regex
+#   200028: full 930100 clone (block/capture/setvar)
 SecRule REQUEST_HEADERS:Content-Type "@rx (?i)xml" "id:200023,phase:2,pass,log,auditlog,msg:'XMLDIAG-CONTROL loaded and phase2 ran'"
 SecRule REQBODY_PROCESSOR "@streq XML" "id:200025,phase:2,pass,log,auditlog,msg:'XMLDIAG-PROCESSOR-ENGAGED'"
 SecRule XML:/* "@rx .*" "id:200022,phase:2,pass,log,auditlog,msg:'XMLDIAG-ROOT-XPATH doc present'"
 SecRule XML://@* "@rx .*" "id:200021,phase:2,pass,log,auditlog,msg:'XMLDIAG-ATTR-XPATH attributes visible'"
-# Discriminators for why 930100 itself never fires although (a) XML://@* sees
-# the attribute value and (b) the 930100 regex matches that exact value locally:
-# 200026 = 930100's exact VARIABLE LIST with a trivial regex -> isolates the
-# multi-variable resolution (REQUEST_URI_RAW|ARGS|...|!Referer|FILES|XML:/*|XML://@*);
-# 200027 = XML://@* alone with 930100's EXACT regex -> isolates PCRE compilation
-# of the huge pattern in this build; 200028 = full 930100 clone (same vars,
-# regex, actions) -> if 200026+200027 fire but 200028 does not, the action
-# combination (block/capture/setvar) is implicated.
-SecRule REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@* "@rx 0x5c0x2e" "id:200026,phase:2,pass,log,auditlog,msg:'XMLDIAG-MULTIVAR-LIST ok'"
-SecRule XML://@* "@rx (?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))" "id:200027,phase:2,pass,log,auditlog,msg:'XMLDIAG-930100-REGEX on XML://@* ok'"
-SecRule REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@* "@rx (?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))" "id:200028,phase:2,block,capture,t:none,msg:'XMLDIAG-FULL-CLONE of 930100',logdata:'Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}',ver:'OWASP_CRS/4.25.1',severity:'CRITICAL',setvar:'tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}',setvar:'tx.lfi_score=+%{tx.critical_anomaly_score}'"
+SecRule $vars930100 "@rx 0x5c0x2e" "id:200026,phase:2,pass,log,auditlog,msg:'XMLDIAG-MULTIVAR-LIST ok'"
+SecRule XML://@* "@rx $re930100" "id:200027,phase:2,pass,log,auditlog,msg:'XMLDIAG-930100-REGEX on XML://@* ok'"
+SecRule $vars930100 "@rx $re930100" "id:200028,phase:2,block,capture,t:none,msg:'XMLDIAG-FULL-CLONE of 930100',logdata:'Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}',ver:'OWASP_CRS/4.25.1',severity:'CRITICAL',setvar:'tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}',setvar:'tx.lfi_score=+%{tx.critical_anomaly_score}'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
