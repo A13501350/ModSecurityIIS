@@ -151,6 +151,12 @@ SecAuditLogParts ABIJDEFHZ
 # directly onto the transaction before processRequestBody() reads it. The JSON
 # processor populates JSON:* unconditionally, so only XML needs this.
 SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200010,phase:1,t:none,t:lowercase,pass,nolog,ctl:parseXmlIntoArgs=on"
+# A/B probe for the connector's defer-block fix (b733a65): a phase-1 deny on a
+# request that still carries an entity body. Master's connector writes the
+# block immediately (request ends with an unread body -- claimed to make
+# http.sys reset the connection); the fix parks it until FinishBodyRead().
+# Curl probes E/F below compare the client-visible outcome on both connectors.
+SecRule REQUEST_HEADERS:X-Phase1Probe "@streq block" "id:200020,phase:1,deny,status:403,log,msg:'phase1 block probe (body present)'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -462,12 +468,13 @@ $xmlBytes += [System.Text.Encoding]::UTF8.GetBytes('/"></a></root>')
 [System.IO.File]::WriteAllBytes("$PWD\xml-nul-body.bin", $xmlBytes)
 
 function Invoke-CurlDiag {
-    param($Label, $Method, $Url, $ContentType, $BodyFile, $BodyStr)
+    param($Label, $Method, $Url, $ContentType, $BodyFile, $BodyStr, $ExtraHeader)
     Write-Host "----- curl: $Label -----"
     $a = @('-v', '-sS', '-m', '15', '-X', $Method, $Url)
     if ($ContentType) { $a += '-H'; $a += "Content-Type: $ContentType" }
     $a += '-H'; $a += 'User-Agent: OWASP CRS test agent'
     $a += '-H'; $a += 'Connection: close'
+    if ($ExtraHeader) { $a += '-H'; $a += $ExtraHeader }
     if ($BodyFile) { $a += '--data-binary'; $a += "@$BodyFile" }
     elseif ($BodyStr) { $a += '--data'; $a += $BodyStr }
     $tx = & curl.exe @a 2>&1 | Out-String
@@ -479,6 +486,11 @@ $rA = Invoke-CurlDiag "A: XML NUL-byte body (930100-5 replica)" POST "http://loc
 $rB = Invoke-CurlDiag "B: SQLi urlencoded body (942100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "id=1%27+OR+%271%27%3D%271"
 $rC = Invoke-CurlDiag "C: XSS urlencoded body (941100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
 $rD = Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "name=value"
+# E is the A/B probe: phase-1 deny while the request still carries a body --
+# exactly the scenario connector commit b733a65 claims master mishandles (RST).
+# F is the no-body baseline (both connectors should deliver a clean 403).
+$rE = Invoke-CurlDiag "E: phase-1 deny + POST body (A/B: master RST vs fix defers)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "x=1" "X-Phase1Probe: block"
+$rF = Invoke-CurlDiag "F: phase-1 deny + GET no body (baseline: clean 403 both)" GET "http://localhost/status/200" $null $null $null "X-Phase1Probe: block"
 
 $txAll = [System.Text.StringBuilder]::new()
 [void]$txAll.AppendLine("=== curl -v replay of blocked-POST tests (connector body-drain fix PRESENT) ===")
@@ -487,6 +499,8 @@ $txAll = [System.Text.StringBuilder]::new()
 [void]$txAll.AppendLine($rB)
 [void]$txAll.AppendLine($rC)
 [void]$txAll.AppendLine($rD)
+[void]$txAll.AppendLine($rE)
+[void]$txAll.AppendLine($rF)
 [void]$txAll.AppendLine()
 [void]$txAll.AppendLine("=== INTERPRETATION ===")
 [void]$txAll.AppendLine("If a test shows '< HTTP/1.1 403' with complete headers and a clean close, the connector")
