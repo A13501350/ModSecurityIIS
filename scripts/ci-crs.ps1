@@ -444,13 +444,18 @@ function Invoke-CurlDiag {
     return $tx
 }
 
+$rA = Invoke-CurlDiag "A: XML NUL-byte body (930100-5 replica)" POST "http://localhost/post" "application/xml" "$PWD\xml-nul-body.bin" $null
+$rB = Invoke-CurlDiag "B: SQLi urlencoded body (942100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "id=1%27+OR+%271%27%3D%271"
+$rC = Invoke-CurlDiag "C: XSS urlencoded body (941100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+$rD = Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "name=value"
+
 $txAll = [System.Text.StringBuilder]::new()
 [void]$txAll.AppendLine("=== curl -v replay of blocked-POST tests (connector body-drain fix PRESENT) ===")
 [void]$txAll.AppendLine()
-[void]$txAll.AppendLine((Invoke-CurlDiag "A: XML NUL-byte body (930100-5 replica)" POST "http://localhost/post" "application/xml" "$PWD\xml-nul-body.bin" $null))
-[void]$txAll.AppendLine((Invoke-CurlDiag "B: SQLi urlencoded body (942100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "id=1%27+OR+%271%27%3D%271"))
-[void]$txAll.AppendLine((Invoke-CurlDiag "C: XSS urlencoded body (941100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "q=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
-[void]$txAll.AppendLine((Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "name=value"))
+[void]$txAll.AppendLine($rA)
+[void]$txAll.AppendLine($rB)
+[void]$txAll.AppendLine($rC)
+[void]$txAll.AppendLine($rD)
 [void]$txAll.AppendLine()
 [void]$txAll.AppendLine("=== INTERPRETATION ===")
 [void]$txAll.AppendLine("If a test shows '< HTTP/1.1 403' with complete headers and a clean close, the connector")
