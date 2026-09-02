@@ -150,6 +150,15 @@ SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
+# Widen the response-body MIME allow-list to include application/json, exactly
+# as CRS CI does (tests/docker-compose.yml: MODSEC_RESP_BODY_ACCESS /
+# MODSEC_RESP_BODY_MIMETYPE). modsecurity.conf-recommended allows only
+# "text/plain text/html text/xml", but the albedo /reflect backend echoes JSON,
+# so every RESPONSE-phase data-leakage test (95xxx / 956xxx) gets an EMPTY
+# RESPONSE_BODY and the rule silently never matches. Must come AFTER the Include
+# above, since libModSecurity keeps the last value for these directives.
+SecResponseBodyAccess On
+SecResponseBodyMimeType text/plain text/html text/xml application/json
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
