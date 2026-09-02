@@ -139,6 +139,11 @@ SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_pa
 # Must be phase 1 and must run BEFORE 901180, which only initializes the
 # variable when its count is still 0.
 SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr_inspect=1"
+# Response-phase diagnostics: does the engine ever SEE the response?
+# 200031 logs the response Content-Type the engine recorded (phase 3);
+# 200032 fires iff RESPONSE_BODY is non-empty (phase 4 = response body).
+SecRule RESPONSE_HEADERS:Content-Type "@rx ." "id:200031,phase:3,pass,log,auditlog,msg:'RESP-CT=[%{RESPONSE_HEADERS:Content-Type}]'"
+SecRule RESPONSE_BODY "@rx ." "id:200032,phase:4,pass,log,auditlog,msg:'RESP-BODY-NONEMPTY'"
 # Load the upstream recommended baseline BEFORE the CRS includes. It sets
 # SecRuleEngine DetectionOnly (line 7) and OVERRIDES the audit settings above
 # (SecAuditEngine RelevantOnly, SecAuditLog /var/log/modsec_audit.log -- a Unix
