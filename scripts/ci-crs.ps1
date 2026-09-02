@@ -434,12 +434,23 @@ $ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
 $testsDir = Join-Path $crsDir "tests\regression\tests"
-Write-Host "[7/8] Running go-ftw (representative subset)..."
+# MEASUREMENT MODE: config WITHOUT testoverride.ignore so every included test
+# really runs and the true failure set is visible, and the CI gate is left open
+# below so the complete list is captured in go-ftw-output.txt.
+$ftwMeasureConfig = Join-Path $ConfRoot "ftw-measure.yaml"
+@"
+---
+logfile: '$auditPathForYaml'
+logmarkerheadername: X-CRS-TEST
+mode: 'default'
+"@ | Set-Content $ftwMeasureConfig -Encoding Ascii
+Write-Host "[7/8] Running go-ftw (FULL detection, no ignore list)..."
 & $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig --show-failures-only 2>&1 |
+    --config $ftwMeasureConfig --show-failures-only 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
 $ftwCode = $LASTEXITCODE
-Write-Host "go-ftw exit code: $ftwCode"
+Write-Host "go-ftw exit code: $ftwCode (measurement run, CI gate disabled)"
+Add-Content -Path "$PWD\go-ftw-output.txt" -Value "`n=== go-ftw exit code: $ftwCode (measurement run, CI gate disabled) ==="
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
@@ -457,4 +468,6 @@ if ($bad) {
     throw "Found IIS/module error events in the Application log."
 }
 Write-Host "[8/8] Event log clean."
-exit $ftwCode
+# CI gate disabled for the measurement run: always succeed so the complete
+# failure list is preserved in the uploaded go-ftw-output.txt.
+exit 0
