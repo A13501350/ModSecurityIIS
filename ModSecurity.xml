@@ -10,6 +10,13 @@
   <sectionSchema name="system.webServer/ModSecurity">
     <attribute name="enabled" type="bool" defaultValue="false"/>
     <attribute name="configFile" type="string" defaultValue="c:\inetpub\modsecurity.conf" validationType="nonEmptyString" />
+    <!-- When true, the connector buffers the full response body and may BLOCK
+         (replace) responses whose phase:4 rules match -- independent of
+         SecRuleEngine / SecResponseBodyAccess. Default false: responses are
+         inspected (logged) but never blocked. Native CHttpModule streaming
+         limits mean only single-shot (content-length) responses are reliably
+         blockable; chunked/streaming responses degrade to inspect-only. -->
+    <attribute name="responseBodyBlock" type="bool" defaultValue="false"/>
   </sectionSchema>
 
 </configSchema>

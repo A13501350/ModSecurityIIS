@@ -81,6 +81,26 @@ MODSECURITY_STORED_CONTEXT::Initialize(
         goto Failure;
     }
 
+    hr = GetBooleanPropertyValue(
+                pSessionTrackingElement,
+                MODSECURITY_SECTION_RESPONSEBODYBLOCK,
+                &pPropertyException,
+                &m_bResponseBodyBlock);
+
+    if ( FAILED( hr ) )
+    {
+        goto Failure;
+    }
+
+    if ( pPropertyException != NULL )
+    {
+        if ( ppException != NULL )
+        {
+            *ppException = pPropertyException;
+        }
+        goto Failure;
+    }
+
     hr = GetStringPropertyValue(
                 pSessionTrackingElement,
                 MODSECURITY_SECTION_CONFIGFILE,
@@ -208,7 +228,8 @@ MODSECURITY_STORED_CONTEXT::~MODSECURITY_STORED_CONTEXT()
 
 MODSECURITY_STORED_CONTEXT::MODSECURITY_STORED_CONTEXT():
     m_bIsEnabled ( FALSE ),
-    m_pszPath( NULL )
+    m_pszPath( NULL ),
+    m_bResponseBodyBlock( FALSE )
 {
 }
 

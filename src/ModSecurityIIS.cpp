@@ -341,7 +341,8 @@ static PCSTR StandardReason(int status)
     }
 }
 
-static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
+static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
+                          bool canBlock)
 {
     modsecurity::Transaction* tx = rsc->m_pTx;
     if (tx == nullptr)
@@ -374,6 +375,15 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     modsecurity::intervention::free(&it);   // release url/log owned by libmodsecurity
 
     if (!disruptive)
+    {
+        return false;
+    }
+
+    // Response-phase interventions are only honored when response-body blocking
+    // is enabled; otherwise we have already consumed the intervention (above)
+    // but take no disruptive action (detect-only). Request-phase callers pass
+    // canBlock=true unconditionally.
+    if (!canBlock)
     {
         return false;
     }
@@ -428,6 +438,27 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     pHttpContext->SetRequestHandled();
     rsc->FinishRequest();
     return true;
+}
+
+// Response-body BLOCKING is gated independently of request-phase blocking so a
+// production box running SecRuleEngine On can still opt out of response-body
+// blocking. It is enabled for a request only when ALL of:
+//   * the IIS <responseBodyBlock> switch is on, AND
+//   * SecResponseBodyAccess is On (else there is nothing to inspect), AND
+//   * the rule engine can actually disrupt (Enabled, not DetectionOnly).
+// When this returns false the connector inspects the response but never
+// blocks it (Mode B).
+static bool responseBodyBlockingEnabled(REQUEST_STORED_CONTEXT* rsc)
+{
+    if (rsc == NULL || rsc->m_pTx == NULL || rsc->m_pRules == NULL)
+    {
+        return false;
+    }
+    return rsc->m_ResponseBodyBlock
+        && rsc->m_pRules->m_secResponseBodyAccess ==
+               modsecurity::RulesSetProperties::TrueConfigBoolean
+        && rsc->m_pTx->getRuleEngineState() ==
+               modsecurity::RulesSetProperties::EnabledRuleEngine;
 }
 
 
@@ -687,7 +718,7 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
-    if (ApplyIntervention(rsc, pHttpContext))
+    if (ApplyIntervention(rsc, pHttpContext, true))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
@@ -797,6 +828,7 @@ CMyHttpModule::OnBeginRequest(
     rsc->m_pTx          = tx;
     rsc->m_pRules       = rules;
     rsc->m_pHttpContext = pHttpContext;
+    rsc->m_ResponseBodyBlock = (pConfig->GetResponseBodyBlock() == TRUE);
     IHttpModuleContextContainer* pCtxContainer =
         pHttpContext->GetModuleContextContainer();
     HRESULT shr = pCtxContainer->SetModuleContext(rsc, g_pModuleContext);
@@ -925,7 +957,7 @@ CMyHttpModule::OnBeginRequest(
     }
 
     tx->processRequestHeaders();
-    if (ApplyIntervention(rsc, pHttpContext))
+    if (ApplyIntervention(rsc, pHttpContext, true))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
@@ -1149,21 +1181,24 @@ CMyHttpModule::OnSendResponse(
     tx->processResponseHeaders(respStatus,
         rsc->m_Protocol.empty() ? std::string("HTTP/1.1")
                                 : "HTTP/" + rsc->m_Protocol);
-    if (ApplyIntervention(rsc, pHttpContext))
+    if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     rsc->m_ResponseHeadersFed = true;
     }
 
-    // --- response body (accumulate only) ---
-    // Chunks are incremental: each RQ_SEND_RESPONSE carries only the entity
-    // bytes queued since the previous send, so append them all to the
-    // transaction here. Do NOT process them yet -- v3's processResponseBody()
-    // has no re-run guard and appendResponseBody accumulates, so evaluating on
-    // every flush would re-run phase-4 rules over the whole growing body
-    // (duplicate alerts + O(n^2)). The single processResponseBody() call is
-    // made in OnPostEndRequest once the response is complete.
+    // --- response body: Mode A (block) vs Mode B (inspect-only) ---
+    // Mode A (responseBodyBlockingEnabled): feed the body to the engine and,
+    // once the COMPLETE body is present in a single notification (no
+    // HTTP_SEND_RESPONSE_FLAG_MORE_DATA), evaluate phase-4 right HERE and block
+    // -- replacing the response via Clear()+SetRequestHandled() BEFORE any body
+    // byte leaves the worker. This mirrors the v2 connector's buffering model.
+    // If the response is chunked/streaming (MORE_DATA is set), the already-
+    // queued bytes cannot be held, so THIS request is degraded to Mode B
+    // (inspect-only) and the body is allowed to flow.
+    // Mode B (default / responseBodyBlock off): accumulate only; phase-4 runs
+    // later in OnPostEndRequest for detection (never blocks, bytes already sent).
     {
     size_t respInspected = 0;
     const size_t maxInspect = GetMaxInspectBodyBytes();
@@ -1207,6 +1242,45 @@ CMyHttpModule::OnSendResponse(
         // read another module's cached fragment bytes, so such content cannot
         // be inspected here; it is skipped deliberately.
     }
+
+    bool moreData = (pProvider->GetFlags() &
+                     HTTP_SEND_RESPONSE_FLAG_MORE_DATA) != 0;
+
+    if (responseBodyBlockingEnabled(rsc) && !rsc->m_ResponseBodyEvaluated)
+    {
+        if (moreData)
+        {
+            // Streaming response: queued bytes already committed, cannot block.
+            // Degrade this request to inspect-only for the rest of its life.
+            rsc->m_ResponseBodyBlock = false;
+        }
+        else
+        {
+            // Complete body available in this notification. Disable chunked
+            // framing (set Content-Length) so a block-replace is clean, then
+            // evaluate phase-4 synchronously and block if a rule matches.
+            if (pProvider->GetHeadersBeingSent() && respInspected < maxInspect &&
+                pHttpContext->GetResponse()->GetHeader(HttpHeaderContentLength) == NULL)
+            {
+                CHAR szLength[21];
+                ZeroMemory(szLength, sizeof(szLength));
+                StringCchPrintfA(szLength, sizeof(szLength) / sizeof(CHAR) - 1,
+                                 "%d", (int)respInspected);
+                pHttpContext->GetResponse()->SetHeader(HttpHeaderContentLength,
+                                                       szLength,
+                                                       (USHORT)strlen(szLength),
+                                                       TRUE);
+            }
+            rsc->m_ResponseBodyEvaluated = true;
+            rsc->m_pTx->processResponseBody();
+            if (ApplyIntervention(rsc, pHttpContext, true))
+            {
+                // Disruptive: ApplyIntervention replaced the response
+                // (Clear + SetRequestHandled) before any body byte left.
+                return RQ_NOTIFICATION_FINISH_REQUEST;
+            }
+        }
+    }
     }
 
     } while (0);
@@ -1248,14 +1322,17 @@ CMyHttpModule::OnPostEndRequest(
     {
         try
         {
-            // Single, deferred response-body evaluation: phase-4 rules run once
-            // over the fully accumulated body (appended in OnSendResponse),
-            // avoiding duplicate alerts from per-flush re-processing.
-            rsc->m_pTx->processResponseBody();
-            if (ApplyIntervention(rsc, pHttpContext))
+            // Deferred response-body evaluation (Mode B / inspect-only): phase-4
+            // runs once over the fully accumulated body (appended in
+            // OnSendResponse). Skipped if Mode A already evaluated it inline.
+            if (!rsc->m_ResponseBodyEvaluated)
             {
-                // Disruptive: ApplyIntervention already finalized the tx.
-                return RQ_NOTIFICATION_CONTINUE;
+                rsc->m_pTx->processResponseBody();
+                if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
+                {
+                    // Disruptive: ApplyIntervention already finalized the tx.
+                    return RQ_NOTIFICATION_CONTINUE;
+                }
             }
             rsc->FinishRequest();   // processLogging + delete tx
         }

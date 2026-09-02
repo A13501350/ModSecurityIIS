@@ -12,7 +12,8 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false), m_BodyReadActive(false)
+          m_ResponseHeadersFed(false), m_BodyReadActive(false),
+          m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -70,6 +71,14 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // transaction exactly once; entity chunks are delivered incrementally,
     // one batch per notification.
     bool                      m_ResponseHeadersFed;
+    // Mirrors the IIS <system.webServer/ModSecurity @responseBodyBlock> switch
+    // for this request. When true (and response-body access + rule engine are
+    // enabled) the connector buffers the full body and may BLOCK responses;
+    // when false the response is inspected but never blocked.
+    bool                      m_ResponseBodyBlock;
+    // Set once phase-4 has been evaluated in OnSendResponse (Mode A), so
+    // OnPostEndRequest skips the deferred re-evaluation.
+    bool                      m_ResponseBodyEvaluated;
     // HTTP version of the request line ("HTTP/1.1", "HTTP/2", ...). The
     // response protocol mirrors the request protocol, so it is reused when
     // feeding Transaction::processResponseHeaders.

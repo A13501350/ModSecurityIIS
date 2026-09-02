@@ -10,6 +10,7 @@
 #define MODSECURITY_SECTION                  L"system.webServer/ModSecurity"
 #define MODSECURITY_SECTION_ENABLED          L"enabled"
 #define MODSECURITY_SECTION_CONFIGFILE       L"configFile"
+#define MODSECURITY_SECTION_RESPONSEBODYBLOCK L"responseBodyBlock"
 
 extern IHttpServer *                       g_pHttpServer;
 extern PVOID                                g_pModuleContext;
@@ -36,6 +37,7 @@ class MODSECURITY_STORED_CONTEXT : public IHttpStoredContext
 
     BOOL   GetIsEnabled() { return m_bIsEnabled; }
     WCHAR* GetPath()      { return m_pszPath; }
+    BOOL   GetResponseBodyBlock() { return m_bResponseBodyBlock; }
 
     HRESULT
     Initialize(
@@ -60,4 +62,5 @@ class MODSECURITY_STORED_CONTEXT : public IHttpStoredContext
 
     BOOL   m_bIsEnabled;
     WCHAR* m_pszPath;
+    BOOL   m_bResponseBodyBlock;
 };
