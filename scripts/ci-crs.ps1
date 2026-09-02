@@ -586,6 +586,20 @@ $resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
     -Body '{"body": "ViewStateException: Invalid viewstate detected."}' `
     -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 Write-Host "[7c/8] 950150-1 replay -> HTTP $($resp950.StatusCode)"
+
+# --- 7d) connector response-phase trace dump ---------------------------------
+# The DLL writes C:/inetpub/modsec/modsecurityiis-trace.log (captured by the
+# iis-smoke-diagnostics artifact). Print its tail here too so the run log
+# directly shows whether OnSendResponse/OnPostEndRequest fired and reached
+# processResponseHeaders / processResponseBody.
+$trace = "C:/inetpub/modsec/modsecurityiis-trace.log"
+if (Test-Path $trace) {
+    Write-Host "[7d/8] connector trace (last 50 lines):"
+    Get-Content $trace -Tail 50 | Write-Host
+} else {
+    Write-Host "[7d/8] connector trace NOT present at $trace"
+}
+
 if ($MeasureMode) {
     Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
     Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }

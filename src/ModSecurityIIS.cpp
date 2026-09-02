@@ -25,6 +25,8 @@
 #include <memory>    // std::shared_ptr
 #include <new>       // std::nothrow
 #include <exception> // std::exception
+#include <cstdio>    // FILE*, fprintf (diag trace)
+#include <cstdarg>   // va_list (diag trace)
 
 #include "httpserv.h"
 
@@ -251,6 +253,29 @@ static void ReportException(const char* where, const char* what) noexcept
                 where != NULL ? where : "?",
                 what != NULL ? what : "unknown error");
     iis::WriteEventViewerLog(buf, EVENTLOG_ERROR_TYPE);
+}
+
+// DEBUG (diag/single-body-test): append-only file trace so we can prove, in a
+// live IIS run, whether the response-phase handlers (OnSendResponse /
+// OnPostEndRequest) are actually invoked and reach processResponseHeaders /
+// processResponseBody. The file lives under C:/inetpub/modsec/ which the
+// iis-smoke-diagnostics artifact uploads. Cheap and disabled-able: it only
+// writes when the path exists/creatable; failures are silently ignored.
+static void IisTrace(const char* fmt, ...)
+{
+    FILE* f = fopen("C:/inetpub/modsec/modsecurityiis-trace.log", "a");
+    if (f == NULL) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d.%03d ",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
 }
 
 
@@ -891,6 +916,8 @@ CMyHttpModule::OnBeginRequest(
     std::string version = VersionToString(req->Version);
     rsc->m_Protocol = version;
     tx->processURI(uri.c_str(), method.c_str(), version.c_str());
+    IisTrace("OnBeginRequest: created tx=%p rsc=%p uri=%s method=%s",
+             (void*)tx, (void*)rsc, uri.c_str(), method.c_str());
 
     // --- request headers ---
 #define _TRANSHEADER(id,str)                                               \
@@ -1093,6 +1120,8 @@ CMyHttpModule::OnSendResponse(
     REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)
         pHttpContext->GetModuleContextContainer()->GetModuleContext(g_pModuleContext);
 
+    IisTrace("OnSendResponse: entry rsc=%p", (void*)rsc);
+
     try
     {
 
@@ -1100,6 +1129,8 @@ CMyHttpModule::OnSendResponse(
     {
     if (rsc == NULL || rsc->m_pTx == NULL)
     {
+        IisTrace("OnSendResponse: BREAK rsc=%p tx=%p", (void*)rsc,
+                 (rsc != NULL) ? (void*)rsc->m_pTx : (void*)NULL);
         break;
     }
 
@@ -1181,6 +1212,7 @@ CMyHttpModule::OnSendResponse(
     tx->processResponseHeaders(respStatus,
         rsc->m_Protocol.empty() ? std::string("HTTP/1.1")
                                 : "HTTP/" + rsc->m_Protocol);
+    IisTrace("OnSendResponse: after processResponseHeaders status=%d", respStatus);
     if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
     {
         return RQ_NOTIFICATION_FINISH_REQUEST;
@@ -1290,11 +1322,13 @@ CMyHttpModule::OnSendResponse(
     {
         // Mid-response there is no clean way to abort the send; fail-open and
         // let IIS finish delivering the already-inspected response.
+        IisTrace("OnSendResponse: EXCEPTION %s", e.what());
         ReportException("OnSendResponse", e.what());
         return RQ_NOTIFICATION_CONTINUE;
     }
     catch (...)
     {
+        IisTrace("OnSendResponse: EXCEPTION (unknown)");
         ReportException("OnSendResponse", NULL);
         return RQ_NOTIFICATION_CONTINUE;
     }
@@ -1318,6 +1352,8 @@ CMyHttpModule::OnPostEndRequest(
     REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)
         pHttpContext->GetModuleContextContainer()->GetModuleContext(g_pModuleContext);
 
+    IisTrace("OnPostEndRequest: entry rsc=%p", (void*)rsc);
+
     if (rsc != NULL && rsc->m_pTx != NULL)
     {
         try
@@ -1327,7 +1363,10 @@ CMyHttpModule::OnPostEndRequest(
             // OnSendResponse). Skipped if Mode A already evaluated it inline.
             if (!rsc->m_ResponseBodyEvaluated)
             {
+                IisTrace("OnPostEndRequest: before processResponseBody tx=%p",
+                         (void*)rsc->m_pTx);
                 rsc->m_pTx->processResponseBody();
+                IisTrace("OnPostEndRequest: after processResponseBody");
                 if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
                 {
                     // Disruptive: ApplyIntervention already finalized the tx.
