@@ -15,3 +15,15 @@ vcpkg_installed/
 .vs/
 *.user
 .DS_Store
+
+# Local diagnostic / CI-test-output artifacts (downloaded audit logs, go-ftw
+# output, diagnostic run dumps). Never commit these.
+ab9/
+abA/
+abB/
+modsec/
+modsectest/
+logs/
+failids*.txt
+go-ftw-output.txt
+modsec_crs_audit.log

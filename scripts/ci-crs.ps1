@@ -140,15 +140,39 @@ SecRuleRemoveById 920273
 # blocked) -- the probe below reports which path fired. albedo echoes the request
 # body, so a probe POST whose body contains the marker trips this rule.
 SecRule RESPONSE_BODY "@rx MODEA-BLOCK-MARKER" "id:990130,phase:4,deny,status:403,msg:'diag: mode-a response body block'"
-# DEBUG (diag/single-body-test): definitive phase:4 diagnostic. @rx .+ requires a
+# DEBUG (diag/single-body-test): non-empty RESPONSE_BODY marker. @rx .+ requires a
 # non-empty RESPONSE_BODY, so if this logs we KNOW phase 4 ran AND the response
 # body was populated (0-length / mime-excluded bodies would NOT match). Macro-free
-# logdata to avoid any config-parse risk. If it NEVER logs, phase 4 is not being
-# invoked or RESPONSE_BODY is empty -> deeper Mode A wiring / capture bug.
+# to avoid any config-parse risk.
 SecRule RESPONSE_BODY "@rx .+" "id:990132,phase:4,pass,log,msg:'diag: RESPONSE_BODY seen'"
+# DEBUG (diag/single-body-test): ALWAYS-FIRES phase:4 marker. Matches any
+# REQUEST_URI, so if it logs we KNOW phase 4 was INVOKED for that transaction
+# (the audit line carries the [uri "..."] so we can tell which request). Pair it
+# with 990132 to separate the two failure modes behind the 950150 miss:
+#   * 990133 ABSENT  -> phase 4 was never evaluated (deep connector bug,
+#                       OnSendResponse/OnPostEndRequest not reaching processResponseBody)
+#   * 990133 PRESENT but 990132 ABSENT -> phase 4 ran but RESPONSE_BODY was EMPTY
+#                       (response-body capture bug: appendResponseBody never fed
+#                       the body, e.g. pEntityChunks empty for proxied responses)
+# No macros (config-parse-safe).
+SecRule REQUEST_URI "@rx .+" "id:990133,phase:4,pass,log,msg:'diag: phase4 ran'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
+
+# DEBUG (diag/single-body-test): drop a static ASP.NET error page into the site
+# root. It is served LOCALLY (not via the ARR proxy to albedo), as text/html --
+# which is in the DEFAULT SecResponseBodyMimeType set. This lets [7c/8] tell
+# whether response-body capture works AT ALL (static file) versus only failing
+# for the PROXIED /reflect response. If 950150/990133 fire for /leak.html but
+# not /reflect, the capture path is proxy-specific (pEntityChunks empty for
+# reverse-proxied bodies); if they fail for both, body capture is fundamentally
+# broken in OnSendResponse.
+$leakHtml = Join-Path $SiteRoot "leak.html"
+@"
+<html><body>ViewStateException: Invalid viewstate detected.</body></html>
+"@ | Set-Content $leakHtml -Encoding Ascii
+Write-Host "[2/8] Static probe page written ($leakHtml)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
 & $appcmd set config $SiteName /section:ModSecurity `
@@ -517,14 +541,28 @@ $hit950 = Select-String -Path $auditSrc -Pattern '"950150"' -Quiet
 Write-Host "[7c/8] RESPONSE-950 rule 950150 in audit log: $hit950"
 $hit132 = Select-String -Path $auditSrc -Pattern '"990132"' -Quiet
 Write-Host "[7c/8] phase:4 diagnostic 990132 (RESPONSE_BODY seen) in audit: $hit132"
+$hit133 = Select-String -Path $auditSrc -Pattern '"990133"' -Quiet
+Write-Host "[7c/8] phase:4 always-fires marker 990133 in audit: $hit133"
 if ($hit950) {
     Write-Host "[7c/8] audit lines mentioning 950150:"
     Select-String -Path $auditSrc -Pattern '950150' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
 }
 if ($hit132) {
-    Write-Host "[7c/8] 990132 diagnostic lines (RESPONSE_BODY length / content-type):"
+    Write-Host "[7c/8] 990132 diagnostic lines (RESPONSE_BODY seen):"
     Select-String -Path $auditSrc -Pattern '990132' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
 }
+if ($hit133) {
+    Write-Host "[7c/8] 990133 lines (which URIs reached phase 4):"
+    Select-String -Path $auditSrc -Pattern '990133' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
+}
+# DEBUG (diag/single-body-test): static-file probe. GET /leak.html is served
+# LOCALLY as text/html (default mime set) -- if 950150 fires here but not for
+# the proxied /reflect, body capture is proxy-specific.
+$staticHit = Select-String -Path $auditSrc -Pattern 'leak\.html' -Quiet
+Write-Host "[7c/8] static /leak.html request present in audit: $staticHit"
+$leak = Invoke-WebRequest "http://localhost/leak.html" -UseBasicParsing `
+    -SkipHttpErrorCheck -TimeoutSec 15
+Write-Host "[7c/8] static /leak.html probe -> HTTP $($leak.StatusCode), body-len=$($leak.Content.Length)"
 # Direct replay of the same request to show the LIVE status: 403 = Mode A
 # buffered + blocked the response body; 200 = rule fired but inspect-only.
 $resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
