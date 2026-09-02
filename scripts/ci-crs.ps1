@@ -67,6 +67,12 @@ SecRequestBodyAccess On
 # <ModSecurity> section, the connector engages Mode A (buffers the full body
 # and may BLOCK on phase-4 matches) instead of inspect-only.
 SecResponseBodyAccess On
+# DEBUG (diag/single-body-test): albedo /reflect echoes JSON with Content-Type
+# application/json. The default SecResponseBodyMimeType (text/plain text/html
+# text/xml) excludes application/json, so RESPONSE_BODY was NEVER populated for
+# these responses -> phase 4 rules (950150, 990130) had nothing to match. Add
+# application/json so the echo body is actually inspected.
+SecResponseBodyMimeType "text/plain text/html text/xml application/json application/javascript"
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
 # Audit EVERYTHING (not RelevantOnly): go-ftw locates test boundaries via
@@ -134,6 +140,12 @@ SecRuleRemoveById 920273
 # blocked) -- the probe below reports which path fired. albedo echoes the request
 # body, so a probe POST whose body contains the marker trips this rule.
 SecRule RESPONSE_BODY "@rx MODEA-BLOCK-MARKER" "id:990130,phase:4,deny,status:403,msg:'diag: mode-a response body block'"
+# DEBUG (diag/single-body-test): definitive phase:4 diagnostic. @rx ^.*$ matches
+# even an empty body, so if this logs we KNOW phase 4 ran and we can read the
+# RESPONSE_BODY length (0 => body not captured, e.g. mime-type excluded or not
+# buffered) and the response Content-Type. If it NEVER logs, phase 4 is not being
+# invoked at all by the connector -- a deeper Mode A wiring bug.
+SecRule RESPONSE_BODY "@rx ^.*$" "id:990132,phase:4,pass,log,logdata:'RB-len=%{MATCHED_VAR_LENGTH} ct=%{RESPONSE_HEADERS:Content-Type}',msg:'diag: RESPONSE_BODY seen'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
@@ -498,9 +510,15 @@ if ($modeA.StatusCode -eq 403) {
 # blocked it (deny -> 403) or only inspected (pass/log -> 200).
 $hit950 = Select-String -Path $auditSrc -Pattern '"950150"' -Quiet
 Write-Host "[7c/8] RESPONSE-950 rule 950150 in audit log: $hit950"
+$hit132 = Select-String -Path $auditSrc -Pattern '"990132"' -Quiet
+Write-Host "[7c/8] phase:4 diagnostic 990132 (RESPONSE_BODY seen) in audit: $hit132"
 if ($hit950) {
     Write-Host "[7c/8] audit lines mentioning 950150:"
     Select-String -Path $auditSrc -Pattern '950150' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
+}
+if ($hit132) {
+    Write-Host "[7c/8] 990132 diagnostic lines (RESPONSE_BODY length / content-type):"
+    Select-String -Path $auditSrc -Pattern '990132' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
 }
 # Direct replay of the same request to show the LIVE status: 403 = Mode A
 # buffered + blocked the response body; 200 = rule fired but inspect-only.
