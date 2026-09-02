@@ -125,6 +125,20 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # detection_paranoia_level follow blocking_paranoia_level when unset, so setting
 # BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
+# Opt in to CRS 4.25.x XML ATTRIBUTE inspection. On the LTS branch this is a
+# runtime gate, not a config directive: rule 901180 (phase 1) defaults
+# tx.crs_xml_attr_inspect to 0 when it is unset, and rule 901181 (phase 2) then
+# applies ctl:ruleRemoveTargetByTag=<attack-protocol|attack-lfi|attack-rfi|
+# attack-rce|attack-php|attack-generic|attack-xss|attack-sqli|attack-fixation>;XML://@*
+# -- stripping the XML://@* target from every rule carrying one of those tags.
+# Such a rule then inspects only XML:/* (element text), so payloads hidden in
+# XML ATTRIBUTES are never examined and the rule silently never matches
+# (e.g. CRS test 930100-5 feeds its payload through the `probe` attribute).
+# CRS CI performs the same opt-in: tests/docker-compose.yml appends
+# `SecAction id:900511 ... setvar:tx.crs_xml_attr_inspect=1` to crs-setup.conf.
+# Must be phase 1 and must run BEFORE 901180, which only initializes the
+# variable when its count is still 0.
+SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr_inspect=1"
 # Load the upstream recommended baseline BEFORE the CRS includes. It sets
 # SecRuleEngine DetectionOnly (line 7) and OVERRIDES the audit settings above
 # (SecAuditEngine RelevantOnly, SecAuditLog /var/log/modsec_audit.log -- a Unix
