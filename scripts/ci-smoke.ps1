@@ -31,7 +31,7 @@ param(
 $ErrorActionPreference = "Stop"
 $failures = New-Object System.Collections.Generic.List[string]
 
-function Assert-True([bool]$Cond, [string]$Name, [string]$Detail = "") {
+function Assert-True([object]$Cond, [string]$Name, [string]$Detail = "") {
     if ($Cond) { Write-Host "PASS $name" -ForegroundColor Green }
     else {
         Write-Host "FAIL $Name :: $Detail" -ForegroundColor Red
