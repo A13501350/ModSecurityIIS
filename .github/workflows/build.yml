@@ -163,9 +163,12 @@ jobs:
         with:
           name: modsecurityiis
           path: artifact
-          # Reuse a prior run's DLL when build_run_id is supplied; an empty value
-          # falls back to the current run's own artifact (produced by the build job).
-          run-id: ${{ inputs.build_run_id }}
+          # Reuse a prior run's DLL when build_run_id is supplied; otherwise fall
+          # back to THIS run's own artifact (uploaded by the build job above).
+          # The fallback must be explicit: handing the action an EMPTY run-id makes
+          # it request .../runs/NaN/artifacts and fail with 404, so a plain full
+          # build could never download the DLL it had just produced.
+          run-id: ${{ inputs.build_run_id != '' && inputs.build_run_id || github.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       # dumpbin (used by the smoke script to list libModSecurity imports)
