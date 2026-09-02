@@ -140,12 +140,12 @@ SecRuleRemoveById 920273
 # blocked) -- the probe below reports which path fired. albedo echoes the request
 # body, so a probe POST whose body contains the marker trips this rule.
 SecRule RESPONSE_BODY "@rx MODEA-BLOCK-MARKER" "id:990130,phase:4,deny,status:403,msg:'diag: mode-a response body block'"
-# DEBUG (diag/single-body-test): definitive phase:4 diagnostic. @rx ^.*$ matches
-# even an empty body, so if this logs we KNOW phase 4 ran and we can read the
-# RESPONSE_BODY length (0 => body not captured, e.g. mime-type excluded or not
-# buffered) and the response Content-Type. If it NEVER logs, phase 4 is not being
-# invoked at all by the connector -- a deeper Mode A wiring bug.
-SecRule RESPONSE_BODY "@rx ^.*$" "id:990132,phase:4,pass,log,logdata:'RB-len=%{MATCHED_VAR_LENGTH} ct=%{RESPONSE_HEADERS:Content-Type}',msg:'diag: RESPONSE_BODY seen'"
+# DEBUG (diag/single-body-test): definitive phase:4 diagnostic. @rx .+ requires a
+# non-empty RESPONSE_BODY, so if this logs we KNOW phase 4 ran AND the response
+# body was populated (0-length / mime-excluded bodies would NOT match). Macro-free
+# logdata to avoid any config-parse risk. If it NEVER logs, phase 4 is not being
+# invoked or RESPONSE_BODY is empty -> deeper Mode A wiring / capture bug.
+SecRule RESPONSE_BODY "@rx .+" "id:990132,phase:4,pass,log,msg:'diag: RESPONSE_BODY seen'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
