@@ -62,7 +62,11 @@ $conf = Join-Path $ConfRoot "modsecurity-crs.conf"
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
-SecResponseBodyAccess Off
+# DEBUG (diag/single-body-test): enable response-body inspection so phase 4
+# evaluates RESPONSE_BODY. Combined with responseBodyBlock="true" on the
+# <ModSecurity> section, the connector engages Mode A (buffers the full body
+# and may BLOCK on phase-4 matches) instead of inspect-only.
+SecResponseBodyAccess On
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
 # Audit EVERYTHING (not RelevantOnly): go-ftw locates test boundaries via
@@ -115,13 +119,20 @@ Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
+# DEBUG (diag/single-body-test): Mode A response-body block. With
+# responseBodyBlock="true" + SecResponseBodyAccess On, the connector buffers the
+# whole response and evaluates this phase:4 rule; a match REPLACES the response
+# with 403. Streamed/chunked upstream responses degrade to inspect-only (never
+# blocked) -- the probe below reports which path fired. albedo echoes the request
+# body, so a probe POST whose body contains the marker trips this rule.
+SecRule RESPONSE_BODY "@rx MODEA-BLOCK-MARKER" "id:990130,phase:4,deny,status:403,msg:'diag: mode-a response body block'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
 & $appcmd set config $SiteName /section:ModSecurity `
-    /enabled:true /configFile:$conf /commit:site
+    /enabled:true /configFile:$conf /responseBodyBlock:true /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
 # go-ftw targets http://localhost (port 80) by default. Delete the Default
@@ -159,7 +170,7 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
   <system.webServer>
-    <ModSecurity enabled="true" configFile="C:\inetpub\modsec\modsecurity-crs.conf" />
+    <ModSecurity enabled="true" configFile="C:\inetpub\modsec\modsecurity-crs.conf" responseBodyBlock="true" />
     <rewrite>
       <rules>
         <rule name="ToAlbedo" stopProcessing="true">
@@ -442,6 +453,24 @@ Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
+
+# --- 7b) Mode A response-body blocking debug probe -------------------------
+# With responseBodyBlock="true" + SecResponseBodyAccess On + phase:4 rule
+# 990130, a response body containing MODEA-BLOCK-MARKER must be BLOCKED (403):
+# the connector buffers the full body, evaluates phase 4, and replaces the
+# response. albedo echoes the request body, so the marker lands in the response.
+# If the upstream sends a chunked/streamed response the connector degrades to
+# inspect-only (never blocks) -- this probe reports which path was taken.
+# Non-fatal: it is a debug signal, not a CI gate.
+$modeA = Invoke-WebRequest "http://localhost/" -Method Post `
+    -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER debug probe" `
+    -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
+Write-Host "[7b/8] Mode A probe (response body contains marker) -> $($modeA.StatusCode)"
+if ($modeA.StatusCode -eq 403) {
+    Write-Host "[7b/8] PASS: Mode A buffered + BLOCKED the response body (403)."
+} else {
+    Write-Host "[7b/8] INFO: response NOT blocked (got $($modeA.StatusCode)). Mode A did not engage -- check responseBodyBlock, SecResponseBodyAccess, or a chunked upstream response (streaming degrades to inspect-only)."
+}
 if ($MeasureMode) {
     Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
     Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }
