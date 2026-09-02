@@ -119,6 +119,14 @@ Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
+# DEBUG (diag/single-body-test): relax the PL4 strict request-byte-range rule
+# 920273 so JSON / space-bearing request bodies are NOT denied at phase 2. Without
+# this, 920273 (parameter set excludes byte 32/space and 34/{} etc.) -> 949110
+# denies the request (403) BEFORE /reflect echoes the leak, so the phase:4
+# RESPONSE-95x/956x rules (and Mode A's 990130) never run. This is a debug-only
+# relaxation: at PL1 -- the level the official CRS regression runs at -- 920273 is
+# inactive by default, so this is purely making PL4 behave like PL1 for transport.
+SecRuleRemoveById 920273
 # DEBUG (diag/single-body-test): Mode A response-body block. With
 # responseBodyBlock="true" + SecResponseBodyAccess On, the connector buffers the
 # whole response and evaluates this phase:4 rule; a match REPLACES the response
@@ -468,8 +476,12 @@ Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyCont
 # If the upstream sends a chunked/streamed response the connector degrades to
 # inspect-only (never blocks) -- this probe reports which path was taken.
 # Non-fatal: it is a debug signal, not a CI gate.
-$modeA = Invoke-WebRequest "http://localhost/" -Method Post `
-    -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER debug probe" `
+# Post to /reflect (NOT "/") with a SPACE-FREE marker so 920273 cannot block it
+# at phase 2 -- the request must survive to phase 4 for 990130 to evaluate the
+# echoed RESPONSE_BODY. (The previous probe used a space-bearing body and was
+# killed by 920273/949110 at phase 2, so its 403 proved nothing about Mode A.)
+$modeA = Invoke-WebRequest "http://localhost/reflect" -Method Post `
+    -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER" `
     -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 Write-Host "[7b/8] Mode A probe (response body contains marker) -> $($modeA.StatusCode)"
 if ($modeA.StatusCode -eq 403) {
