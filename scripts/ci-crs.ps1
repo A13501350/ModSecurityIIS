@@ -145,7 +145,14 @@ SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr
 # path). We re-assert the rule engine AND the audit settings AFTER the Include,
 # since libModSecurity takes the LAST value for these directives.
 Include $recConf
-SecRuleEngine On
+# MEASUREMENT: SecRuleEngine DetectionOnly -- CRS CI parity. RESPONSE-phase
+# (95xxx/956xxx) tests POST a JSON body whose characters trip PL4 strict-set
+# rules (920272/920273); in blocking mode the request is denied in phase 2 and
+# never reaches the backend /reflect, so no response body exists for the
+# response-phase rule to inspect. CRS CI runs DetectionOnly for exactly this
+# reason (docker-compose: MODSEC_RULE_ENGINE DetectionOnly, BLOCKING_PARANOIA 4)
+# and go-ftw judges by audit-log IDs, not status.
+SecRuleEngine DetectionOnly
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
