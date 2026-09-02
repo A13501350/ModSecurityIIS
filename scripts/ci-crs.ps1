@@ -388,7 +388,13 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
 # `failed to run: [ ... ]` list). Set to $false to restore the green run using
 # scripts/crs_ignore.txt.
 $MeasureMode = $true
-$includeRegex = '^(911|913|922|930|931|932|933|934|941|942|943|944|949|950|951|952|953|954|955|956)'
+# DEBUG (diag/single-body-test): run ONE response-body-dependent test from the
+# RESPONSE-95x/956x families (data-leakage rules that inspect RESPONSE_BODY in
+# phase 4). 950150-1 = ASP.NET ViewStateException posted to albedo's /reflect,
+# which echoes the body back, so the leakage string lands in RESPONSE_BODY and
+# rule 950150 fires. Swap for e.g. '^956100-1$' to debug the Ruby family.
+$SingleTest = '^950150-1$'
+$includeRegex = $SingleTest
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
@@ -471,6 +477,26 @@ if ($modeA.StatusCode -eq 403) {
 } else {
     Write-Host "[7b/8] INFO: response NOT blocked (got $($modeA.StatusCode)). Mode A did not engage -- check responseBodyBlock, SecResponseBodyAccess, or a chunked upstream response (streaming degrades to inspect-only)."
 }
+
+# --- 7c) RESPONSE-95x single-test debug dump ---------------------------------
+# The selected test (950150-1) posts an ASP.NET ViewStateException to albedo's
+# /reflect; albedo echoes it, so the leakage string is in RESPONSE_BODY and the
+# phase:4 rule 950150 should fire. This confirms the connector's response-body
+# inspection works for the RESPONSE-95x families and reports whether Mode A
+# blocked it (deny -> 403) or only inspected (pass/log -> 200).
+$hit950 = Select-String -Path $auditSrc -Pattern '"950150"' -Quiet
+Write-Host "[7c/8] RESPONSE-950 rule 950150 in audit log: $hit950"
+if ($hit950) {
+    Write-Host "[7c/8] audit lines mentioning 950150:"
+    Select-String -Path $auditSrc -Pattern '950150' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
+}
+# Direct replay of the same request to show the LIVE status: 403 = Mode A
+# buffered + blocked the response body; 200 = rule fired but inspect-only.
+$resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
+    -ContentType "application/json" `
+    -Body '{"body": "ViewStateException: Invalid viewstate detected."}' `
+    -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
+Write-Host "[7c/8] 950150-1 replay -> HTTP $($resp950.StatusCode)"
 if ($MeasureMode) {
     Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
     Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }
