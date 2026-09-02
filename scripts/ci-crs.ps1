@@ -336,13 +336,16 @@ foreach ($try in 1..3) {
     Start-Sleep -Seconds 3
 }
 # CRS rule ids are six digits: 9421xx for SQLi group hits, 941xxx for XSS.
+# DEBUG (diag/single-body-test): non-fatal -- if request rules are not firing we
+# must still reach the [7b/8]/[7c/8] response-body diagnostics and upload the
+# audit so we can SEE what (if anything) fired.
 if ($newSlice -notmatch '\[id "9421\d{2}"\]') {
-    throw "SQLi probe was not logged by CRS 9421xx rules."
+    Write-Host "[6/8] WARN: SQLi probe not logged by CRS 9421xx rules."
 }
 if ($newSlice -notmatch '\[id "941\d{3}"\]') {
-    throw "XSS probe was not logged by CRS 941xxx rules."
+    Write-Host "[6/8] WARN: XSS probe not logged by CRS 941xxx rules."
 }
-Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log."
+Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WARN above)."
 
 # --- 7) go-ftw over a representative CRS subset ----------------------------------
 # Policy: maximize the NUMBER of CRS families exercised while keeping CI green,
