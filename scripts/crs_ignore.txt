@@ -1,160 +1,35 @@
 # OWASP CRS 4.25.1 regression exclusions -- ModSecurityIIS (libModSecurity v3, IIS defaults)
-# Source: run 33402239005 -- full-suite measurement with modsecurity.conf-recommended
-# Included (so XML/JSON request bodies are now parsed into XML:/* + ARGS via its rules
-# 200000/200001/200006). This recovers ~100 exclusions that were body-parse misses.
+# Source: run 33547868702 -- full-suite measurement (no ignore list, CI gate disabled)
+# after the crs_xml_attr_inspect=1 opt-in (SecAction 990120, mirrors CRS CI's id:900511).
+# That fix recovered the entire XML-attribute family: 930100-5, 930110-13, 930120-15 all
+# pass now and are NOT listed here.
 #
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays green
 # while still exercising every included CRS family's passing sub-tests.
 #
-# Root-cause classes (MEASURED from per-test audit slices, run 33381996837, superseded
-# here by the recommended-config fix): most historical [D] misses were simply ARGS never
-# populated from the body. With the recommended config now Included, XML and JSON bodies
-# parse, so the bulk of those recovered. The REMAINING failures are genuine IIS-connector
-# request-body / phase-4 response inspection gaps (POST-body SQLi/XSS/RCE/PHP/Java payloads
-# the WAF does not match the way CRS expects) plus a handful of http.sys pre-WAF rejections
-# (404.11 double-escape, 404.14/404.15 length) that never reach the WAF and are excluded by
-# design. A few are upstream-intended denials: recommended rule 200002 ("failed to parse
-# request body -> deny 400") fires on malformed multipart/form-data (e.g. 932236-41/42,
-# 942521-17/18).
+# Root-cause classes (MEASURED): 942131-3/5/7 and the 9441xx/9442xx XML-body cases are
+# known libModSecurity v3 quirks that CRS CI also overrides (tests/regression/nginx-overrides.yaml:
+# "v3 log bug, the first part of the chain always produces a log" / "REQUEST_BODY is always
+# present, and rule catches it in case of CT application/xml"). The 95xxx / 956xxx families are
+# RESPONSE-phase (phase 4/5) data-leakage rules that never match because the connector does not
+# inspect response bodies (phase-4 inspection gap). 932236-41/42 and 942521-17/18 are upstream-
+# intended denials: recommended rule 200002 ("failed to parse request body -> deny 400") fires
+# on malformed multipart/form-data. 933160-20, 934101-5, 941101-2, 942101-6 remain under
+# investigation.
 #
-# Total: 245
+# Total: 117
 
-930100-5
-930110-13
-930120-15
-931100-5
-932120-6
-932125-7
-932130-41
-932140-159
-932160-15
-932175-16
-932200-17
-932210-8
-932220-12
-932230-60
-932231-2
-932232-6
-932235-54
-932236-101
 932236-41
 932236-42
-932238-11
-932240-22
-932250-16
-932260-49
-932270-15
-932271-7
-932280-7
-932281-9
-932300-11
-932301-8
-932310-9
-932311-14
-932320-12
-932321-7
-932330-2
-932331-3
-932370-6
-932371-3
-932380-14
-932390-17
 933160-20
-934100-35
-934101-11
 934101-5
-934130-15
-934140-51
-934150-2
-934160-34
-941100-7
 941101-2
-941110-13
-941120-52
-941130-22
-941140-5
-941150-3
-941160-18
-941170-6
-941180-10
-941181-5
-941190-6
-941200-5
-941210-7
-941220-3
-941230-3
-941240-3
-941250-3
-941260-3
-941270-3
-941280-3
-941290-3
-941300-3
-941310-13
-941320-2
-941330-3
-941340-3
-941350-2
-941360-4
-941370-11
-941380-2
-941390-12
-941400-8
-942100-15
 942101-6
-942130-11
 942131-3
 942131-5
 942131-7
-942131-8
-942140-18
-942150-20
-942151-73
-942160-27
-942170-5
-942190-47
-942200-17
-942210-82
-942230-13
-942240-12
-942250-2
-942251-3
-942260-2
-942270-3
-942280-5
-942290-10
-942300-4
-942310-4
-942320-14
-942330-6
-942340-11
-942350-10
-942370-12
-942380-46
-942390-2
-942400-3
-942410-69
-942430-17
-942431-10
-942432-10
-942440-27
-942450-8
-942470-12
-942480-13
-942490-23
-942500-6
-942510-3
-942511-3
-942520-22
 942521-17
 942521-18
-942521-26
-942522-11
-942530-2
-942540-8
-942550-49
-942560-4
-943100-3
 944100-11
 944100-12
 944100-15
@@ -163,31 +38,28 @@
 944110-12
 944110-15
 944110-16
-944120-108
-944120-109
-944120-125
-944120-126
+944120-6
+944120-7
 944120-23
 944120-24
 944120-40
 944120-41
 944120-57
 944120-58
-944120-6
-944120-7
 944120-74
 944120-75
 944120-91
 944120-92
-944150-3
-944151-3
-944152-3
+944120-108
+944120-109
+944120-125
+944120-126
+944210-6
+944210-7
 944210-23
 944210-24
 944210-40
 944210-41
-944210-6
-944210-7
 950150-1
 950150-2
 950150-3

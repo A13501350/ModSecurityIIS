@@ -25,8 +25,6 @@ $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
 
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"
-# go-ftw test directory (the --debug invocation below depends on this).
-$testsDir = Join-Path $crsDir "tests/regression/tests"
 New-Item -ItemType Directory -Force $crsDir | Out-Null
 $tgz     = Join-Path $env:TEMP "crs-$CrsVersion.tar.gz"
 $url     = "https://github.com/coreruleset/coreruleset/archive/refs/tags/$CrsVersion.tar.gz"
@@ -76,19 +74,6 @@ $recConf = (Join-Path $PSScriptRoot "..\libmodsecurity\modsecurity.conf-recommen
 if (-not (Test-Path $recConf)) {
     throw "libmodsecurity/modsecurity.conf-recommended not found at $recConf (is the submodule checked out in this job?)"
 }
-# 930100's pattern verbatim (CRS 4.25.1, REQUEST-930-APPLICATION-ATTACK-LFI.conf).
-# Defined once and interpolated into the diagnostic rules below -- keep this a
-# SINGLE-QUOTED string and keep it on ONE line (PowerShell here-strings ignore
-# backslash line continuations, and expandable here-strings would eat ${...}).
-$re930100 = '(?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))'
-$vars930100 = 'REQUEST_URI_RAW|ARGS|REQUEST_HEADERS|!REQUEST_HEADERS:Referer|FILES|XML:/*|XML://@*'
-# DIAGNOSTIC: a byte-identical clone of 930100 placed INSIDE the CRS rules dir,
-# so the `rules\*.conf` glob loads it right next to the real rule. If 200029
-# fails to match while the main-config clone 200028 does, the defect is
-# position/ordering dependent; if 200029 matches too, something targets the id.
-@"
-SecRule $vars930100 "@rx $re930100" "id:200029,phase:2,pass,log,auditlog,msg:'XMLDIAG-RULESDIR-CLONE of 930100'"
-"@ | Set-Content (Join-Path $crsDir "rules\999900-930100-clone.conf") -Encoding Ascii
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
@@ -141,15 +126,18 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
 # Opt in to CRS 4.25.x XML ATTRIBUTE inspection. On the LTS branch this is a
-# runtime gate: rule 901180 defaults tx.crs_xml_attr_inspect to 0 when unset,
-# and rule 901181 (phase 2) then runs ctl:ruleRemoveTargetByTag=<attack-*>;XML://@*
-# -- stripping the XML://@* target from every rule tagged attack-lfi/attack-xss/
-# attack-sqli/... . Those rules then see only XML:/* (element text), so payloads
-# hidden in XML ATTRIBUTES (e.g. CRS test 930100-5) are never inspected and the
-# rule silently never matches. CRS CI does the same opt-in -- tests/docker-compose.yml
-# appends `SecAction id:900511 ... setvar:tx.crs_xml_attr_inspect=1` to
-# crs-setup.conf. Must run in phase 1 BEFORE 901180 (which only initializes the
-# variable when its count is 0).
+# runtime gate, not a config directive: rule 901180 (phase 1) defaults
+# tx.crs_xml_attr_inspect to 0 when it is unset, and rule 901181 (phase 2) then
+# applies ctl:ruleRemoveTargetByTag=<attack-protocol|attack-lfi|attack-rfi|
+# attack-rce|attack-php|attack-generic|attack-xss|attack-sqli|attack-fixation>;XML://@*
+# -- stripping the XML://@* target from every rule carrying one of those tags.
+# Such a rule then inspects only XML:/* (element text), so payloads hidden in
+# XML ATTRIBUTES are never examined and the rule silently never matches
+# (e.g. CRS test 930100-5 feeds its payload through the `probe` attribute).
+# CRS CI performs the same opt-in: tests/docker-compose.yml appends
+# `SecAction id:900511 ... setvar:tx.crs_xml_attr_inspect=1` to crs-setup.conf.
+# Must be phase 1 and must run BEFORE 901180, which only initializes the
+# variable when its count is still 0.
 SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr_inspect=1"
 # Load the upstream recommended baseline BEFORE the CRS includes. It sets
 # SecRuleEngine DetectionOnly (line 7) and OVERRIDES the audit settings above
@@ -157,44 +145,11 @@ SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr
 # path). We re-assert the rule engine AND the audit settings AFTER the Include,
 # since libModSecurity takes the LAST value for these directives.
 Include $recConf
-# SecRuleEngine DetectionOnly replicates CRS CI exactly (tests/docker-compose.yml
-# sets MODSEC_RULE_ENGINE: DetectionOnly; go-ftw judges by audit-log IDs, so
-# detection-only still exercises full rule matching).
-SecRuleEngine DetectionOnly
+SecRuleEngine On
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecAuditLogParts ABIJDEFHZ
-# DIAGNOSTIC: engine debug log; ci-crs.ps1 greps it for "930100" below and
-# appends the lines to go-ftw-output.txt, so we can see whether/where the
-# engine evaluates the rule (level 9 is fine for this 1-test run).
-SecDebugLog $auditDir\debug.log
-SecDebugLogLevel 9
-# --- local rules. ALL SINGLE-LINE: PowerShell here-strings do not honor `\`
-# --- line continuations (a split rule once silently failed to load).
-# 200010: the SecParseXmlIntoArgs directive is accepted by the v3.0.16 parser
-# but never propagates to the transaction (the Driver->RulesSet merge macro is
-# not invoked), so set the property per-request via ctl, which writes it
-# directly. Same Content-Type that recConf rule 200000 uses to select the XML
-# processor. (930100-family rules read XML via XPath/DOM and work without
-# this; 200010 feeds the separate XML:* args path.)
-SecRule REQUEST_HEADERS:Content-Type "^(?:application(?:/soap\+|/)|text/)xml" "id:200010,phase:1,t:none,t:lowercase,pass,nolog,ctl:parseXmlIntoArgs=on"
-# 200020 + curl probes E/F below: phase-1 deny on a request that still carries
-# an entity body. Kept as a transport regression guard -- the A/B test showed
-# master already delivers a clean 403 here (defer-block fix b733a65 reverted).
-SecRule REQUEST_HEADERS:X-Phase1Probe "@streq block" "id:200020,phase:1,deny,status:403,log,msg:'phase1 block probe (body present)'"
-# XML diagnostics -- where does 930100's inspection chain break?
-#   200023 control: rules loaded, phase 2 ran   200025: XML processor engaged
-#   200022 XML:/*   : DOM doc present           200021 XML://@*: attrs visible
-#   200026: 930100's variable list, trivial rx  200027: XML://@* + 930100 regex
-#   200028: full 930100 clone (block/capture/setvar)
-SecRule REQUEST_HEADERS:Content-Type "@rx (?i)xml" "id:200023,phase:2,pass,log,auditlog,msg:'XMLDIAG-CONTROL loaded and phase2 ran'"
-SecRule REQBODY_PROCESSOR "@streq XML" "id:200025,phase:2,pass,log,auditlog,msg:'XMLDIAG-PROCESSOR-ENGAGED'"
-SecRule XML:/* "@rx .*" "id:200022,phase:2,pass,log,auditlog,msg:'XMLDIAG-ROOT-XPATH doc present'"
-SecRule XML://@* "@rx .*" "id:200021,phase:2,pass,log,auditlog,msg:'XMLDIAG-ATTR-XPATH attributes visible'"
-SecRule $vars930100 "@rx 0x5c0x2e" "id:200026,phase:2,pass,log,auditlog,msg:'XMLDIAG-MULTIVAR-LIST ok'"
-SecRule XML://@* "@rx $re930100" "id:200027,phase:2,pass,log,auditlog,msg:'XMLDIAG-930100-REGEX on XML://@* ok'"
-SecRule $vars930100 "@rx $re930100" "id:200028,phase:2,block,capture,t:none,msg:'XMLDIAG-FULL-CLONE of 930100',logdata:'Matched Data: %{TX.0} found within %{MATCHED_VAR_NAME}: %{MATCHED_VAR}',ver:'OWASP_CRS/4.25.1',severity:'CRITICAL',setvar:'tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}',setvar:'tx.lfi_score=+%{tx.critical_anomaly_score}'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -233,23 +188,9 @@ if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsecte
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
 
 # --- 4) reverse proxy: URL Rewrite + ARR -> albedo ------------------------------
-# Install via winget: Chocolatey's community feed is unreliable (intermittent
-# download failures), so `choco install iis-arr` can fail silently and leave
-# system.webServer/proxy unregistered -> appcmd then errors "Unknown config
-# section". winget's installers register the schema; iisreset reloads it.
-# ARR enablement is non-fatal: WAF block tests (930100-5) are denied at phase 2
-# before any rewrite, so they run even if proxying to the backend is unavailable.
-foreach ($pkg in @('Microsoft.IIS.URLRewrite', 'Microsoft.IIS.ApplicationRequestRouting')) {
-    Write-Host "[4/8] installing $pkg via winget..."
-    & winget install --id $pkg -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String | ForEach-Object { Write-Host "[4/8] winget $pkg : $($_ -replace "`r?`n", ' ')" }
-}
-& iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
-& iisreset /start 2>&1 | Out-Null; Start-Sleep -Seconds 3
-& $appcmd set config /section:system.webServer/proxy /enabled:true 2>&1 | Out-String | ForEach-Object { Write-Host "[4/8] appcmd proxy: $($_ -replace "`r?`n", ' ')" }
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "WARNING: ARR proxy section not available on this runner; ALLOWED requests will not reach albedo, but block tests (930100-5) still run."
-}
-else { Write-Host "[4/8] ARR proxy enabled." }
+choco install urlrewrite iis-arr -y --no-progress | Out-Null
+& $appcmd set config /section:system.webServer/proxy /enabled:true
+if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
 
 # IMPORTANT: keep the site-level <ModSecurity> element -- overwriting
 # web.config without it silently disables the module (GetConfig finds no
@@ -478,128 +419,18 @@ Write-Host "[7/8] Loaded $(@($ignoreYaml -split "`n").Count) ignored CRS sub-tes
 logfile: '$auditPathForYaml'
 logmarkerheadername: X-CRS-TEST
 mode: 'default'
-basic:
-  address: 'http://localhost/'
 testoverride:
   ignore:
 $ignoreYaml
 "@ | Set-Content $ftwConfig -Encoding Ascii
 
-Write-Host "[7/8] DIAGNOSTIC: curl -v replay of blocked-POST tests + IIS Failed Request Tracing (FREB)"
-Write-Host "[7/8] (connector body-drain fix is present; goal: see client view of the block response / connection)"
-
-# ---- enable Failed Request Tracing (FREB), WWW Server provider, Verbose ------
-$frebSrc = "C:\inetpub\logs\FailedReqLogFiles"
-New-Item -ItemType Directory -Force $frebSrc | Out-Null
-& $appcmd set config "$SiteName" /section:system.webServer/tracing /enabled:"true" 2>&1 | Out-Null
-& $appcmd set config "$SiteName" /section:system.webServer/tracing/traceFailedRequests `
-    /+[path='*',statusCodes='200-999',timeTaken='00:01:00'] 2>&1 | Out-Null
-& $appcmd set config "$SiteName" /section:system.webServer/tracing/traceFailedRequests `
-    "/+[path='*',statusCodes='200-999'].traceProviders.[providerId='{3A12BAF6-C0DC-4F00-9A43-7C42DACD2342}',areas='*',verbosity='Verbose']" 2>&1 | Out-Null
-Write-Host "[7/8] FREB enabled for $SiteName (WWW Server provider, Verbose)"
-
-# ---- craft representative blocked-POST bodies --------------------------------
-# A) XML body with embedded NUL byte -- replica of CRS 930100-5 (a [T] TRANSPORT test)
-$xmlBytes = [System.Text.Encoding]::UTF8.GetBytes('<?xml version="1.0"?><root><a probe="0x5c0x2e.')
-$xmlBytes += [byte]0
-$xmlBytes += [System.Text.Encoding]::UTF8.GetBytes('/"></a></root>')
-[System.IO.File]::WriteAllBytes("$PWD\xml-nul-body.bin", $xmlBytes)
-
-function Invoke-CurlDiag {
-    param($Label, $Method, $Url, $ContentType, $BodyFile, $BodyStr, $ExtraHeader)
-    Write-Host "----- curl: $Label -----"
-    $a = @('-v', '-sS', '-m', '15', '-X', $Method, $Url)
-    if ($ContentType) { $a += '-H'; $a += "Content-Type: $ContentType" }
-    $a += '-H'; $a += 'User-Agent: OWASP CRS test agent'
-    $a += '-H'; $a += 'Connection: close'
-    if ($ExtraHeader) { $a += '-H'; $a += $ExtraHeader }
-    if ($BodyFile) { $a += '--data-binary'; $a += "@$BodyFile" }
-    elseif ($BodyStr) { $a += '--data'; $a += $BodyStr }
-    $tx = & curl.exe @a 2>&1 | Out-String
-    Write-Host $tx
-    return $tx
-}
-
-$rA = Invoke-CurlDiag "A: XML NUL-byte body (930100-5 replica)" POST "http://localhost/post" "application/xml" "$PWD\xml-nul-body.bin" $null
-$rB = Invoke-CurlDiag "B: SQLi urlencoded body (942100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "id=1%27+OR+%271%27%3D%271"
-$rC = Invoke-CurlDiag "C: XSS urlencoded body (941100 family)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
-$rD = Invoke-CurlDiag "D: baseline clean POST (expect 200)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "name=value"
-# E is the A/B probe: phase-1 deny while the request still carries a body --
-# exactly the scenario connector commit b733a65 claims master mishandles (RST).
-# F is the no-body baseline (both connectors should deliver a clean 403).
-$rE = Invoke-CurlDiag "E: phase-1 deny + POST body (A/B: master RST vs fix defers)" POST "http://localhost/post" "application/x-www-form-urlencoded" $null "x=1" "X-Phase1Probe: block"
-$rF = Invoke-CurlDiag "F: phase-1 deny + GET no body (baseline: clean 403 both)" GET "http://localhost/status/200" $null $null $null "X-Phase1Probe: block"
-# G: same 930100 payload in the QUERY STRING (no %00, http.sys-safe). If 930100
-# fires here via REQUEST_URI_RAW/ARGS but not on XML://@*, the rule is loaded
-# and the defect is specific to its XML variable evaluation; if it does not
-# fire here either, the rule is never executed at all.
-$rG = Invoke-CurlDiag "G: LFI payload in query string (930100 via URI/ARGS)" GET "http://localhost/post?x=0x5c0x2e0x2e0x2f" $null $null $null
-
-$txAll = [System.Text.StringBuilder]::new()
-[void]$txAll.AppendLine("=== curl -v replay of blocked-POST tests (connector body-drain fix PRESENT) ===")
-[void]$txAll.AppendLine()
-[void]$txAll.AppendLine($rA)
-[void]$txAll.AppendLine($rB)
-[void]$txAll.AppendLine($rC)
-[void]$txAll.AppendLine($rD)
-[void]$txAll.AppendLine($rE)
-[void]$txAll.AppendLine($rF)
-[void]$txAll.AppendLine($rG)
-[void]$txAll.AppendLine()
-[void]$txAll.AppendLine("=== INTERPRETATION ===")
-[void]$txAll.AppendLine("If a test shows '< HTTP/1.1 403' with complete headers and a clean close, the connector")
-[void]$txAll.AppendLine("delivered the block correctly and the prior go-ftw 'failed to run' is a go-ftw client")
-[void]$txAll.AppendLine("limitation (not a connector bug). A 'Recv failure: Connection reset by peer' / 'Empty")
-[void]$txAll.AppendLine("reply' means http.sys still resets the connection despite the drained body.")
-
-Set-Content -Path "$PWD\go-ftw-output.txt" -Value $txAll.ToString() -Encoding UTF8
-
-# ---- go-ftw's OWN view: --debug on one [T] test to see why it reports 'failed to run' -
-# Use a config WITHOUT testoverride.ignore, otherwise 930100-5 would be Ignored
-# ("no tests found") and we'd never see the real error.
-$dbgConfig = Join-Path $ConfRoot "ftw-debug.yaml"
-@"
----
-logfile: '$auditPathForYaml'
-logmarkerheadername: X-CRS-TEST
-mode: 'default'
-"@ | Set-Content $dbgConfig -Encoding Ascii
-Write-Host "[7/8] go-ftw --debug on 930100-5 (clean config, captures go-ftw client + audit-match view)"
-$dbg = (& $ftwExe run -d $testsDir --include "^930100-5`$" --config $dbgConfig --debug 2>&1 | Out-String)
-[void]$txAll.AppendLine()
-[void]$txAll.AppendLine("=== go-ftw --debug for 930100-5 (why does it report 'failed to run'?) ===")
-[void]$txAll.AppendLine($dbg)
-Add-Content -Path "$PWD\go-ftw-output.txt" -Value $dbg -Encoding UTF8
-Write-Host $dbg
-
-# ---- engine's own account of rule 930100: grep the SecDebugLog ---------------
-# Level 9 logs each rule evaluation. If 930100 appears here, it runs and fails
-# to match; if it is absent, it is never evaluated (load or ordering problem).
-$dbgLogPath = Join-Path $auditDir "debug.log"
-if (Test-Path $dbgLogPath) {
-    $hits930 = @(Select-String -LiteralPath $dbgLogPath `
-        -Pattern '930100|XML:|ruleRemove|UpdateTarget' |
-        Select-Object -First 400 | ForEach-Object { $_.Line })
-    Add-Content -Path "$PWD\go-ftw-output.txt" `
-        -Value "=== SecDebugLog lines mentioning 930100 (count: $($hits930.Count)) ==="
-    if ($hits930.Count -gt 0) {
-        Add-Content -Path "$PWD\go-ftw-output.txt" -Value $hits930
-    }
-    Write-Host "[7/8] debug-log lines mentioning 930100: $($hits930.Count)"
-} else {
-    Write-Host "[7/8] WARNING: SecDebugLog not found at $dbgLogPath"
-}
-
-# ---- harvest FREB logs into the audit dir (captured by iis-smoke-diagnostics) -
-$frebDst = "C:\inetpub\logs\modsec-audit\freb"
-New-Item -ItemType Directory -Force $frebDst | Out-Null
-if (Test-Path $frebSrc) {
-    Copy-Item "$frebSrc\*" $frebDst -Recurse -Force -ErrorAction SilentlyContinue
-}
-Write-Host "[7/8] FREB files copied: $((Get-ChildItem $frebDst -Recurse -File -ErrorAction SilentlyContinue).Count)"
-
-$ftwCode = 0
-Write-Host "=== curl -v transcripts (client view of response / connection) ==="
+$testsDir = Join-Path $crsDir "tests\regression\tests"
+Write-Host "[7/8] Running go-ftw (representative subset)..."
+& $ftwExe run -d $testsDir --include $includeRegex `
+    --config $ftwConfig --show-failures-only 2>&1 |
+    Tee-Object -FilePath "$PWD\go-ftw-output.txt"
+$ftwCode = $LASTEXITCODE
+Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
@@ -614,7 +445,7 @@ $bad = Get-WinEvent -FilterHashtable @{ LogName = "Application";
            'Failed to find the RegisterModule entrypoint|dll failed to load|cannot be read because it is missing a section declaration' }
 if ($bad) {
     $bad | Select-Object TimeCreated, ProviderName, Id, Message | Format-List | Out-String | Write-Host
-    Write-Host "WARNING: Found IIS/module error events in the Application log (diagnostic run continues)."
+    throw "Found IIS/module error events in the Application log."
 }
-Write-Host "[8/8] Event log checked."
+Write-Host "[8/8] Event log clean."
 exit $ftwCode
