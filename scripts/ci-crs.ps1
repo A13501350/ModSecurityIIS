@@ -156,6 +156,18 @@ SecRule RESPONSE_BODY "@rx .+" "id:990132,phase:4,pass,log,msg:'diag: RESPONSE_B
 #                       the body, e.g. pEntityChunks empty for proxied responses)
 # No macros (config-parse-safe).
 SecRule REQUEST_URI "@rx .+" "id:990133,phase:4,pass,log,msg:'diag: phase4 ran'"
+# DEBUG (diag/single-body-test): phase:3 (response-headers) markers. These run
+# in processResponseHeaders, which has NO mime-type dependency, so they fire
+# whenever the connector's OnSendResponse reaches the response phase at all.
+#   * 990134 (REQUEST_URI) -> proves phase 3 / response handling engages.
+#   * 990135 (RESPONSE_HEADERS:Content-Type) -> proves the response Content-Type
+#       was actually fed to libModSecurity via addResponseHeader. If 990135 is
+#       ABSENT while 990134 is present, the Content-Type was never fed, so
+#       processResponseBody() (transaction.cc:1132) bails on the mime check and
+#       SKIPS phase 4 for EVERY response -- the real root cause of 990133/950150
+#       never firing. No macros (config-parse-safe).
+SecRule REQUEST_URI "@rx .+" "id:990134,phase:3,pass,log,msg:'diag: phase3 ran'"
+SecRule RESPONSE_HEADERS:Content-Type "@rx .+" "id:990135,phase:3,pass,log,msg:'diag: resp Content-Type fed'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
@@ -543,6 +555,10 @@ $hit132 = Select-String -Path $auditSrc -Pattern '"990132"' -Quiet
 Write-Host "[7c/8] phase:4 diagnostic 990132 (RESPONSE_BODY seen) in audit: $hit132"
 $hit133 = Select-String -Path $auditSrc -Pattern '"990133"' -Quiet
 Write-Host "[7c/8] phase:4 always-fires marker 990133 in audit: $hit133"
+$hit134 = Select-String -Path $auditSrc -Pattern '"990134"' -Quiet
+Write-Host "[7c/8] phase:3 marker 990134 (response phase engaged) in audit: $hit134"
+$hit135 = Select-String -Path $auditSrc -Pattern '"990135"' -Quiet
+Write-Host "[7c/8] phase:3 marker 990135 (resp Content-Type fed) in audit: $hit135"
 if ($hit950) {
     Write-Host "[7c/8] audit lines mentioning 950150:"
     Select-String -Path $auditSrc -Pattern '950150' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
