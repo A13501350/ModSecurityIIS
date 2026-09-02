@@ -1,4 +1,11 @@
 name: Build ModSecurityIIS
+# Give dispatched runs a human-readable name so they can be told apart in the
+# Actions list (we repeatedly lost track of which run-id held the modsecurityiis
+# artifact, e.g. reuse runs never upload the DLL). `label` is free-form; when
+# build_run_id is set we also tag the reuse so the source run is obvious. Push
+# events leave both empty and fall back to the plain workflow name.
+run-name: >-
+  ${{ inputs.label != '' && inputs.label || 'Build ModSecurityIIS' }}${{ inputs.build_run_id != '' && format(' [reuse {0}]', inputs.build_run_id) || '' }}
 
 on:
   push:
@@ -13,18 +20,46 @@ on:
       - 'docs/**'
       - '**/*.editorconfig'
   workflow_dispatch:
+    inputs:
+      # Human-readable name shown in the Actions list for this run. Leave blank
+      # for the default "Build ModSecurityIIS".
+      label:
+        description: 'Name for this run (shown in the Actions list)'
+        required: false
+        default: ''
+        type: string
+      # Reuse a previously built DLL artifact instead of rebuilding (the build job
+      # takes ~6 min and is unchanged when only scripts/ci-crs.ps1 is edited). Pass
+      # the run-id of any successful build run that produced the `modsecurityiis`
+      # artifact. Leave blank to build normally. IMPORTANT: this must be the run-id
+      # of a FULL BUILD that actually uploaded the `modsecurityiis` artifact -- a
+      # run that itself reused a DLL does NOT re-upload it, so its id will 404.
+      build_run_id:
+        description: 'Optional run-id of a prior build to reuse the DLL artifact'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
+    # In reuse mode (workflow_dispatch with inputs.build_run_id set) EVERY step
+    # below is skipped via `if: inputs.build_run_id == ''`, so this job becomes a
+    # near-instant no-op that merely satisfies smoke-iis's `needs`. smoke-iis
+    # downloads the prior run's DLL via download-artifact run-id. We cannot skip
+    # the job itself (GitHub disallows inputs/github in the needs context), so we
+    # gate the steps instead -- this also drops the ~5-min Conan/engine cache and
+    # the checkout/Conan/MSVC setup that are dead weight when nothing is built.
     runs-on: windows-latest
 
     steps:
       - name: Checkout (with submodules, recursive)
+        if: ${{ inputs.build_run_id == '' }}
         uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Python
+        if: ${{ inputs.build_run_id == '' }}
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
@@ -36,6 +71,7 @@ jobs:
       # like yajl from source) is pinned to 3.x via a profile override in the
       # build helper, see conan-center-index#26878.
       - name: Install Conan 2.x + Ninja
+        if: ${{ inputs.build_run_id == '' }}
         run: pip install "conan>=2" ninja
 
       # Cache both the Conan package cache and the already-built engine tree.
@@ -45,6 +81,7 @@ jobs:
       # fast. The key covers the conanfile and our build helper so a dep/flag
       # change invalidates the cached engine.
       - name: Cache Conan packages + engine build
+        if: ${{ inputs.build_run_id == '' }}
         uses: actions/cache@v6
         with:
           path: |
@@ -59,9 +96,11 @@ jobs:
       # cache above: it pays off when that cache misses (eviction, key bump)
       # and a full ~40-min engine+deps rebuild would otherwise start over.
       - name: Run sccache
+        if: ${{ inputs.build_run_id == '' }}
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Configure sccache env
+        if: ${{ inputs.build_run_id == '' }}
         shell: pwsh
         run: |
           Add-Content $env:GITHUB_ENV "SCCACHE_GHA_ENABLED=true"
@@ -70,23 +109,30 @@ jobs:
           Add-Content $env:GITHUB_PATH (Split-Path $env:SCCACHE_PATH)
 
       - name: Set up MSVC toolchain (cl.exe + Windows SDK)
+        if: ${{ inputs.build_run_id == '' }}
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - uses: ammaraskar/msvc-problem-matcher@0.3.0
+        if: ${{ inputs.build_run_id == '' }}
 
+      # The four steps below are already gated. In reuse mode they all skip, as
+      # do every step above, so the job is an instant no-op placeholder.
       - name: Configure
+        if: ${{ inputs.build_run_id == '' }}
         run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
       - name: Build
+        if: ${{ inputs.build_run_id == '' }}
         run: cmake --build build --config Release
 
       - name: sccache stats
+        if: ${{ inputs.build_run_id == '' }}
         run: "& $env:SCCACHE_PATH --show-stats"
 
       - name: Upload artifacts
-        if: always()
+        if: ${{ inputs.build_run_id == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: modsecurityiis
@@ -101,17 +147,29 @@ jobs:
   # pass-through, audit log, event log). Failure here fails the workflow.
   smoke-iis:
     runs-on: windows-latest
+    # The build job still runs on reuse, but its Configure/Build/Upload steps are
+    # gated (if: inputs.build_run_id == '') so the ~6-min compile + DLL upload are
+    # skipped; smoke-iis downloads the reused DLL directly via the run-id input.
     needs: build
 
     steps:
-      - name: Checkout
+      - name: Checkout (with submodules, recursive)
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Download built DLLs
         uses: actions/download-artifact@v8
         with:
           name: modsecurityiis
           path: artifact
+          # Reuse a prior run's DLL when build_run_id is supplied; otherwise fall
+          # back to THIS run's own artifact (uploaded by the build job above).
+          # The fallback must be explicit: handing the action an EMPTY run-id makes
+          # it request .../runs/NaN/artifacts and fail with 404, so a plain full
+          # build could never download the DLL it had just produced.
+          run-id: ${{ inputs.build_run_id != '' && inputs.build_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       # dumpbin (used by the smoke script to list libModSecurity imports)
       # comes with the MSVC toolchain.
