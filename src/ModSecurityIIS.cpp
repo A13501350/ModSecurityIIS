@@ -1331,6 +1331,23 @@ CMyHttpModule::OnSendResponse(
             }
         }
     }
+
+    // Mode B (responseBodyBlock off) / degraded streaming: the body is fully
+    // buffered and this is the FINAL send (no MORE_DATA flag) -> evaluate
+    // phase 4 here for detection. Unlike the old OnPostEndRequest placement,
+    // this runs AFTER the response headers were fed, so Content-Type is known
+    // and the mime gate inside processResponseBody() passes. Inspect-only:
+    // ApplyIntervention is called with blocking disabled, so a match logs but
+    // never replaces the response.
+    if (!responseBodyBlockingEnabled(rsc) &&
+        !rsc->m_ResponseBodyEvaluated && !moreData)
+    {
+        rsc->m_ResponseBodyEvaluated = true;
+        IisTrace("OnSendResponse: before processResponseBody (Mode B) tx=%p",
+                 (void*)rsc->m_pTx);
+        rsc->m_pTx->processResponseBody();
+        ApplyIntervention(rsc, pHttpContext, false);
+    }
     }
 
     } while (0);
@@ -1365,44 +1382,25 @@ CMyHttpModule::OnPostEndRequest(
     IN IHttpEventProvider * pProvider
 )
 {
+    UNREFERENCED_PARAMETER(pHttpContext);
     UNREFERENCED_PARAMETER(pProvider);
 
-    REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)
-        pHttpContext->GetModuleContextContainer()->GetModuleContext(g_pModuleContext);
-
-    IisTrace("OnPostEndRequest: entry rsc=%p", (void*)rsc);
-
-    if (rsc != NULL && rsc->m_pTx != NULL)
-    {
-        try
-        {
-            // Deferred response-body evaluation (Mode B / inspect-only): phase-4
-            // runs once over the fully accumulated body (appended in
-            // OnSendResponse). Skipped if Mode A already evaluated it inline.
-            if (!rsc->m_ResponseBodyEvaluated)
-            {
-                IisTrace("OnPostEndRequest: before processResponseBody tx=%p",
-                         (void*)rsc->m_pTx);
-                rsc->m_pTx->processResponseBody();
-                IisTrace("OnPostEndRequest: after processResponseBody");
-                if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
-                {
-                    // Disruptive: ApplyIntervention already finalized the tx.
-                    return RQ_NOTIFICATION_CONTINUE;
-                }
-            }
-            rsc->FinishRequest();   // processLogging + delete tx
-        }
-        catch (const std::exception& e)
-        {
-            ReportException("OnPostEndRequest", e.what());
-        }
-        catch (...)
-        {
-            ReportException("OnPostEndRequest", NULL);
-        }
-    }
-
+    // MEASURED (connector file trace, CI run 33733528207): in this IIS pipeline
+    // the RQ_END_REQUEST post-notification fires BEFORE RQ_SEND_RESPONSE -- all
+    // 13 observed OnSendResponse calls arrived after OnPostEndRequest. The old
+    // body of this handler was therefore actively harmful:
+    //   1. processResponseBody() ran with NO response headers fed yet
+    //      (addResponseHeader("Content-Type") happens only in OnSendResponse),
+    //      so the mime check in Transaction::processResponseBody early-returned
+    //      and phase 4 did nothing;
+    //   2. FinishRequest() deleted the transaction and nulled m_pTx;
+    //   3. OnSendResponse then found m_pTx == NULL and broke out -- so phase 3
+    //      and the response-body feed never ran at all (the root cause of every
+    //      RESPONSE-95x phase-4 regression failure and of Mode A never blocking).
+    // The response phases now live entirely in OnSendResponse. The transaction
+    // is finalized by REQUEST_STORED_CONTEXT::CleanupStoredContext (destructor
+    // path: processLogging + delete), which IIS invokes after every notification
+    // has completed -- including RQ_SEND_RESPONSE.
     return RQ_NOTIFICATION_CONTINUE;
 }
 
