@@ -518,6 +518,11 @@ $ftwArgs += @('--max-marker-log-lines', '20000')
 # entire run (observed at the same test in 33745710564 AND 33749658477).
 $ftwArgs += @('--exclude', '^(92[01]|980)')
 if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
+# Full-suite runs print one line per test (~4300 "✔ passed" lines -> ~900KB of
+# CI log). Only the failures matter for the gate; --show-failures-only keeps the
+# log down to the summary plus whatever actually failed. Single-test debug runs
+# keep the per-test lines (there is only one).
+if ($SingleTest -eq '') { $ftwArgs += '--show-failures-only' }
 if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
 & $ftwExe @ftwArgs 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
