@@ -427,7 +427,7 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # intended denials (recommended rule 200002 "failed to parse request body ->
 # deny 400" fires on malformed multipart/form-data). See
 # scripts/crs_ignore.txt header for the full breakdown. To regenerate: run CI
-# with $MeasureMode = $true, harvest the failing ids into crs_ignore.txt.
+# with $MeasureMode = $false, harvest the failing ids into crs_ignore.txt.
 #
 # MEASUREMENT OVERRIDE: set $true to skip testoverride.ignore entirely and
 # measure the raw failure count. Default (green CI) run uses

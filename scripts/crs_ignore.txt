@@ -1,24 +1,26 @@
 # OWASP CRS 4.25.1 regression exclusions -- ModSecurityIIS (libModSecurity v3, IIS defaults)
-# Source: run 33547868702 -- full-suite measurement (no ignore list, CI gate disabled)
-# after the crs_xml_attr_inspect=1 opt-in (SecAction 990120, mirrors CRS CI's id:900511).
-# That fix recovered the entire XML-attribute family: 930100-5, 930110-13, 930120-15 all
-# pass now and are NOT listed here.
+# Source: run 33757830298 -- full-suite measurement (no ignore list) on
+# cleanup/response-fix-final AFTER merging master (crs_xml_attr_inspect=1 +
+# modsecurity.conf-recommended body parsing) and after the connector response-
+# phase fix (OnSendResponse; d228cb6) plus /reflect DetectionOnly (990140).
 #
-# These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays green
-# while still exercising every included CRS family's passing sub-tests.
+# The RESPONSE-95x/956x families that were excluded on master for the phase-4
+# inspection gap now PASS and are NOT listed here. What remains (41 ids) is the
+# same set upstream CRS CI overrides or expects:
+#   * 942131-3/5/7, 944100/944110/944120/944210 (XML/JSON-body Java):
+#     libModSecurity v3 quirks -- CRS CI overrides these in
+#     tests/regression/nginx-overrides.yaml ("v3 log bug, the first part of the
+#     chain always produces a log" / "REQUEST_BODY is always present, and rule
+#     catches it in case of CT application/xml").
+#   * 932236-41/42, 942521-17/18: upstream-intended denials -- recommended rule
+#     200002 ("failed to parse request body -> deny 400") fires on malformed
+#     multipart/form-data.
+#   * 933160-20, 934101-5, 941101-2, 942101-6: under investigation.
 #
-# Root-cause classes (MEASURED): 942131-3/5/7 and the 9441xx/9442xx XML-body cases are
-# known libModSecurity v3 quirks that CRS CI also overrides (tests/regression/nginx-overrides.yaml:
-# "v3 log bug, the first part of the chain always produces a log" / "REQUEST_BODY is always
-# present, and rule catches it in case of CT application/xml"). The 95xxx / 956xxx families are
-# RESPONSE-phase (phase 4/5) data-leakage rules that never match because the connector does not
-# inspect response bodies (phase-4 inspection gap). 932236-41/42 and 942521-17/18 are upstream-
-# intended denials: recommended rule 200002 ("failed to parse request body -> deny 400") fires
-# on malformed multipart/form-data. 933160-20, 934101-5, 941101-2, 942101-6 remain under
-# investigation.
+# These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
+# green while still exercising every included family's passing sub-tests.
 #
-# Total: 117
-
+# Total: 41
 932236-41
 932236-42
 933160-20
@@ -38,101 +40,25 @@
 944110-12
 944110-15
 944110-16
-944120-6
-944120-7
+944120-108
+944120-109
+944120-125
+944120-126
 944120-23
 944120-24
 944120-40
 944120-41
 944120-57
 944120-58
+944120-6
+944120-7
 944120-74
 944120-75
 944120-91
 944120-92
-944120-108
-944120-109
-944120-125
-944120-126
-944210-6
-944210-7
 944210-23
 944210-24
 944210-40
 944210-41
-950150-1
-950150-2
-950150-3
-950150-4
-950150-5
-950150-6
-950150-7
-950150-8
-950150-9
-951110-1
-951120-1
-951130-1
-951140-1
-951150-1
-951160-1
-951170-1
-951180-1
-951190-1
-951200-1
-951210-1
-951210-2
-951220-1
-951220-2
-951230-1
-951230-2
-951240-1
-951240-2
-951250-1
-951260-1
-952110-1
-952110-2
-952110-3
-952110-4
-952110-5
-952110-6
-952110-7
-952110-8
-952110-9
-953101-1
-953101-2
-953101-3
-953101-4
-953101-5
-953120-1
-953120-3
-953120-5
-953120-7
-954100-1
-954100-2
-954100-3
-954101-1
-954101-2
-954120-1
-954120-2
-955100-1
-955100-2
-955100-3
-955110-1
-955120-1
-955120-2
-955260-1
-955400-1
-955400-2
-955400-3
-956100-1
-956100-2
-956100-3
-956100-4
-956100-5
-956100-6
-956100-7
-956100-8
-956100-9
-956110-1
-956110-2
-956110-3
+944210-6
+944210-7
