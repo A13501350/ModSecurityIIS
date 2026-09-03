@@ -639,12 +639,16 @@ if (-not $hit950) {
 # go-ftw "failed to run" (~10-25ms, i.e. NOT a timeout). Replay each request 60x
 # and bucket the failures to learn whether it is a refused/reset connection, an
 # ARR/albedo hiccup, or something intermittent in the connector itself.
+$body951200 = @'
+{"body": "[match sql-errors.data]the used select statements have different number of columns[/match]: Unexpected end of command in statement [SELECT * FROM INTO WHERE 'place'='xxxxxxx' AND 'yielddate' BETWEEN '01/11/2012' AND '29/11/2012''']."}
+'@
+$body955120 = @'
+{"body": "<html><head><meta http-equiv='Content-Type' content='text/html; charset='><title>example.com Wso 2024</title></head>"}
+'@
 $flakeReplay = @(
   @{ name='934120-43'; method='GET';  uri='http://localhost/get'; headers=@{ 'Cookie'='ssrf=http://2852039166/' } },
-  @{ name='951200-1';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }
-     body='{"body": "[match sql-errors.data]the used select statements have different number of columns[/match]: Unexpected end of command in statement [SELECT * FROM INTO WHERE '"'"'place'"'"'='"'"'xxxxxxx'"'"' AND '"'"'yielddate'"'"' BETWEEN '"'"'01/11/2012'"'"' AND '"'"'29/11/2012'"'"''"'"']."}' },
-  @{ name='955120-2';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }
-     body='{"body": "<html><head><meta http-equiv='"'"'Content-Type'"'"' content='"'"'text/html; charset='"'"'><title>example.com Wso 2024</title></head>"}' }
+  @{ name='951200-1';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }; body=$body951200 },
+  @{ name='955120-2';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }; body=$body955120 }
 )
 foreach ($fr in $flakeReplay) {
     $ok = 0; $fail = 0; $codes = @{}; $errs = @{}
