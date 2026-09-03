@@ -516,8 +516,11 @@ $ftwArgs += @('--max-marker-log-lines', '20000')
 # reporting rule 980170, which never fires with this connector, and go-ftw
 # treats the test's own retry_once exhaustion as a FATAL error that aborts the
 # entire run (observed at the same test in 33745710564 AND 33749658477).
-$ftwArgs += @('--exclude', '^(92[01]|980)')
+# 920/921/980 are excluded on FULL-suite runs (see comment above). go-ftw v1.3
+# refuses to combine --include with --exclude ("you need to choose one"), so
+# single-test debug runs pass --include and NOT --exclude.
 if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
+else { $ftwArgs += @('--exclude', '^(92[01]|980)') }
 # Full-suite runs print one line per test (~4300 "✔ passed" lines -> ~900KB of
 # CI log). Only the failures matter for the gate; --show-failures-only keeps the
 # log down to the summary plus whatever actually failed. Single-test debug runs
