@@ -760,8 +760,17 @@ if ($MeasureMode) {
     Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
     Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }
 } else {
-    Write-Host "--- FULL CRS AUDIT LOG ---"
-    Get-Content $auditSrc -ErrorAction SilentlyContinue
+    # Dumping the whole audit log here balloons the CI log to ~67 MB (run
+    # 33751539867). Instead print a compact rollup: rule ids that fired, by
+    # frequency -- the file itself is uploaded as modsec_crs_audit.log anyway.
+    Write-Host "--- CRS audit rule-id rollup (top 25) ---"
+    if (Test-Path $auditSrc) {
+        $ids = Select-String -Path $auditSrc -Pattern '\[id "(\d+)"\]' -AllMatches |
+            ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }
+        $ids | Group-Object | Sort-Object Count -Descending |
+            Select-Object -First 25 |
+            ForEach-Object { Write-Host ("{0,6}  {1}" -f $_.Count, $_.Name) }
+    }
 }
 
 # --- 8) event-log hygiene (loader/config problems surface here) -------------------
