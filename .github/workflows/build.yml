@@ -1,11 +1,15 @@
 name: Build ModSecurityIIS
-# Give dispatched runs a human-readable name so they can be told apart in the
-# Actions list (we repeatedly lost track of which run-id held the modsecurityiis
-# artifact, e.g. reuse runs never upload the DLL). `label` is free-form; when
-# build_run_id is set we also tag the reuse so the source run is obvious. Push
-# events leave both empty and fall back to the plain workflow name.
+# Give runs a human-readable name so they can be told apart in the Actions
+# list (we repeatedly lost track of which run-id held the modsecurityiis
+# artifact, e.g. reuse runs never upload the DLL). `label` wins for dispatched
+# runs; a build_run_id appends [reuse <id>] so the source run is obvious. PUSH
+# runs have no inputs, so they fall back to the head commit message (single
+# line: GitHub renders run-name as-is, and our commits keep a one-line
+# subject). Last resort is the plain workflow name.
 run-name: >-
-  ${{ inputs.label != '' && inputs.label || 'Build ModSecurityIIS' }}${{ inputs.build_run_id != '' && format(' [reuse {0}]', inputs.build_run_id) || '' }}
+  ${{ inputs.label != '' && inputs.label ||
+       (github.event_name == 'push' && github.event.head_commit.message) ||
+       'Build ModSecurityIIS' }}${{ inputs.build_run_id != '' && format(' [reuse {0}]', inputs.build_run_id) || '' }}
 
 on:
   push:
