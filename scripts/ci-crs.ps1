@@ -602,8 +602,21 @@ try {
 } catch {
     Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
 }
-& iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
-& iisreset /start 2>&1 | Out-Null
+# This script runs with $ErrorActionPreference = "Stop" (line 17). A single
+# error line emitted by iisreset becomes a terminating error and KILLS the run
+# -- exactly what happened in the v12 diagnostic: everything after [7a/8]
+# ([7b/8]/[7c/8]/[7d/8], the probes, the trace dump) never executed. So the
+# restart must be wrapped and non-fatal.
+$eap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & iisreset /stop  2>&1 | Out-Null
+    Start-Sleep -Seconds 3
+    & iisreset /start 2>&1 | Out-Null
+} catch {
+    Write-Host "[7a/8] WARN: iisreset issue: $($_.Exception.Message)"
+}
+$ErrorActionPreference = $eap
 foreach ($i in 1..30) {
     if ((Get-Service W3SVC).Status -eq "Running") { break }
     Start-Sleep -Seconds 1
