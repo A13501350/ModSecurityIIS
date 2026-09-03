@@ -552,11 +552,20 @@ $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
 New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
 Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
 try {
-    Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -NoRestart `
-        -ErrorAction Stop | Out-Null
+    # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics, and
+    # without it the call fails with "One or several parent features are
+    # disabled" (observed) and FREB silently produces no logs at all.
+    Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
+        -NoRestart -ErrorAction Stop | Out-Null
     Write-Host "[7a/8] IIS-HttpTracing feature enabled."
 } catch {
-    Write-Host "[7a/8] WARN: IIS-HttpTracing feature: $($_.Exception.Message)"
+    Write-Host "[7a/8] WARN: IIS-HttpTracing via cmdlet: $($_.Exception.Message)"
+    try {
+        & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 |
+            Write-Host
+    } catch {
+        Write-Host "[7a/8] WARN: dism fallback failed: $($_.Exception.Message)"
+    }
 }
 try {
     & $appcmd set config $SiteName `
