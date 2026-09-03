@@ -61,6 +61,13 @@ on:
         required: false
         default: false
         type: boolean
+      # no_gate: for diagnostic/measurement runs that must not page on expected
+      #   failures. go-ftw result still printed; the run exits 0.
+      no_gate:
+        description: 'Do not gate on go-ftw failures (diagnostic runs only)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -244,6 +251,11 @@ jobs:
         env:
           MODSEC_IIS_FREB: ${{ inputs.freb == true }}
           MODSEC_IIS_FTW_DEBUG: ${{ inputs.ftw_debug == true }}
+          # Diagnostic/debug runs are observation, not a gate: a full-suite
+          # --debug run is exactly when an intermittent flake may show up, and
+          # it must not redden the workflow. Debug runs therefore opt out of
+          # go-ftw gating; normal runs keep it ON.
+          MODSEC_IIS_NO_GATE: ${{ inputs.no_gate == true || inputs.ftw_debug == true }}
         run: ./scripts/ci-crs.ps1 -DllDir artifact
 
       - name: Upload smoke diagnostics
