@@ -621,6 +621,19 @@ foreach ($i in 1..30) {
     if ((Get-Service W3SVC).Status -eq "Running") { break }
     Start-Sleep -Seconds 1
 }
+# W3SVC reporting Running is NOT enough: in v13 the site stayed down after the
+# post-install restart and every later probe died with "connection actively
+# refused". Start the site explicitly and WAIT until it actually answers.
+& $appcmd start site $SiteName 2>&1 | Out-Null
+$up = $false
+foreach ($i in 1..30) {
+    try {
+        $p = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+                 -SkipHttpErrorCheck -TimeoutSec 5
+        if ($p.StatusCode -eq 200) { $up = $true; break }
+    } catch { Start-Sleep -Seconds 2 }
+}
+Write-Host "[7a/8] post-FREB restart: site reachable = $up"
 
 # --- 7b) Mode A response-body blocking debug probe -------------------------
 # With responseBodyBlock="true" + SecResponseBodyAccess On + phase:4 rule
@@ -634,11 +647,18 @@ foreach ($i in 1..30) {
 # at phase 2 -- the request must survive to phase 4 for 990130 to evaluate the
 # echoed RESPONSE_BODY. (The previous probe used a space-bearing body and was
 # killed by 920273/949110 at phase 2, so its 403 proved nothing about Mode A.)
-$modeA = Invoke-WebRequest "http://localhost/reflect" -Method Post `
-    -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER" `
-    -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
-Write-Host "[7b/8] Mode A probe (response body contains marker) -> $($modeA.StatusCode)"
-if ($modeA.StatusCode -eq 403) {
+# Probe must never kill the run: under EAP=Stop a refused connection aborts
+# everything after it (v13 lost [7c/8]-[7d/8] this way). Report and continue.
+$modeA = $null
+try {
+    $modeA = Invoke-WebRequest "http://localhost/reflect" -Method Post `
+        -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER" `
+        -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
+} catch {
+    Write-Host "[7b/8] WARN: Mode A probe transport failed: $($_.Exception.Message)"
+}
+Write-Host "[7b/8] Mode A probe (response body contains marker) -> $(if ($modeA) { $modeA.StatusCode } else { 'NO-RESPONSE' })"
+if ($modeA -and $modeA.StatusCode -eq 403) {
     Write-Host "[7b/8] PASS: Mode A buffered + BLOCKED the response body (403)."
 } else {
     Write-Host "[7b/8] INFO: response NOT blocked (got $($modeA.StatusCode)). Mode A did not engage -- check responseBodyBlock, SecResponseBodyAccess, or a chunked upstream response (streaming degrades to inspect-only)."
@@ -688,16 +708,26 @@ if ($hit133) {
 # the proxied /reflect, body capture is proxy-specific.
 $staticHit = Select-String -Path $auditSrc -Pattern 'leak\.html' -Quiet
 Write-Host "[7c/8] static /leak.html request present in audit: $staticHit"
-$leak = Invoke-WebRequest "http://localhost/leak.html" -UseBasicParsing `
-    -SkipHttpErrorCheck -TimeoutSec 15
-Write-Host "[7c/8] static /leak.html probe -> HTTP $($leak.StatusCode), body-len=$($leak.Content.Length)"
+$leak = $null
+try {
+    $leak = Invoke-WebRequest "http://localhost/leak.html" -UseBasicParsing `
+        -SkipHttpErrorCheck -TimeoutSec 15
+} catch {
+    Write-Host "[7c/8] WARN: leak.html probe transport failed: $($_.Exception.Message)"
+}
+Write-Host "[7c/8] static /leak.html probe -> HTTP $(if ($leak) { $leak.StatusCode } else { 'NO-RESPONSE' }), body-len=$(if ($leak) { $leak.Content.Length } else { 0 })"
 # Direct replay of the same request to show the LIVE status: 403 = Mode A
 # buffered + blocked the response body; 200 = rule fired but inspect-only.
-$resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
-    -ContentType "application/json" `
-    -Body '{"body": "ViewStateException: Invalid viewstate detected."}' `
-    -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
-Write-Host "[7c/8] 950150-1 replay -> HTTP $($resp950.StatusCode)"
+$resp950 = $null
+try {
+    $resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
+        -ContentType "application/json" `
+        -Body '{"body": "ViewStateException: Invalid viewstate detected."}' `
+        -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
+} catch {
+    Write-Host "[7c/8] WARN: 950150-1 replay transport failed: $($_.Exception.Message)"
+}
+Write-Host "[7c/8] 950150-1 replay -> HTTP $(if ($resp950) { $resp950.StatusCode } else { 'NO-RESPONSE' })"
 
 # --- 7d) connector response-phase trace dump ---------------------------------
 # The DLL writes C:/inetpub/modsec/modsecurityiis-trace.log (captured by the
