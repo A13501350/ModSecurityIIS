@@ -530,6 +530,11 @@ if ($MeasureMode) {
 # per-request request/response dumps, which is unmanageable across 4883 tests,
 # so it is only enabled for single-test debug runs.
 $ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
+# Default is 500 lines: with SecAuditEngine On over 4883 tests the audit log
+# grows far faster than that and go-ftw aborts mid-run with "Error:
+# retry-once" (observed at 980170-1 in run 33745710564). 20000 comfortably
+# covers the inter-marker distance of the full suite.
+$ftwArgs += @('--max-marker-log-lines', '20000')
 if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
 if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
 & $ftwExe @ftwArgs 2>&1 |
