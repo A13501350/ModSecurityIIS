@@ -535,6 +535,14 @@ $ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
 # retry-once" (observed at 980170-1 in run 33745710564). 20000 comfortably
 # covers the inter-marker distance of the full suite.
 $ftwArgs += @('--max-marker-log-lines', '20000')
+# 920/921 (Protocol Enforcement/Attack) send MALFORMED requests: http.sys
+# rejects or sometimes HANGS the connection on them, and a hung connection
+# makes go-ftw abort the whole run with "read tcp ... i/o timeout" (observed
+# at 920410-1 in run 33747110589 and at 920390-1 in run 33748330919 -- two
+# different points, so intermittent). The CI strategy already treats these
+# families as untestable under IIS (rejected before any module runs); exclude
+# them so the remaining ~4865 tests measure to completion.
+$ftwArgs += @('--exclude', '^92[01]')
 if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
 if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
 & $ftwExe @ftwArgs 2>&1 |
