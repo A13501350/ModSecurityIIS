@@ -433,7 +433,7 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # measure the raw failure count. Default (green CI) run uses
 # scripts/crs_ignore.txt -- refreshed after the response phase fix (d228cb6)
 # and the merge of master's XML-attribute/body-parse opt-ins.
-$MeasureMode = $true
+$MeasureMode = $false
 # empty = run the FULL IIS-feasible suite (all families; 920/921 and 980 are
 # excluded via --exclude in the go-ftw invocation below). Set to e.g.
 # '^950150-1$' to debug a single test.
