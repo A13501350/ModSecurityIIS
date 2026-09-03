@@ -120,6 +120,20 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # detection_paranoia_level follow blocking_paranoia_level when unset, so setting
 # BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
+# DEBUG (diag/single-body-test): A/B CONTROL rules, placed BEFORE the CRS
+# Includes. 990136 (phase:3) and 990137 (phase:4) are byte-for-byte identical
+# to 990134 / 990133 below except for the id and the message. This isolates
+# *rule position* from every other variable:
+#   * 990136/990137 LOG but 990134/990133 do NOT
+#       -> the engine drops every rule defined AFTER the Include directives
+#          (config-parsing bug). Note this is NOT a connector bug: the audit
+#          F part shows "HTTP/1.1 200", and those variables are only assigned
+#          inside processResponseHeaders(), so phase 3 IS being invoked.
+#   * all four log -> position is irrelevant; the rules never matched for
+#          another reason.
+#   * none log -> phase 3/4 rule evaluation itself is dead.
+SecRule REQUEST_URI "@rx .+" "id:990136,phase:3,pass,log,msg:'diag: phase3 ran (PRE-include control)'"
+SecRule REQUEST_URI "@rx .+" "id:990137,phase:4,pass,log,msg:'diag: phase4 ran (PRE-include control)'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -556,7 +570,18 @@ Write-Host "[7c/8] phase:4 diagnostic 990132 (RESPONSE_BODY seen) in audit: $hit
 $hit133 = Select-String -Path $auditSrc -Pattern '"990133"' -Quiet
 Write-Host "[7c/8] phase:4 always-fires marker 990133 in audit: $hit133"
 $hit134 = Select-String -Path $auditSrc -Pattern '"990134"' -Quiet
-Write-Host "[7c/8] phase:3 marker 990134 (response phase engaged) in audit: $hit134"
+Write-Host "[7c/8] phase:3 marker 990134 (response phase engaged, POST-include) in audit: $hit134"
+$hit136 = Select-String -Path $auditSrc -Pattern '"990136"' -Quiet
+Write-Host "[7c/8] phase:3 CONTROL 990136 (identical, PRE-include) in audit: $hit136"
+$hit137 = Select-String -Path $auditSrc -Pattern '"990137"' -Quiet
+Write-Host "[7c/8] phase:4 CONTROL 990137 (identical, PRE-include) in audit: $hit137"
+if ($hit136 -and -not $hit134) {
+    Write-Host "[7c/8] VERDICT: rules AFTER the Include directives are DROPPED by the engine (config-parsing bug)."
+} elseif ($hit136 -and $hit134) {
+    Write-Host "[7c/8] VERDICT: both positions fire -- rule position is NOT the cause."
+} else {
+    Write-Host "[7c/8] VERDICT: no phase3 control fired -- phase-3 evaluation itself is dead."
+}
 $hit135 = Select-String -Path $auditSrc -Pattern '"990135"' -Quiet
 Write-Host "[7c/8] phase:3 marker 990135 (resp Content-Type fed) in audit: $hit135"
 if ($hit950) {

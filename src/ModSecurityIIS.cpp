@@ -263,7 +263,24 @@ static void ReportException(const char* where, const char* what) noexcept
 // writes when the path exists/creatable; failures are silently ignored.
 static void IisTrace(const char* fmt, ...)
 {
-    FILE* f = fopen("C:/inetpub/modsec/modsecurityiis-trace.log", "a");
+    // Tried in order: w3wp's app-pool identity can only write where ITS audit
+    // log lives (C:/inetpub/logs/modsec-crs-audit -- proven writable because
+    // the engine writes audit.log there). C:/inetpub/modsec is the config root
+    // written by the elevated CI script and is NOT writable by w3wp, which is
+    // why an earlier trace attempt there silently produced no file at all.
+    static const char* kPaths[] = {
+        // First choice: ci-smoke's audit dir. w3wp demonstrably writes its
+        // audit.log there (204 KB observed) AND it is inside the uploaded
+        // iis-smoke-diagnostics artifact, so the trace is both writable and
+        // retrievable.
+        "C:/inetpub/logs/modsec-audit/modsecurityiis-trace.log",
+        "C:/inetpub/logs/modsec-crs-audit/modsecurityiis-trace.log",
+        "C:/inetpub/modsec/modsecurityiis-trace.log"
+    };
+    FILE* f = NULL;
+    for (int i = 0; i < 3 && f == NULL; i++) {
+        f = fopen(kPaths[i], "a");
+    }
     if (f == NULL) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
