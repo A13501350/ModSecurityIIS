@@ -714,14 +714,17 @@ if ($bad) {
 }
 Write-Host "[8/8] Event log clean."
 
-# go-ftw test results are deliberately NOT a CI gate. Intermittent transport
-# flakes (a different sub-test every ~run) would otherwise turn the workflow red
-# with an unavoidable failure notification each time; known misses already live
-# in crs_ignore.txt. Failures stay visible in the run log and the
-# go-ftw-output.txt / modsec_crs_audit.log artifacts. Real regressions surface
-# there too, and [6/8] (blocking probes) + [7b/8] (phase-4 sentinel) + [8/8]
-# (event-log hygiene) above still hard-fail on genuine engine/config breakage.
-if ($ftwCode -ne 0) {
-    Write-Host "[9/8] WARNING: go-ftw exit=$ftwCode (NOT gating). See go-ftw-output.txt for the failing ids."
+# go-ftw result gating: ON by default (a real regression turns the run red).
+# Intermittent transport flakes (a different sub-test every ~run) would
+# otherwise page with a failure notification each time; for diagnostic runs
+# only, set MODSEC_IIS_NO_GATE=1 to exit 0 and leave the failures in the log
+# and the go-ftw-output.txt / modsec_crs_audit.log artifacts. Genuine
+# engine/config breakage still hard-fails regardless via [6/8] (blocking
+# probes), [7b/8] (phase-4 sentinel) and [8/8] (event-log hygiene).
+if ($env:MODSEC_IIS_NO_GATE -eq '1') {
+    if ($ftwCode -ne 0) {
+        Write-Host "[9/8] WARNING: go-ftw exit=$ftwCode (MODSEC_IIS_NO_GATE=1, NOT gating). See go-ftw-output.txt."
+    }
+    exit 0
 }
-exit 0
+exit $ftwCode
