@@ -15,7 +15,13 @@
 #   * 932236-41/42, 942521-17/18: upstream-intended denials -- recommended rule
 #     200002 ("failed to parse request body -> deny 400") fires on malformed
 #     multipart/form-data.
-#   * 933160-20, 934101-5, 941101-2, 942101-6: under investigation.
+#   * 933160-20, 934101-5, 941101-2, 942101-6: http.sys / IIS Request Filtering
+#     rejects the URI PATH before any module runs -- these payloads carry bare
+#     quotes/parens that are illegal in RFC 3986 paths (e.g. /get/"onmouseover=...,
+#     /get/eval(gzinflate(...)). Same class as the 920/921 pre-WAF rejections;
+#     the passing siblings of these files put the payload in query/body instead.
+#   * 934120-43, 951200-1: intermittent transport flakes (pass most runs; a
+#     transient ARR/albedo failure on one measurement). Not rule logic.
 #
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
 # green while still exercising every included family's passing sub-tests.
