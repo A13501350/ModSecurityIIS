@@ -527,9 +527,24 @@ else { $ftwArgs += @('--exclude', '^(92[01]|980)') }
 # keep the per-test lines (there is only one).
 if ($SingleTest -eq '') { $ftwArgs += '--show-failures-only' }
 if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
-& $ftwExe @ftwArgs 2>&1 |
-    Tee-Object -FilePath "$PWD\go-ftw-output.txt"
+# go-ftw stdout goes ONLY into go-ftw-output.txt (uploaded as the crs-ftw-logs
+# artifact), never to the run log: a full-suite --debug run would otherwise
+# dump every request/response into the run log (~tens of MB). The run log gets
+# the compact summary below instead; the full detail lives in the artifact.
+& $ftwExe @ftwArgs 2>&1 | Out-File -FilePath "$PWD\go-ftw-output.txt" -Encoding utf8
 $ftwCode = $LASTEXITCODE
+# Compact per-test rollup for the run log: passed/failed/skipped counts and the
+# failing test ids (detail is in go-ftw-output.txt).
+$gOut = Get-Content "$PWD\go-ftw-output.txt" -ErrorAction SilentlyContinue
+$fails = $gOut | Select-String -Pattern 'failed (in|to run)|failed: \d' | ForEach-Object { $_.Line } |
+         Where-Object { $_ -notmatch 'go-ftw output|Starting|Running go-ftw' }
+$gOut | Select-String -Pattern 'total tests|test\(s\) failed|test\(s\) failed to run' |
+    ForEach-Object { Write-Host "go-ftw: $($_.Line.Trim())" }
+if ($fails) {
+    Write-Host "go-ftw failing lines:"
+    $fails | Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.Trim())" }
+}
+Write-Host "go-ftw exit code: $ftwCode"
 Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
