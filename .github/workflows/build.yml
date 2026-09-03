@@ -43,6 +43,24 @@ on:
         required: false
         default: ''
         type: string
+      # Diagnostic toggles for the CRS suite (default OFF -- mainline behavior).
+      # ftw_debug: go-ftw --debug on FULL runs (every request/response dump goes to
+      #   the go-ftw-output.txt artifact, run log stays compact). Use when chasing
+      #   the intermittent "failed to run" flakes.
+      ftw_debug:
+        description: 'go-ftw --debug on full-suite runs (output to artifact)'
+        required: false
+        default: false
+        type: boolean
+      # freb: enable IIS Failed Request Tracing BEFORE go-ftw so it captures the
+      #   whole suite (installs IIS-HttpTracing + one iisreset; site is restarted
+      #   and probed afterwards). Logs land in C:/inetpub/logs/FailedReqLogFiles
+      #   (uploaded as iis-smoke-diagnostics).
+      freb:
+        description: 'IIS Failed Request Tracing over the full go-ftw run'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -223,6 +241,9 @@ jobs:
 
       - name: Test against OWASP CRS (go-ftw + albedo)
         shell: pwsh
+        env:
+          MODSEC_IIS_FREB: ${{ inputs.freb == true }}
+          MODSEC_IIS_FTW_DEBUG: ${{ inputs.ftw_debug == true }}
         run: ./scripts/ci-crs.ps1 -DllDir artifact
 
       - name: Upload smoke diagnostics
