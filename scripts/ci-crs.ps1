@@ -112,6 +112,20 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
   log,\
   msg:'X-CRS-Test %{MATCHED_VAR}',\
   ctl:ruleRemoveById=1-999999"
+# RESPONSE-95x/956x data-leak tests POST their leak payload (which is itself a
+# near-attack string, e.g. `[match sql-errors.data]...ODBC Syntax error...`) to
+# albedo's echo endpoint /reflect. With request-body parsing active (the
+# modsecurity.conf-recommended Include), those bodies match phase-2 ARGS rules
+# (942430/942431/942432 restricted-character, 932xxx, ...) -> anomaly score ->
+# 949110 blocks the request BEFORE albedo echoes it, so the phase-4 response
+# rule never fires and the test fails. No CRS regression test (930..956)
+# asserts an HTTP status -- they all only require the rule id in the log -- so
+# degrading the echo endpoint to DetectionOnly loses nothing except the
+# meaningless phase-2 block. Real blocking is still asserted by the [6/8]
+# SQLi/XSS probes, which hit "/", NOT /reflect. Must be phase 1 and BEFORE the
+# CRS includes so the engine switch applies to every later rule in this tx.
+SecRule REQUEST_URI "@rx ^/reflect([?].*)?$" \
+  "id:990140,phase:1,pass,t:none,nolog,noauditlog,ctl:ruleEngine=DetectionOnly"
 # Raise the CRS paranoia level to 4 so the regression exercises EVERY rule
 # family. This MUST come BEFORE the includes and MUST say phase:1 explicitly:
 #   * CRS gates each paranoia block with a PAIR of skipAfter rules, one per
