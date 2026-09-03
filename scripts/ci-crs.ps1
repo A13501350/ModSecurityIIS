@@ -437,7 +437,7 @@ $MeasureMode = $false
 # empty = run the FULL IIS-feasible suite (all families; 920/921 and 980 are
 # excluded via --exclude in the go-ftw invocation below). Set to e.g.
 # '^950150-1$' to debug a single test.
-$SingleTest = ''
+$SingleTest = '^934120-43$'
 $includeRegex = $SingleTest
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
@@ -632,6 +632,39 @@ $hit950 = Select-String -Path $auditSrc -Pattern '"950150"' -Quiet
 Write-Host "[7b/8] phase:4 rule 950150 present in audit log (response-body inspection live): $hit950"
 if (-not $hit950) {
     Write-Host "[7b/8] WARN: no 950150 hit -- is SecResponseBodyAccess On and does the suite reach a /reflect data-leak?"
+}
+
+# --- 7b2) intermittent-transport flake replay ----------------------------------
+# 934120-43 / 951200-1 / 955120-2 pass most full runs and fail ~1 in N with a
+# go-ftw "failed to run" (~10-25ms, i.e. NOT a timeout). Replay each request 60x
+# and bucket the failures to learn whether it is a refused/reset connection, an
+# ARR/albedo hiccup, or something intermittent in the connector itself.
+$flakeReplay = @(
+  @{ name='934120-43'; method='GET';  uri='http://localhost/get'; headers=@{ 'Cookie'='ssrf=http://2852039166/' } },
+  @{ name='951200-1';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }
+     body='{"body": "[match sql-errors.data]the used select statements have different number of columns[/match]: Unexpected end of command in statement [SELECT * FROM INTO WHERE '"'"'place'"'"'='"'"'xxxxxxx'"'"' AND '"'"'yielddate'"'"' BETWEEN '"'"'01/11/2012'"'"' AND '"'"'29/11/2012'"'"''"'"']."}' },
+  @{ name='955120-2';  method='POST'; uri='http://localhost/reflect'; headers=@{ 'Content-Type'='application/json' }
+     body='{"body": "<html><head><meta http-equiv='"'"'Content-Type'"'"' content='"'"'text/html; charset='"'"'><title>example.com Wso 2024</title></head>"}' }
+)
+foreach ($fr in $flakeReplay) {
+    $ok = 0; $fail = 0; $codes = @{}; $errs = @{}
+    for ($k = 1; $k -le 60; $k++) {
+        try {
+            $resp = Invoke-WebRequest $fr.uri -Method $fr.method -Headers $fr.headers `
+                        -Body $fr.body -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 10
+            $ok++
+            $c = "$($resp.StatusCode)"
+            $codes[$c] = 1 + $codes[$c]
+        } catch {
+            $fail++
+            $msg = $_.Exception.Message
+            if ($msg.Length -gt 90) { $msg = $msg.Substring(0, 90) }
+            $errs[$msg] = 1 + $errs[$msg]
+        }
+        if ($k % 20 -eq 0) { Start-Sleep -Milliseconds 200 }
+    }
+    Write-Host "[7b2] flake replay $($fr.name): ok=$ok fail=$fail codes=$($codes | ConvertTo-Json -Compress)"
+    foreach ($e in $errs.Keys) { Write-Host "[7b2]   FAIL: '$e' x $($errs[$e])" }
 }
 
 # --- 7c) connector file-trace dump (opt-in) ----------------------------------
