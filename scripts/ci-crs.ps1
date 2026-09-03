@@ -463,12 +463,11 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # `failed to run: [ ... ]` list). Set to $false to restore the green run using
 # scripts/crs_ignore.txt.
 $MeasureMode = $true
-# DEBUG (diag/single-body-test): run ONE response-body-dependent test from the
-# RESPONSE-95x/956x families (data-leakage rules that inspect RESPONSE_BODY in
-# phase 4). 950150-1 = ASP.NET ViewStateException posted to albedo's /reflect,
-# which echoes the body back, so the leakage string lands in RESPONSE_BODY and
-# rule 950150 fires. Swap for e.g. '^956100-1$' to debug the Ruby family.
-$SingleTest = '^950150-1$'
+# DEBUG (diag/single-body-test): empty = run the FULL suite (4883 tests).
+# Set to e.g. '^950150-1$' to debug a single response-body-dependent test
+# (RESPONSE-95x/956x families inspect RESPONSE_BODY in phase 4; albedo's
+# /reflect echoes the body so the leakage string lands in RESPONSE_BODY).
+$SingleTest = ''
 $includeRegex = $SingleTest
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
@@ -526,15 +525,14 @@ if ($MeasureMode) {
 }
 # Default output (NOT -o github) so the complete failure reason for "failed to
 # run" is captured -- the github format collapses it to a placeholder.
-# Print go-ftw's own CLI surface so we can see every knob (timeouts, marker
-# retries, debug) without relying on memory of a specific version.
-Write-Host "=== go-ftw run --help ==="
-& $ftwExe run --help 2>&1 | Write-Host
-# --debug makes go-ftw print the actual request/response and the underlying
-# transport error for each "failed to run" (the default output collapses it to
-# a one-line summary, which is why the 288 failures were undiagnosable).
-& $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig --debug 2>&1 |
+# --debug was decisive for the single-test diagnostics (it prints the real
+# "Failed to find IDs in the log" instead of a one-line summary) but produces
+# per-request request/response dumps, which is unmanageable across 4883 tests,
+# so it is only enabled for single-test debug runs.
+$ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
+if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
+if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
+& $ftwExe @ftwArgs 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
 $ftwCode = $LASTEXITCODE
 Write-Host "go-ftw exit code: $ftwCode"
