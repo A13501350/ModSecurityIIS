@@ -27,6 +27,7 @@
 #include <exception> // std::exception
 #include <cstdio>    // FILE*, fprintf (diag trace)
 #include <cstdarg>   // va_list (diag trace)
+#include <cstdlib>   // getenv (diag trace enable switch)
 
 #include "httpserv.h"
 
@@ -261,8 +262,31 @@ static void ReportException(const char* where, const char* what) noexcept
 // processResponseBody. The file lives under C:/inetpub/modsec/ which the
 // iis-smoke-diagnostics artifact uploads. Cheap and disabled-able: it only
 // writes when the path exists/creatable; failures are silently ignored.
+//
+// KEPT as a permanently available diagnostic, but DISABLED by default: the
+// trace only writes when the MODSEC_IIS_TRACE environment variable is set
+// (any non-empty value other than "0"). w3wp inherits the app pool's
+// environment, so set it on the app pool to enable. Evaluated once per
+// process; no per-request overhead when off.
+static int g_iisTraceEnabled = -1;
+
+static bool IisTraceEnabled()
+{
+    if (g_iisTraceEnabled == -1)
+    {
+        const char* v = getenv("MODSEC_IIS_TRACE");
+        g_iisTraceEnabled =
+            (v != NULL && v[0] != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return g_iisTraceEnabled == 1;
+}
+
 static void IisTrace(const char* fmt, ...)
 {
+    if (!IisTraceEnabled())
+    {
+        return;
+    }
     // Tried in order: w3wp's app-pool identity can only write where ITS audit
     // log lives (C:/inetpub/logs/modsec-crs-audit -- proven writable because
     // the engine writes audit.log there). C:/inetpub/modsec is the config root

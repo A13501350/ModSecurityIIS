@@ -120,85 +120,20 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # detection_paranoia_level follow blocking_paranoia_level when unset, so setting
 # BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
-# DEBUG (diag/single-body-test): A/B CONTROL rules, placed BEFORE the CRS
-# Includes. 990136 (phase:3) and 990137 (phase:4) are byte-for-byte identical
-# to 990134 / 990133 below except for the id and the message. This isolates
-# *rule position* from every other variable:
-#   * 990136/990137 LOG but 990134/990133 do NOT
-#       -> the engine drops every rule defined AFTER the Include directives
-#          (config-parsing bug). Note this is NOT a connector bug: the audit
-#          F part shows "HTTP/1.1 200", and those variables are only assigned
-#          inside processResponseHeaders(), so phase 3 IS being invoked.
-#   * all four log -> position is irrelevant; the rules never matched for
-#          another reason.
-#   * none log -> phase 3/4 rule evaluation itself is dead.
-SecRule REQUEST_URI "@rx .+" "id:990136,phase:3,pass,log,msg:'diag: phase3 ran (PRE-include control)'"
-SecRule REQUEST_URI "@rx .+" "id:990137,phase:4,pass,log,msg:'diag: phase4 ran (PRE-include control)'"
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
-# DEBUG (diag/single-body-test): relax the PL4 strict request-byte-range rule
-# 920273 so JSON / space-bearing request bodies are NOT denied at phase 2. Without
-# this, 920273 (parameter set excludes byte 32/space and 34/{} etc.) -> 949110
-# denies the request (403) BEFORE /reflect echoes the leak, so the phase:4
-# RESPONSE-95x/956x rules (and Mode A's 990130) never run. This is a debug-only
-# relaxation: at PL1 -- the level the official CRS regression runs at -- 920273 is
-# inactive by default, so this is purely making PL4 behave like PL1 for transport.
+# Relax the PL4 strict request-byte-range rule 920273 so JSON / space-bearing
+# request bodies are NOT denied at phase 2 before /reflect can echo the body
+# for the RESPONSE-95x data-leak tests. This is a debug-only relaxation: at
+# PL1 -- the level the official CRS regression runs at -- 920273 is inactive,
+# so this makes PL4 behave like PL1 for transport.
 SecRuleRemoveById 920273
-# DEBUG (diag/single-body-test): Mode A response-body block. With
-# responseBodyBlock="true" + SecResponseBodyAccess On, the connector buffers the
-# whole response and evaluates this phase:4 rule; a match REPLACES the response
-# with 403. Streamed/chunked upstream responses degrade to inspect-only (never
-# blocked) -- the probe below reports which path fired. albedo echoes the request
-# body, so a probe POST whose body contains the marker trips this rule.
-SecRule RESPONSE_BODY "@rx MODEA-BLOCK-MARKER" "id:990130,phase:4,deny,status:403,msg:'diag: mode-a response body block'"
-# DEBUG (diag/single-body-test): non-empty RESPONSE_BODY marker. @rx .+ requires a
-# non-empty RESPONSE_BODY, so if this logs we KNOW phase 4 ran AND the response
-# body was populated (0-length / mime-excluded bodies would NOT match). Macro-free
-# to avoid any config-parse risk.
-SecRule RESPONSE_BODY "@rx .+" "id:990132,phase:4,pass,log,msg:'diag: RESPONSE_BODY seen'"
-# DEBUG (diag/single-body-test): ALWAYS-FIRES phase:4 marker. Matches any
-# REQUEST_URI, so if it logs we KNOW phase 4 was INVOKED for that transaction
-# (the audit line carries the [uri "..."] so we can tell which request). Pair it
-# with 990132 to separate the two failure modes behind the 950150 miss:
-#   * 990133 ABSENT  -> phase 4 was never evaluated (deep connector bug,
-#                       OnSendResponse/OnPostEndRequest not reaching processResponseBody)
-#   * 990133 PRESENT but 990132 ABSENT -> phase 4 ran but RESPONSE_BODY was EMPTY
-#                       (response-body capture bug: appendResponseBody never fed
-#                       the body, e.g. pEntityChunks empty for proxied responses)
-# No macros (config-parse-safe).
-SecRule REQUEST_URI "@rx .+" "id:990133,phase:4,pass,log,msg:'diag: phase4 ran'"
-# DEBUG (diag/single-body-test): phase:3 (response-headers) markers. These run
-# in processResponseHeaders, which has NO mime-type dependency, so they fire
-# whenever the connector's OnSendResponse reaches the response phase at all.
-#   * 990134 (REQUEST_URI) -> proves phase 3 / response handling engages.
-#   * 990135 (RESPONSE_HEADERS:Content-Type) -> proves the response Content-Type
-#       was actually fed to libModSecurity via addResponseHeader. If 990135 is
-#       ABSENT while 990134 is present, the Content-Type was never fed, so
-#       processResponseBody() (transaction.cc:1132) bails on the mime check and
-#       SKIPS phase 4 for EVERY response -- the real root cause of 990133/950150
-#       never firing. No macros (config-parse-safe).
-SecRule REQUEST_URI "@rx .+" "id:990134,phase:3,pass,log,msg:'diag: phase3 ran'"
-SecRule RESPONSE_HEADERS:Content-Type "@rx .+" "id:990135,phase:3,pass,log,msg:'diag: resp Content-Type fed'"
 
 "@ | Set-Content $conf -Encoding Ascii
 Write-Host "[2/8] Engine config written ($conf)"
-
-# DEBUG (diag/single-body-test): drop a static ASP.NET error page into the site
-# root. It is served LOCALLY (not via the ARR proxy to albedo), as text/html --
-# which is in the DEFAULT SecResponseBodyMimeType set. This lets [7c/8] tell
-# whether response-body capture works AT ALL (static file) versus only failing
-# for the PROXIED /reflect response. If 950150/990133 fire for /leak.html but
-# not /reflect, the capture path is proxy-specific (pEntityChunks empty for
-# reverse-proxied bodies); if they fail for both, body capture is fundamentally
-# broken in OnSendResponse.
-$leakHtml = Join-Path $SiteRoot "leak.html"
-@"
-<html><body>ViewStateException: Invalid viewstate detected.</body></html>
-"@ | Set-Content $leakHtml -Encoding Ascii
-Write-Host "[2/8] Static probe page written ($leakHtml)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
 & $appcmd set config $SiteName /section:ModSecurity `
@@ -556,204 +491,121 @@ Write-Host "go-ftw exit code: $ftwCode"
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
 
-# --- 7a) IIS Failed Request Tracing (FREB) ---------------------------------
-# FREB logs a NOTIFY_MODULE_START/NOTIFY_MODULE_END pair for every module on
-# every pipeline notification -- RQ_SEND_RESPONSE included -- so it shows from
-# IIS's own point of view whether ModSecurityIIS's OnSendResponse is invoked at
-# all. Enabled only HERE (after go-ftw) so the log contains just the handful of
-# probe requests rather than thousands of regression requests.
-$frebDir = "C:\inetpub\logs\FailedReqLogFiles"
-New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
-Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
-try {
-    # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics, and
-    # without it the call fails with "One or several parent features are
-    # disabled" (observed) and FREB silently produces no logs at all.
-    Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
-        -NoRestart -ErrorAction Stop | Out-Null
-    Write-Host "[7a/8] IIS-HttpTracing feature enabled."
-} catch {
-    Write-Host "[7a/8] WARN: IIS-HttpTracing via cmdlet: $($_.Exception.Message)"
+# --- 7a) opt-in diagnostic capability (default OFF) ------------------------
+# IIS Failed Request Tracing (FREB): logs a NOTIFY_MODULE_START/END pair for
+# every module on every pipeline notification, so it shows from IIS's own point
+# of view whether ModSecurityIIS's response handlers are invoked. It costs a
+# Windows feature install + a full iisreset, and the servicing-pending state
+# can leave the site down afterwards (later probes degrade to WARN). Kept as an
+# opt-in diagnostic: set MODSEC_IIS_FREB=1 on the runner to enable.
+if ($env:MODSEC_IIS_FREB -eq '1') {
+    $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
+    New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
     try {
-        & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 |
-            Write-Host
+        # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics.
+        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
+            -NoRestart -ErrorAction Stop | Out-Null
+        Write-Host "[7a/8] IIS-HttpTracing feature enabled."
     } catch {
-        Write-Host "[7a/8] WARN: dism fallback failed: $($_.Exception.Message)"
+        Write-Host "[7a/8] WARN: IIS-HttpTracing via cmdlet: $($_.Exception.Message)"
+        try {
+            & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 |
+                Write-Host
+        } catch {
+            Write-Host "[7a/8] WARN: dism fallback failed: $($_.Exception.Message)"
+        }
     }
-}
-try {
-    & $appcmd set config $SiteName `
-        /section:system.webServer/tracing/traceFailedRequestsLogging `
-        /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
-    $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
-    [xml]$doc = Get-Content $ahConfig
-    $sws = $doc.configuration."system.webServer"
-    if (-not $sws) {
-        $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
-    }
-    $tracing = $sws.tracing
-    if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
-    $tfr = $tracing.traceFailedRequests
-    if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
-    $tfr.RemoveAll()
-    $add = $doc.CreateElement("add")
-    $add.SetAttribute("path", "*")
-    $ta = $doc.CreateElement("traceAreas")
-    $prov = $doc.CreateElement("add")
-    $prov.SetAttribute("provider", "WWW Server")
-    # RequestNotifications is the decisive area: it names the module and the
-    # notification for each entry.
-    $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
-    $prov.SetAttribute("verbosity", "Verbose")
-    [void]$ta.AppendChild($prov)
-    [void]$add.AppendChild($ta)
-    $fd = $doc.CreateElement("failureDefinitions")
-    $fd.SetAttribute("statusCodes", "200-999")
-    [void]$add.AppendChild($fd)
-    [void]$tfr.AppendChild($add)
-    $doc.Save($ahConfig)
-    Write-Host "[7a/8] FREB rule added (all status codes, RequestNotifications)."
-} catch {
-    Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
-}
-# This script runs with $ErrorActionPreference = "Stop" (line 17). A single
-# error line emitted by iisreset becomes a terminating error and KILLS the run
-# -- exactly what happened in the v12 diagnostic: everything after [7a/8]
-# ([7b/8]/[7c/8]/[7d/8], the probes, the trace dump) never executed. So the
-# restart must be wrapped and non-fatal.
-$eap = $ErrorActionPreference
-$ErrorActionPreference = "Continue"
-try {
-    & iisreset /stop  2>&1 | Out-Null
-    Start-Sleep -Seconds 3
-    & iisreset /start 2>&1 | Out-Null
-} catch {
-    Write-Host "[7a/8] WARN: iisreset issue: $($_.Exception.Message)"
-}
-$ErrorActionPreference = $eap
-foreach ($i in 1..30) {
-    if ((Get-Service W3SVC).Status -eq "Running") { break }
-    Start-Sleep -Seconds 1
-}
-# W3SVC reporting Running is NOT enough: in v13 the site stayed down after the
-# post-install restart and every later probe died with "connection actively
-# refused". Start the site explicitly and WAIT until it actually answers.
-& $appcmd start site $SiteName 2>&1 | Out-Null
-$up = $false
-foreach ($i in 1..30) {
     try {
-        $p = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
-                 -SkipHttpErrorCheck -TimeoutSec 5
-        if ($p.StatusCode -eq 200) { $up = $true; break }
-    } catch { Start-Sleep -Seconds 2 }
-}
-Write-Host "[7a/8] post-FREB restart: site reachable = $up"
-
-# --- 7b) Mode A response-body blocking debug probe -------------------------
-# With responseBodyBlock="true" + SecResponseBodyAccess On + phase:4 rule
-# 990130, a response body containing MODEA-BLOCK-MARKER must be BLOCKED (403):
-# the connector buffers the full body, evaluates phase 4, and replaces the
-# response. albedo echoes the request body, so the marker lands in the response.
-# If the upstream sends a chunked/streamed response the connector degrades to
-# inspect-only (never blocks) -- this probe reports which path was taken.
-# Non-fatal: it is a debug signal, not a CI gate.
-# Post to /reflect (NOT "/") with a SPACE-FREE marker so 920273 cannot block it
-# at phase 2 -- the request must survive to phase 4 for 990130 to evaluate the
-# echoed RESPONSE_BODY. (The previous probe used a space-bearing body and was
-# killed by 920273/949110 at phase 2, so its 403 proved nothing about Mode A.)
-# Probe must never kill the run: under EAP=Stop a refused connection aborts
-# everything after it (v13 lost [7c/8]-[7d/8] this way). Report and continue.
-$modeA = $null
-try {
-    $modeA = Invoke-WebRequest "http://localhost/reflect" -Method Post `
-        -ContentType "text/plain" -Body "MODEA-BLOCK-MARKER" `
-        -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
-} catch {
-    Write-Host "[7b/8] WARN: Mode A probe transport failed: $($_.Exception.Message)"
-}
-Write-Host "[7b/8] Mode A probe (response body contains marker) -> $(if ($modeA) { $modeA.StatusCode } else { 'NO-RESPONSE' })"
-if ($modeA -and $modeA.StatusCode -eq 403) {
-    Write-Host "[7b/8] PASS: Mode A buffered + BLOCKED the response body (403)."
+        & $appcmd set config $SiteName `
+            /section:system.webServer/tracing/traceFailedRequestsLogging `
+            /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
+        $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+        [xml]$doc = Get-Content $ahConfig
+        $sws = $doc.configuration."system.webServer"
+        if (-not $sws) {
+            $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
+        }
+        $tracing = $sws.tracing
+        if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
+        $tfr = $tracing.traceFailedRequests
+        if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
+        $tfr.RemoveAll()
+        $add = $doc.CreateElement("add")
+        $add.SetAttribute("path", "*")
+        $ta = $doc.CreateElement("traceAreas")
+        $prov = $doc.CreateElement("add")
+        $prov.SetAttribute("provider", "WWW Server")
+        $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
+        $prov.SetAttribute("verbosity", "Verbose")
+        [void]$ta.AppendChild($prov)
+        [void]$add.AppendChild($ta)
+        $fd = $doc.CreateElement("failureDefinitions")
+        $fd.SetAttribute("statusCodes", "200-999")
+        [void]$add.AppendChild($fd)
+        [void]$tfr.AppendChild($add)
+        $doc.Save($ahConfig)
+        Write-Host "[7a/8] FREB rule added (all status codes, RequestNotifications)."
+    } catch {
+        Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
+    }
+    # This script runs with $ErrorActionPreference = "Stop": a single error line
+    # from iisreset becomes a terminating error. Wrap and keep it non-fatal.
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & iisreset /stop  2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        & iisreset /start 2>&1 | Out-Null
+    } catch {
+        Write-Host "[7a/8] WARN: iisreset issue: $($_.Exception.Message)"
+    }
+    $ErrorActionPreference = $eap
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+    # W3SVC Running is NOT enough: start the site and wait until it answers.
+    & $appcmd start site $SiteName 2>&1 | Out-Null
+    $up = $false
+    foreach ($i in 1..30) {
+        try {
+            $p = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+                     -SkipHttpErrorCheck -TimeoutSec 5
+            if ($p.StatusCode -eq 200) { $up = $true; break }
+        } catch { Start-Sleep -Seconds 2 }
+    }
+    Write-Host "[7a/8] post-FREB restart: site reachable = $up"
 } else {
-    Write-Host "[7b/8] INFO: response NOT blocked (got $($modeA.StatusCode)). Mode A did not engage -- check responseBodyBlock, SecResponseBodyAccess, or a chunked upstream response (streaming degrades to inspect-only)."
+    Write-Host "[7a/8] FREB disabled (set MODSEC_IIS_FREB=1 to trace per-module pipeline notifications)."
 }
 
-# --- 7c) RESPONSE-95x single-test debug dump ---------------------------------
-# The selected test (950150-1) posts an ASP.NET ViewStateException to albedo's
-# /reflect; albedo echoes it, so the leakage string is in RESPONSE_BODY and the
-# phase:4 rule 950150 should fire. This confirms the connector's response-body
-# inspection works for the RESPONSE-95x families and reports whether Mode A
-# blocked it (deny -> 403) or only inspected (pass/log -> 200).
+# --- 7b) response-phase regression sentinel ----------------------------------
+# The full CRS suite above already exercises phase 4 via the RESPONSE-95x
+# families. This is a cheap confirmation that response-body inspection is still
+# wired (SecResponseBodyAccess On + a /reflect data-leak request reached 950150).
 $hit950 = Select-String -Path $auditSrc -Pattern '"950150"' -Quiet
-Write-Host "[7c/8] RESPONSE-950 rule 950150 in audit log: $hit950"
-$hit132 = Select-String -Path $auditSrc -Pattern '"990132"' -Quiet
-Write-Host "[7c/8] phase:4 diagnostic 990132 (RESPONSE_BODY seen) in audit: $hit132"
-$hit133 = Select-String -Path $auditSrc -Pattern '"990133"' -Quiet
-Write-Host "[7c/8] phase:4 always-fires marker 990133 in audit: $hit133"
-$hit134 = Select-String -Path $auditSrc -Pattern '"990134"' -Quiet
-Write-Host "[7c/8] phase:3 marker 990134 (response phase engaged, POST-include) in audit: $hit134"
-$hit136 = Select-String -Path $auditSrc -Pattern '"990136"' -Quiet
-Write-Host "[7c/8] phase:3 CONTROL 990136 (identical, PRE-include) in audit: $hit136"
-$hit137 = Select-String -Path $auditSrc -Pattern '"990137"' -Quiet
-Write-Host "[7c/8] phase:4 CONTROL 990137 (identical, PRE-include) in audit: $hit137"
-if ($hit136 -and -not $hit134) {
-    Write-Host "[7c/8] VERDICT: rules AFTER the Include directives are DROPPED by the engine (config-parsing bug)."
-} elseif ($hit136 -and $hit134) {
-    Write-Host "[7c/8] VERDICT: both positions fire -- rule position is NOT the cause."
-} else {
-    Write-Host "[7c/8] VERDICT: no phase3 control fired -- phase-3 evaluation itself is dead."
+Write-Host "[7b/8] phase:4 rule 950150 present in audit log (response-body inspection live): $hit950"
+if (-not $hit950) {
+    Write-Host "[7b/8] WARN: no 950150 hit -- is SecResponseBodyAccess On and does the suite reach a /reflect data-leak?"
 }
-$hit135 = Select-String -Path $auditSrc -Pattern '"990135"' -Quiet
-Write-Host "[7c/8] phase:3 marker 990135 (resp Content-Type fed) in audit: $hit135"
-if ($hit950) {
-    Write-Host "[7c/8] audit lines mentioning 950150:"
-    Select-String -Path $auditSrc -Pattern '950150' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
-}
-if ($hit132) {
-    Write-Host "[7c/8] 990132 diagnostic lines (RESPONSE_BODY seen):"
-    Select-String -Path $auditSrc -Pattern '990132' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
-}
-if ($hit133) {
-    Write-Host "[7c/8] 990133 lines (which URIs reached phase 4):"
-    Select-String -Path $auditSrc -Pattern '990133' | ForEach-Object { $_.Line } | Select-Object -First 8 | Write-Host
-}
-# DEBUG (diag/single-body-test): static-file probe. GET /leak.html is served
-# LOCALLY as text/html (default mime set) -- if 950150 fires here but not for
-# the proxied /reflect, body capture is proxy-specific.
-$staticHit = Select-String -Path $auditSrc -Pattern 'leak\.html' -Quiet
-Write-Host "[7c/8] static /leak.html request present in audit: $staticHit"
-$leak = $null
-try {
-    $leak = Invoke-WebRequest "http://localhost/leak.html" -UseBasicParsing `
-        -SkipHttpErrorCheck -TimeoutSec 15
-} catch {
-    Write-Host "[7c/8] WARN: leak.html probe transport failed: $($_.Exception.Message)"
-}
-Write-Host "[7c/8] static /leak.html probe -> HTTP $(if ($leak) { $leak.StatusCode } else { 'NO-RESPONSE' }), body-len=$(if ($leak) { $leak.Content.Length } else { 0 })"
-# Direct replay of the same request to show the LIVE status: 403 = Mode A
-# buffered + blocked the response body; 200 = rule fired but inspect-only.
-$resp950 = $null
-try {
-    $resp950 = Invoke-WebRequest "http://localhost/reflect" -Method Post `
-        -ContentType "application/json" `
-        -Body '{"body": "ViewStateException: Invalid viewstate detected."}' `
-        -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
-} catch {
-    Write-Host "[7c/8] WARN: 950150-1 replay transport failed: $($_.Exception.Message)"
-}
-Write-Host "[7c/8] 950150-1 replay -> HTTP $(if ($resp950) { $resp950.StatusCode } else { 'NO-RESPONSE' })"
 
-# --- 7d) connector response-phase trace dump ---------------------------------
-# The DLL writes C:/inetpub/modsec/modsecurityiis-trace.log (captured by the
-# iis-smoke-diagnostics artifact). Print its tail here too so the run log
-# directly shows whether OnSendResponse/OnPostEndRequest fired and reached
-# processResponseHeaders / processResponseBody.
-$trace = "C:/inetpub/modsec/modsecurityiis-trace.log"
-if (Test-Path $trace) {
-    Write-Host "[7d/8] connector trace (last 50 lines):"
-    Get-Content $trace -Tail 50 | Write-Host
-} else {
-    Write-Host "[7d/8] connector trace NOT present at $trace"
+# --- 7c) connector file-trace dump (opt-in) ----------------------------------
+# The DLL only writes the trace when w3wp sees MODSEC_IIS_TRACE=1 (app pool
+# env). When present, dump it; otherwise say so -- no error either way.
+$traceFound = $false
+foreach ($tp in @("C:/inetpub/logs/modsec-audit/modsecurityiis-trace.log",
+                  "C:/inetpub/logs/modsec-crs-audit/modsecurityiis-trace.log",
+                  "C:/inetpub/modsec/modsecurityiis-trace.log")) {
+    if (Test-Path $tp) {
+        Write-Host "[7c/8] connector trace ($tp, last 50 lines):"
+        Get-Content $tp -Tail 50 | Write-Host
+        $traceFound = $true
+        break
+    }
+}
+if (-not $traceFound) {
+    Write-Host "[7c/8] connector trace not written (set MODSEC_IIS_TRACE=1 on the app pool to enable)."
 }
 
 if ($MeasureMode) {
