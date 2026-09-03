@@ -230,6 +230,7 @@ jobs:
           path: |
             C:/inetpub/modsec/
             C:/inetpub/logs/modsec-audit/
+            C:/inetpub/logs/FailedReqLogFiles/
             C:/inetpub/modsectest/
 
       - name: Upload FTW output and audit log

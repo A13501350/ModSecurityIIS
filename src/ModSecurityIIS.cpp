@@ -1226,6 +1226,7 @@ CMyHttpModule::OnSendResponse(
     respStatus = (int)statusCode;
     // RESPONSE_PROTOCOL stores the string verbatim -> full "HTTP/x.y" here
     // (see VersionToString note about the request-side asymmetry).
+    IisTrace("OnSendResponse: before processResponseHeaders status=%d", respStatus);
     tx->processResponseHeaders(respStatus,
         rsc->m_Protocol.empty() ? std::string("HTTP/1.1")
                                 : "HTTP/" + rsc->m_Protocol);
@@ -1445,6 +1446,8 @@ RegisterModule(
             pFactory,
             RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE,
             RQ_END_REQUEST);
+    IisTrace("RegisterModule: SetRequestNotifications(BEGIN|SEND_RESPONSE, "
+             "post=END_REQUEST) hr=0x%08x", (unsigned int)hr);
     if (FAILED(hr))
     {
         goto Finished;

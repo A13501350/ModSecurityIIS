@@ -526,14 +526,79 @@ if ($MeasureMode) {
 }
 # Default output (NOT -o github) so the complete failure reason for "failed to
 # run" is captured -- the github format collapses it to a placeholder.
+# Print go-ftw's own CLI surface so we can see every knob (timeouts, marker
+# retries, debug) without relying on memory of a specific version.
+Write-Host "=== go-ftw run --help ==="
+& $ftwExe run --help 2>&1 | Write-Host
+# --debug makes go-ftw print the actual request/response and the underlying
+# transport error for each "failed to run" (the default output collapses it to
+# a one-line summary, which is why the 288 failures were undiagnosable).
 & $ftwExe run -d $testsDir --include $includeRegex `
-    --config $ftwConfig 2>&1 |
+    --config $ftwConfig --debug 2>&1 |
     Tee-Object -FilePath "$PWD\go-ftw-output.txt"
 $ftwCode = $LASTEXITCODE
 Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
+
+# --- 7a) IIS Failed Request Tracing (FREB) ---------------------------------
+# FREB logs a NOTIFY_MODULE_START/NOTIFY_MODULE_END pair for every module on
+# every pipeline notification -- RQ_SEND_RESPONSE included -- so it shows from
+# IIS's own point of view whether ModSecurityIIS's OnSendResponse is invoked at
+# all. Enabled only HERE (after go-ftw) so the log contains just the handful of
+# probe requests rather than thousands of regression requests.
+$frebDir = "C:\inetpub\logs\FailedReqLogFiles"
+New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
+Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
+try {
+    Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -NoRestart `
+        -ErrorAction Stop | Out-Null
+    Write-Host "[7a/8] IIS-HttpTracing feature enabled."
+} catch {
+    Write-Host "[7a/8] WARN: IIS-HttpTracing feature: $($_.Exception.Message)"
+}
+try {
+    & $appcmd set config $SiteName `
+        /section:system.webServer/tracing/traceFailedRequestsLogging `
+        /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
+    $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+    [xml]$doc = Get-Content $ahConfig
+    $sws = $doc.configuration."system.webServer"
+    if (-not $sws) {
+        $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
+    }
+    $tracing = $sws.tracing
+    if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
+    $tfr = $tracing.traceFailedRequests
+    if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
+    $tfr.RemoveAll()
+    $add = $doc.CreateElement("add")
+    $add.SetAttribute("path", "*")
+    $ta = $doc.CreateElement("traceAreas")
+    $prov = $doc.CreateElement("add")
+    $prov.SetAttribute("provider", "WWW Server")
+    # RequestNotifications is the decisive area: it names the module and the
+    # notification for each entry.
+    $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
+    $prov.SetAttribute("verbosity", "Verbose")
+    [void]$ta.AppendChild($prov)
+    [void]$add.AppendChild($ta)
+    $fd = $doc.CreateElement("failureDefinitions")
+    $fd.SetAttribute("statusCodes", "200-999")
+    [void]$add.AppendChild($fd)
+    [void]$tfr.AppendChild($add)
+    $doc.Save($ahConfig)
+    Write-Host "[7a/8] FREB rule added (all status codes, RequestNotifications)."
+} catch {
+    Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
+}
+& iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
+& iisreset /start 2>&1 | Out-Null
+foreach ($i in 1..30) {
+    if ((Get-Service W3SVC).Status -eq "Running") { break }
+    Start-Sleep -Seconds 1
+}
 
 # --- 7b) Mode A response-body blocking debug probe -------------------------
 # With responseBodyBlock="true" + SecResponseBodyAccess On + phase:4 rule
