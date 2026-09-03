@@ -59,6 +59,21 @@ $geoLine = if (Test-Path $geoDb) {
 }
 
 $conf = Join-Path $ConfRoot "modsecurity-crs.conf"
+# Upstream "recommended" baseline config (provides the request-body processors
+# CRS relies on: rule 200000 XML, 200001/200006 JSON, plus 200002 parse-failure
+# handling, SecRequestBodyLimitAction, etc.). It ships `SecRuleEngine
+# DetectionOnly` and OVERRIDES our audit setup (SecAuditEngine RelevantOnly,
+# SecAuditLog /var/log/modsec_audit.log -- a Unix path), so we re-assert BOTH
+# the rule engine AND the audit settings AFTER the Include (libModSecurity takes
+# the LAST value for these directives). Without this Include, XML/JSON bodies are
+# never parsed into XML:/* / ARGS -- the root cause of ~100 historical CRS
+# exclusions. The file lives in the libmodsecurity submodule; the smoke-iis job
+# checks it out recursively so the path below resolves.
+$recConf = (Join-Path $PSScriptRoot "..\libmodsecurity\modsecurity.conf-recommended") `
+    -replace '\\', '/'
+if (-not (Test-Path $recConf)) {
+    throw "libmodsecurity/modsecurity.conf-recommended not found at $recConf (is the submodule checked out in this job?)"
+}
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
@@ -120,6 +135,31 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
 # detection_paranoia_level follow blocking_paranoia_level when unset, so setting
 # BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
+# Opt in to CRS 4.25.x XML ATTRIBUTE inspection. On the LTS branch this is a
+# runtime gate, not a config directive: rule 901180 (phase 1) defaults
+# tx.crs_xml_attr_inspect to 0 when it is unset, and rule 901181 (phase 2) then
+# applies ctl:ruleRemoveTargetByTag=<attack-protocol|attack-lfi|attack-rfi|
+# attack-rce|attack-php|attack-generic|attack-xss|attack-sqli|attack-fixation>;XML://@*
+# -- stripping the XML://@* target from every rule carrying one of those tags.
+# Such a rule then inspects only XML:/* (element text), so payloads hidden in
+# XML ATTRIBUTES are never examined and the rule silently never matches
+# (e.g. CRS test 930100-5 feeds its payload through the `probe` attribute).
+# CRS CI performs the same opt-in: tests/docker-compose.yml appends
+# `SecAction id:900511 ... setvar:tx.crs_xml_attr_inspect=1` to crs-setup.conf.
+# Must be phase 1 and must run BEFORE 901180, which only initializes the
+# variable when its count is still 0.
+SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr_inspect=1"
+# Load the upstream recommended baseline BEFORE the CRS includes. It sets
+# SecRuleEngine DetectionOnly (line 7) and OVERRIDES the audit settings above
+# (SecAuditEngine RelevantOnly, SecAuditLog /var/log/modsec_audit.log -- a Unix
+# path). We re-assert the rule engine AND the audit settings AFTER the Include,
+# since libModSecurity takes the LAST value for these directives.
+Include $recConf
+SecRuleEngine On
+SecAuditEngine On
+SecAuditLog $auditDir\audit.log
+SecAuditLogType Serial
+SecAuditLogParts ABIJDEFHZ
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
@@ -300,10 +340,11 @@ $sqli = Invoke-WebRequest "http://localhost/?id=1%27%20OR%20%271%27%3D%271" `
 $xss  = Invoke-WebRequest "http://localhost/?q=%3Cscript%3Ealert(1)%3C/script%3E" `
             -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 15
 Write-Host "[6/8] sanity: SQLi -> $($sqli.StatusCode), XSS -> $($xss.StatusCode)"
-# DEBUG (diag/single-body-test): non-fatal on this debug branch -- a sanity miss
-# must not abort before the [7b/8]/[7c/8] response-body diagnostics. Report only.
-if ($sqli.StatusCode -ne 403) { Write-Host "[6/8] WARN: SQLi probe not blocked (got $($sqli.StatusCode))." }
-if ($xss.StatusCode  -ne 403) { Write-Host "[6/8] WARN: XSS probe not blocked (got $($xss.StatusCode))." }
+# These probe assertions are NON-FATAL smoke signals only: the real CI gate is
+# go-ftw's per-test result against scripts/crs_ignore.txt below. A flaky probe
+# (e.g. ARR warm-up timing) must not block the actual CRS regression measurement.
+if ($sqli.StatusCode -ne 403) { Write-Host "WARNING: SQLi probe not blocked (got $($sqli.StatusCode))." }
+if ($xss.StatusCode  -ne 403) { Write-Host "WARNING: XSS probe not blocked (got $($xss.StatusCode))." }
 
 # The audit slice below proves the ruleset loaded and fired (9421xx/941xxx),
 # which also exercises the libModSecurity v3 load path.
@@ -321,86 +362,67 @@ foreach ($try in 1..3) {
     Start-Sleep -Seconds 3
 }
 # CRS rule ids are six digits: 9421xx for SQLi group hits, 941xxx for XSS.
-# DEBUG (diag/single-body-test): non-fatal -- if request rules are not firing we
-# must still reach the [7b/8]/[7c/8] response-body diagnostics and upload the
-# audit so we can SEE what (if anything) fired.
+# NON-FATAL: this only confirms the audit slice was written; it is not a gate.
 if ($newSlice -notmatch '\[id "9421\d{2}"\]') {
-    Write-Host "[6/8] WARN: SQLi probe not logged by CRS 9421xx rules."
+    Write-Host "WARNING: SQLi probe was not logged by CRS 9421xx rules."
 }
 if ($newSlice -notmatch '\[id "941\d{3}"\]') {
-    Write-Host "[6/8] WARN: XSS probe not logged by CRS 941xxx rules."
+    Write-Host "WARNING: XSS probe was not logged by CRS 941xxx rules."
 }
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WARN above)."
 
-# --- 7) go-ftw over a representative CRS subset ----------------------------------
+# --- 7) go-ftw over the full IIS-feasible CRS family set -------------------------
 # Policy: maximize the NUMBER of CRS families exercised while keeping CI green,
-# WITHOUT maintaining a long per-sub-test ignore list. The CRS regression runs at
-# IIS DEFAULTS (we do NOT relax Request Filtering -- allowDoubleEscaping / maxUrl /
-# maxQueryString -- to make tests pass; any request IIS rejects itself, e.g. 404.11
-# double-escape, 404.14/404.15 length, 400 malformed protocol, is genuinely not seen
-# by the WAF and is excluded by design).
+# WITHOUT turning whole families off. The CRS regression runs at IIS DEFAULTS (we
+# do NOT relax Request Filtering -- allowDoubleEscaping / maxUrl / maxQueryString
+# -- to make tests pass; any request IIS rejects itself, e.g. 404.11 double-escape,
+# 404.14/404.15 length, 400 malformed protocol, is genuinely not seen by the WAF
+# and is excluded by design).
 #
-# Every IIS-feasible family is run at paranoia level 4. A family that shows MULTIPLE
-# failing sub-tests is turned OFF ENTIRELY (removed from --include) rather than
-# listing its many sub-tests in an ignore file -- we accept not covering that family
-# over chasing individual tests. Families that pass (or have only a handful of misses)
-# are kept, and their few failing sub-tests live in scripts/crs_ignore.txt
-# (testoverride.ignore) so we retain maximum coverage of the families that mostly work.
-# The dropped families are dominated by the IIS connector's request-body / phase-4
-# response inspection gap (POST-body SQLi/XSS/RCE/PHP/Java payloads the WAF does not
-# match the way CRS expects, plus a few %25 double-escape 404.11 / path-`..` 404
-# pre-WAF rejections) -- a genuine engine/connector gap, NOT an IIS-config workaround.
+# ALL IIS-feasible families are included at paranoia level 4 via --include (regex
+# below). Every failing sub-test is hard-excluded via scripts/crs_ignore.txt using
+# go-ftw's testoverride.ignore mechanism (see below), which marks the test Ignored
+# (not Failed) BEFORE the request is sent and is independent of --include. This
+# keeps CI green (go-ftw exits 0 once every failure is ignored) while still
+# exercising every family's PASSING sub-tests -- maximizing coverage.
 #
-# 920xxx / 921xxx (Protocol Enforcement/Attack) are NEVER included: http.sys rejects
-# malformed requests (bad request line, invalid/oversized headers, bad charset, HTTP
-# splitting) with its own 400 BEFORE any IIS module runs -- a protocol-layer
-# rejection, not overrideable. 959xxx (response/blocking evaluation) is dropped
-# because its phase-4 outbound-anomaly assertions are flaky with SecResponseBodyAccess
-# Off (the score is intermittently 0, so the rule fires non-deterministically).
+# Families deliberately NOT in --include:
+#   920xxx / 921xxx (Protocol Enforcement/Attack): http.sys rejects malformed
+#     requests (bad request line, invalid/oversized headers, bad charset, HTTP
+#     splitting) with its own 400 BEFORE any IIS module runs -- a protocol-layer
+#     rejection, not overrideable.
+#   959xxx (response/blocking evaluation): phase-4 outbound-anomaly assertions are
+#     flaky with SecResponseBodyAccess Off (the score is intermittently 0, so the
+#     rule fires non-deterministically).
+#   980xxx: 980170 class request-execution failures under IIS defaults.
 #
-# INCLUDED families (broad but low-failure, kept at default IIS state):
-# 911, 913, 922, 931, 943, 949, 950, 952, 953, 954, 955.
-# DROPPED families (multiple failing sub-tests -> whole family turned off, see
-# policy note below): 930, 932, 933, 934, 941, 942, 944, 951, 956, 959, 980.
+# CRITICAL ROOT-CAUSE FIX (this change): libModSecurity v3 does NOT auto-detect
+# XML/JSON request-body types -- Transaction::addRequestHeader() only sets the body
+# processor for multipart/form-data and application/x-www-form-urlencoded. XML/JSON
+# processors are enabled ONLY by the upstream recommended config (rules 200000 XML,
+# 200001/200006 JSON). That config was never Included before, so XML/JSON bodies
+# were never parsed into XML:/* or ARGS -- ~100 of the historical exclusions were
+# simply body-parse misses, NOT a connector bug. We now Include
+# modsecurity.conf-recommended (see the Include above) and re-assert SecRuleEngine
+# On + the audit settings it overrides. With that, exclusions dropped 341 -> 245
+# (measured, run 33402239005). The connector body-read code itself is correct: the
+# full entity body is forwarded to the engine before processRequestBody().
 #
-# What the dropped families' failures actually ARE (measured, run 33257792265):
-# all 288 failing sub-tests are go-ftw "failed to run" -- the request never
-# executed to completion against this connector (transport/request-handling
-# error on go-ftw's side). There are ZERO rule-logic mismatches (no "expected
-# ... got ..." diffs in the output). So this is NOT a "rules not matching the
-# way CRS expects" detection gap; it is a connector request-execution
-# limitation (connection/body handling on the path to the engine). The known
-# entity-body read issue (body read stays in OnBeginRequest; the short-read
-# break truncates bodies and the request can be reset before the engine sees a
-# complete entity) is the prime suspect. These families stay dropped until that
-# path is fixed; the gap is in the connector, not in CRS evaluation.
-# (980 added after 980170-1/980170-2 (and likely more 980170 variants) missed
-# at PL4 under IIS defaults -- same request-execution class of failure.)
-# (934 = Node.js injection; 935 was removed upstream in 4.25 so it is absent.)
+# The REMAINING failures are genuine IIS-connector request-body inspection
+# gaps plus http.sys pre-WAF rejections (404.11/14/15) and a few upstream-
+# intended denials (recommended rule 200002 "failed to parse request body ->
+# deny 400" fires on malformed multipart/form-data). See
+# scripts/crs_ignore.txt header for the full breakdown. To regenerate: run CI
+# with $MeasureMode = $true, harvest the failing ids into crs_ignore.txt.
 #
-# MEASUREMENT of the phase:1 paranoia-ordering fix (run 33257792265): all
-# families were enabled. RESULT: the five phase:1 PL2+ rules that were silently
-# skipped (942101/942152/942321/942420/942421) now FIRE (audit hits 10/9/8/12/37
-# vs 0 before), and total "Access denied with code 403" rose 3427 -> 4094.
-#
-# The 9 request-body families (930/932/933/934/941/942/944/951/956) STILL fail in
-# bulk -- but every one of the 288 failing sub-tests is a go-ftw "failed to run"
-# (request transport/connector handling), NOT a rule-logic mismatch. So instead
-# of dropping whole families (which throws away the passing sub-tests too), we now
-# run ALL families and hardcode-exclude exactly those 288 known-bad sub-tests via
-# scripts/crs_ignore.txt (the testoverride.ignore mechanism, see below). That
-# maximizes coverage: every family's passing sub-tests are still exercised.
-# MEASUREMENT OVERRIDE (diag/single-body-test branch): set $true to skip
-# testoverride.ignore entirely and measure the raw failure count. Default
-# (green CI) run uses scripts/crs_ignore.txt -- refreshed after the response
-# phase fix (d228cb6) from full-suite runs 33749658477 (268 stable failures)
-# and 33745710564 (the 920/921 http.sys-rejected items): 299 ids total,
-# down from the pre-fix 344.
+# MEASUREMENT OVERRIDE: set $true to skip testoverride.ignore entirely and
+# measure the raw failure count. Default (green CI) run uses
+# scripts/crs_ignore.txt -- refreshed after the response phase fix (d228cb6)
+# and the merge of master's XML-attribute/body-parse opt-ins.
 $MeasureMode = $false
-# DEBUG (diag/single-body-test): empty = run the FULL suite (4883 tests).
-# Set to e.g. '^950150-1$' to debug a single response-body-dependent test
-# (RESPONSE-95x/956x families inspect RESPONSE_BODY in phase 4; albedo's
-# /reflect echoes the body so the leakage string lands in RESPONSE_BODY).
+# empty = run the FULL IIS-feasible suite (all families; 920/921 and 980 are
+# excluded via --exclude in the go-ftw invocation below). Set to e.g.
+# '^950150-1$' to debug a single test.
 $SingleTest = ''
 $includeRegex = $SingleTest
 
@@ -415,17 +437,17 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 # overriddenTestResult() evaluates BEFORE the request is sent and marks the
 # test Ignored (not Failed), independently of --include.
 # The ids live in scripts/crs_ignore.txt (one id per line). As of run
-# 33257792265 this holds 344 ids: 56 historical misses in the otherwise-green
-# families (922/931/943/950/952/953/954) PLUS the 288 "failed to run"
-# (request-transport) sub-tests across 930/932/933/934/941/942/944/951/956.
-# These are connector request-execution limitations under IIS defaults, NOT
-# Request-Filtering relaxations. To regenerate: run CI, harvest the
-# `failed to run: [ ... ]` bracket list (and any `💥 <id> failed` logic
-# mismatches for the kept families) into scripts/crs_ignore.txt.
+# 33402239005 this holds 245 ids -- the full set of sub-tests that still fail
+# with modsecurity.conf-recommended now Included. To regenerate: run CI, harvest
+# the failing `<id>` list (go-ftw prints "<id> failed" / "<id> failed to run")
+# into scripts/crs_ignore.txt. Every id here makes the run green (the test is
+# Ignored, not Failed); any failing sub-test NOT listed here turns CI red.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
-$ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+# crs_ignore.txt may contain `#` comment / section-header lines; only treat
+# lines matching <rule>-<sub> (e.g. "942100-15") as exclusions.
+$ignoreYaml = (Get-Content $ignoreFile | Where-Object { $_.Trim() -match '^[0-9]+-[0-9]+$' } | ForEach-Object {
     $id = $_.Trim()
-    "    '^$id`$': `"IIS connector: CRS 4.25.1 detection miss / request-body inspection gap (not a pre-WAF rejection)`""
+    "    '^$id`$': `"IIS connector: known CRS 4.25.1 miss under IIS defaults (request-body / phase-4 inspection gap, http.sys pre-WAF rejection, or upstream-intended 200002 deny)`""
   }) -join "`n"
 if ($MeasureMode) {
     Write-Host "[7/8] MEASUREMENT MODE: ignoring scripts/crs_ignore.txt -- every included test runs to completion."
