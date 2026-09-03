@@ -1,11 +1,4 @@
 name: Build ModSecurityIIS
-# One CI run per branch at a time: consecutive pushes to the same ref used to
-# start parallel full-suite runs (each ~10 min of build + 4883 go-ftw tests) and
-# only the newest matters. A new run on the same ref cancels the in-progress
-# one instead of queueing behind it.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 # Give runs a human-readable name so they can be told apart in the Actions
 # list (we repeatedly lost track of which run-id held the modsecurityiis
 # artifact, e.g. reuse runs never upload the DLL). `label` wins for dispatched
