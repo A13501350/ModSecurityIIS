@@ -455,14 +455,13 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # run ALL families and hardcode-exclude exactly those 288 known-bad sub-tests via
 # scripts/crs_ignore.txt (the testoverride.ignore mechanism, see below). That
 # maximizes coverage: every family's passing sub-tests are still exercised.
-# MEASUREMENT OVERRIDE (diag/single-body-test branch): run ALL CRS families with
-# the new canonical tuning and NO per-sub-test exclusions, so we can measure the
-# raw number of failing sub-tests and compare against the 344 hardcoded on
-# master (old tuning). When $MeasureMode is $true we skip testoverride.ignore
-# entirely and let every test run to completion (go-ftw then prints the full
-# `failed to run: [ ... ]` list). Set to $false to restore the green run using
-# scripts/crs_ignore.txt.
-$MeasureMode = $true
+# MEASUREMENT OVERRIDE (diag/single-body-test branch): set $true to skip
+# testoverride.ignore entirely and measure the raw failure count. Default
+# (green CI) run uses scripts/crs_ignore.txt -- refreshed after the response
+# phase fix (d228cb6) from full-suite runs 33749658477 (268 stable failures)
+# and 33745710564 (the 920/921 http.sys-rejected items): 299 ids total,
+# down from the pre-fix 344.
+$MeasureMode = $false
 # DEBUG (diag/single-body-test): empty = run the FULL suite (4883 tests).
 # Set to e.g. '^950150-1$' to debug a single response-body-dependent test
 # (RESPONSE-95x/956x families inspect RESPONSE_BODY in phase 4; albedo's
@@ -542,7 +541,11 @@ $ftwArgs += @('--max-marker-log-lines', '20000')
 # different points, so intermittent). The CI strategy already treats these
 # families as untestable under IIS (rejected before any module runs); exclude
 # them so the remaining ~4865 tests measure to completion.
-$ftwArgs += @('--exclude', '^92[01]')
+# 980 (CORRELATION, phase 5) is excluded too: 980170-1/2/3 assert the phase-5
+# reporting rule 980170, which never fires with this connector, and go-ftw
+# treats the test's own retry_once exhaustion as a FATAL error that aborts the
+# entire run (observed at the same test in 33745710564 AND 33749658477).
+$ftwArgs += @('--exclude', '^(92[01]|980)')
 if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
 if ($SingleTest -ne '')   { $ftwArgs += '--debug' }
 & $ftwExe @ftwArgs 2>&1 |
