@@ -23,43 +23,6 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
 
-# Opt-in diagnostics (set via workflow_dispatch inputs -> env, or env directly).
-$frebOn    = ($env:MODSEC_IIS_FREB -eq '1') -or ($env:MODSEC_IIS_FREB -ieq 'true')
-$ftwDbgOn  = ($env:MODSEC_IIS_FTW_DEBUG -eq '1') -or ($env:MODSEC_IIS_FTW_DEBUG -ieq 'true')
-
-# Restart IIS and wait until the site actually answers. With IIS-HttpTracing
-# installed the box sits in a servicing-pending state where a full `iisreset`
-# can leave W3SVC unable to bring the site up (observed repeatedly). When FREB
-# is on, restarting just the services is gentler and keeps the site reachable;
-# otherwise behave like a normal iisreset.
-function Restart-Iis {
-    if ($frebOn) {
-        try {
-            Restart-Service W3SVC -Force -ErrorAction Stop
-        } catch {
-            Write-Host "WARN: Restart-Service W3SVC failed ($($_.Exception.Message)); falling back to iisreset."
-            & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
-            & iisreset /start 2>&1 | Out-Null
-        }
-    } else {
-        & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
-        & iisreset /start 2>&1 | Out-Null
-    }
-    foreach ($i in 1..30) {
-        if ((Get-Service W3SVC).Status -eq "Running") { break }
-        Start-Sleep -Seconds 1
-    }
-    & $appcmd start site $SiteName 2>&1 | Out-Null
-    for ($i = 0; $i -lt 30; $i++) {
-        try {
-            $r = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
-                     -SkipHttpErrorCheck -TimeoutSec 5
-            if ($r.StatusCode -eq 200) { return $true }
-        } catch { Start-Sleep -Seconds 2 }
-    }
-    return $false
-}
-
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"
 New-Item -ItemType Directory -Force $crsDir | Out-Null
@@ -238,65 +201,6 @@ if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed
 & $appcmd delete site "Default Web Site" 2>$null | Out-Null
 & $appcmd set site $SiteName /bindings:"http/*:80:"
 & $appcmd start site $SiteName
-
-# --- FREB (Failed Request Tracing) opt-in -- configured HERE, BEFORE the first
-# iisreset, so one restart activates the feature + the rule over the WHOLE
-# go-ftw run. (Installing the feature mid-run and restarting afterwards left
-# the site down in a servicing-pending state -- run 33773592685.) Debugs the
-# intermittent go-ftw "failed to run" flakes.
-$frebOn = ($env:MODSEC_IIS_FREB -eq '1') -or ($env:MODSEC_IIS_FREB -ieq 'true')
-if ($frebOn) {
-    $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
-    New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
-    Write-Host "[3/8] enabling IIS Failed Request Tracing -> $frebDir"
-    try {
-        # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics.
-        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
-            -NoRestart -ErrorAction Stop | Out-Null
-        Write-Host "[3/8] IIS-HttpTracing feature enabled."
-    } catch {
-        Write-Host "[3/8] WARN: IIS-HttpTracing feature: $($_.Exception.Message)"
-        try {
-            & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 |
-                Write-Host
-        } catch {
-            Write-Host "[3/8] WARN: dism fallback failed: $($_.Exception.Message)"
-        }
-    }
-    try {
-        & $appcmd set config $SiteName `
-            /section:system.webServer/tracing/traceFailedRequestsLogging `
-            /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
-        $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
-        [xml]$doc = Get-Content $ahConfig
-        $sws = $doc.configuration."system.webServer"
-        if (-not $sws) {
-            $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
-        }
-        $tracing = $sws.tracing
-        if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
-        $tfr = $tracing.traceFailedRequests
-        if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
-        $tfr.RemoveAll()
-        $add = $doc.CreateElement("add")
-        $add.SetAttribute("path", "*")
-        $ta = $doc.CreateElement("traceAreas")
-        $prov = $doc.CreateElement("add")
-        $prov.SetAttribute("provider", "WWW Server")
-        $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
-        $prov.SetAttribute("verbosity", "Verbose")
-        [void]$ta.AppendChild($prov)
-        [void]$add.AppendChild($ta)
-        $fd = $doc.CreateElement("failureDefinitions")
-        $fd.SetAttribute("statusCodes", "200-999")
-        [void]$add.AppendChild($fd)
-        [void]$tfr.AppendChild($add)
-        $doc.Save($ahConfig)
-        Write-Host "[3/8] FREB rule added (all status codes, RequestNotifications)."
-    } catch {
-        Write-Host "[3/8] WARN: FREB config failed: $($_.Exception.Message)"
-    }
-}
 
 & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
 & iisreset /start 2>&1 | Out-Null
@@ -481,15 +385,6 @@ if ($newSlice -notmatch '\[id "941\d{3}"\]') {
 }
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WARN above)."
 
-# --- 7a) opt-in diagnostic capability (default OFF) ------------------------
-# FREB was configured before the [3/8] iisreset (see there) so that single
-# restart activated the feature + rule over the WHOLE go-ftw run below.
-if ($frebOn) {
-    Write-Host "[7a/8] FREB active over the full go-ftw run (logs -> $frebDir)."
-} else {
-    Write-Host "[7a/8] FREB disabled (set MODSEC_IIS_FREB=1 / freb input to trace per-module pipeline notifications)."
-}
-
 # --- 7) go-ftw over the full IIS-feasible CRS family set -------------------------
 # Policy: maximize the NUMBER of CRS families exercised while keeping CI green,
 # WITHOUT turning whole families off. The CRS regression runs at IIS DEFAULTS (we
@@ -655,6 +550,100 @@ Write-Host "go-ftw exit code: $ftwCode"
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
 
+# --- 7a) opt-in diagnostic capability (default OFF) ------------------------
+# IIS Failed Request Tracing (FREB): logs a NOTIFY_MODULE_START/END pair for
+# every module on every pipeline notification, so it shows from IIS's own point
+# of view whether ModSecurityIIS's response handlers are invoked. It costs a
+# Windows feature install + a full iisreset. PROVEN LIMITATION: after
+# Enable-WindowsOptionalFeature IIS-HttpTracing the box is in a servicing-pending
+# state where iisreset can no longer bring the site up -- tried BEFORE the first
+# iisreset (run 33776649545: connection refused at the [3/8] ownership check) and
+# mid-run before go-ftw (run 33773592685: site stayed down, go-ftw could not
+# connect). So FREB can only be enabled AFTER go-ftw -- it captures the manual
+# probes only, never the suite. Still useful for targeted probes, so it stays.
+$frebOn = ($env:MODSEC_IIS_FREB -eq '1') -or ($env:MODSEC_IIS_FREB -ieq 'true')
+if ($frebOn) {
+    $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
+    New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
+    try {
+        # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics.
+        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
+            -NoRestart -ErrorAction Stop | Out-Null
+        Write-Host "[7a/8] IIS-HttpTracing feature enabled."
+    } catch {
+        Write-Host "[7a/8] WARN: IIS-HttpTracing via cmdlet: $($_.Exception.Message)"
+        try {
+            & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 |
+                Write-Host
+        } catch {
+            Write-Host "[7a/8] WARN: dism fallback failed: $($_.Exception.Message)"
+        }
+    }
+    try {
+        & $appcmd set config $SiteName `
+            /section:system.webServer/tracing/traceFailedRequestsLogging `
+            /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
+        $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+        [xml]$doc = Get-Content $ahConfig
+        $sws = $doc.configuration."system.webServer"
+        if (-not $sws) {
+            $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
+        }
+        $tracing = $sws.tracing
+        if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
+        $tfr = $tracing.traceFailedRequests
+        if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
+        $tfr.RemoveAll()
+        $add = $doc.CreateElement("add")
+        $add.SetAttribute("path", "*")
+        $ta = $doc.CreateElement("traceAreas")
+        $prov = $doc.CreateElement("add")
+        $prov.SetAttribute("provider", "WWW Server")
+        $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
+        $prov.SetAttribute("verbosity", "Verbose")
+        [void]$ta.AppendChild($prov)
+        [void]$add.AppendChild($ta)
+        $fd = $doc.CreateElement("failureDefinitions")
+        $fd.SetAttribute("statusCodes", "200-999")
+        [void]$add.AppendChild($fd)
+        [void]$tfr.AppendChild($add)
+        $doc.Save($ahConfig)
+        Write-Host "[7a/8] FREB rule added (all status codes, RequestNotifications)."
+    } catch {
+        Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
+    }
+    # This script runs with $ErrorActionPreference = "Stop": a single error line
+    # from iisreset becomes a terminating error. Wrap and keep it non-fatal.
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & iisreset /stop  2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        & iisreset /start 2>&1 | Out-Null
+    } catch {
+        Write-Host "[7a/8] WARN: iisreset issue: $($_.Exception.Message)"
+    }
+    $ErrorActionPreference = $eap
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+    # W3SVC Running is NOT enough: start the site and wait until it answers.
+    & $appcmd start site $SiteName 2>&1 | Out-Null
+    $up = $false
+    foreach ($i in 1..30) {
+        try {
+            $p = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+                     -SkipHttpErrorCheck -TimeoutSec 5
+            if ($p.StatusCode -eq 200) { $up = $true; break }
+        } catch { Start-Sleep -Seconds 2 }
+    }
+    Write-Host "[7a/8] post-FREB restart: site reachable = $up"
+} else {
+    Write-Host "[7a/8] FREB disabled (set MODSEC_IIS_FREB=1 to trace per-module pipeline notifications)."
+}
+
 # --- 7b) response-phase regression sentinel ----------------------------------
 # The full CRS suite above already exercises phase 4 via the RESPONSE-95x
 # families. This is a cheap confirmation that response-body inspection is still
@@ -719,8 +708,7 @@ Write-Host "[8/8] Event log clean."
 # and the go-ftw-output.txt / modsec_crs_audit.log artifacts. Genuine
 # engine/config breakage still hard-fails regardless via [6/8] (blocking
 # probes), [7b/8] (phase-4 sentinel) and [8/8] (event-log hygiene).
-$noGate = ($env:MODSEC_IIS_NO_GATE -eq '1') -or ($env:MODSEC_IIS_NO_GATE -ieq 'true')
-if ($noGate) {
+if ($env:MODSEC_IIS_NO_GATE -eq '1') {
     if ($ftwCode -ne 0) {
         Write-Host "[9/8] WARNING: go-ftw exit=$ftwCode (MODSEC_IIS_NO_GATE=1, NOT gating). See go-ftw-output.txt."
     }
