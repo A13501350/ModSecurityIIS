@@ -5,7 +5,7 @@
 # phase fix (OnSendResponse; d228cb6) plus /reflect DetectionOnly (990140).
 #
 # The RESPONSE-95x/956x families that were excluded on master for the phase-4
-# inspection gap now PASS and are NOT listed here. What remains (41 ids) is the
+# inspection gap now PASS and are NOT listed here. What remains (69 ids) is the
 # same set upstream CRS CI overrides or expects:
 #   * 942131-3/5/7, 944100/944110/944120/944210 (XML/JSON-body Java):
 #     libModSecurity v3 quirks -- CRS CI overrides these in
@@ -25,7 +25,7 @@
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
 # green while still exercising every included family's passing sub-tests.
 #
-# Total: 41
+# Total: 69
 932236-41
 932236-42
 933160-20
@@ -65,5 +65,42 @@
 944210-24
 944210-40
 944210-41
+# === 920/921/980 connection-level + 980170 (measured run 33882128480) ===
+# The blanket --exclude for these three families was removed; they are now run in
+# full. Under IIS defaults they are ~96% green. Only the sub-tests below fail:
+#   * 920/921 PROTOCOL tests: http.sys rejects or HANGS the malformed request
+#     before/around the WAF (connection-level, not rule logic).
+#   * 920410-1, 920390-1: known to HANG the connection (go-ftw aborts the run) --
+#     ignored for that reason.
+#   * 980170-1/2/3: phase-5 reporting rule never fires under libModSecurity v3
+#     (noauditlog -> no error.log entry); matches upstream nginx-overrides.
+920100-2
+920100-4
+920100-8
+920100-12
+920180-1
+920180-3
+920181-1
+920200-3
+920272-5
+920273-1
+920273-3
+920273-5
+920290-1
+920350-3
+920430-8
+920520-7
+920620-1
+920640-4
+920640-5
+921190-1
+921190-2
+921190-3
+921190-4
+980170-1
+980170-2
+980170-3
+920410-1
+920390-1
 944210-6
 944210-7

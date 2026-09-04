@@ -400,22 +400,19 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # 404.14/404.15 length, 400 malformed protocol, is genuinely not seen by the WAF
 # and is excluded by design).
 #
-# ALL IIS-feasible families are included at paranoia level 4 via --include (regex
-# below). Every failing sub-test is hard-excluded via scripts/crs_ignore.txt using
+# The full suite exercises EVERY IIS-feasible CRS family (no blanket --exclude).
+# Every failing sub-test is hard-excluded via scripts/crs_ignore.txt using
 # go-ftw's testoverride.ignore mechanism (see below), which marks the test Ignored
-# (not Failed) BEFORE the request is sent and is independent of --include. This
+# (not Failed) BEFORE the request is sent. This
 # keeps CI green (go-ftw exits 0 once every failure is ignored) while still
 # exercising every family's PASSING sub-tests -- maximizing coverage.
 #
-# Families deliberately NOT in --include:
-#   920xxx / 921xxx (Protocol Enforcement/Attack): http.sys rejects malformed
-#     requests (bad request line, invalid/oversized headers, bad charset, HTTP
-#     splitting) with its own 400 BEFORE any IIS module runs -- a protocol-layer
-#     rejection, not overrideable.
-#   959xxx (response/blocking evaluation): phase-4 outbound-anomaly assertions are
-#     flaky with SecResponseBodyAccess Off (the score is intermittently 0, so the
-#     rule fires non-deterministically).
-#   980xxx: 980170 class request-execution failures under IIS defaults.
+# Families once excluded (now INCLUDED -- see run 33882128480):
+#   920xxx / 921xxx / 980xxx were historically --exclude'd (http.sys rejects
+#     malformed PROTOCOL requests; 980170 never fires under v3). They are now run
+#     in full; only ~28 specific sub-tests are ignored (see scripts/crs_ignore.txt).
+#   959xxx: was listed here but the --exclude regex only ever covered 920/921/980,
+#     so 959 already ran and passes under IIS defaults -- no action needed.
 #
 # CRITICAL ROOT-CAUSE FIX (this change): libModSecurity v3 does NOT auto-detect
 # XML/JSON request-body types -- Transaction::addRequestHeader() only sets the body
@@ -441,9 +438,9 @@ Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WAR
 # scripts/crs_ignore.txt -- refreshed after the response phase fix (d228cb6)
 # and the merge of master's XML-attribute/body-parse opt-ins.
 $MeasureMode = $false
-# empty = run the FULL IIS-feasible suite (all families; 920/921 and 980 are
-# excluded via --exclude in the go-ftw invocation below). Set to e.g.
-# '^950150-1$' to debug a single test.
+# empty = run the FULL IIS-feasible suite (every family, including 920/921/980).
+# Set to e.g. '^950150-1$' (or '^(92[01]|980)' for just the formerly-excluded
+# families) to debug a single test / family via --include.
 $SingleTest = ''
 $includeRegex = $SingleTest
 
@@ -512,22 +509,26 @@ $ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
 # retry-once" (observed at 980170-1 in run 33745710564). 20000 comfortably
 # covers the inter-marker distance of the full suite.
 $ftwArgs += @('--max-marker-log-lines', '20000')
-# 920/921 (Protocol Enforcement/Attack) send MALFORMED requests: http.sys
-# rejects or sometimes HANGS the connection on them, and a hung connection
-# makes go-ftw abort the whole run with "read tcp ... i/o timeout" (observed
-# at 920410-1 in run 33747110589 and at 920390-1 in run 33748330919 -- two
-# different points, so intermittent). The CI strategy already treats these
-# families as untestable under IIS (rejected before any module runs); exclude
-# them so the remaining ~4865 tests measure to completion.
-# 980 (CORRELATION, phase 5) is excluded too: 980170-1/2/3 assert the phase-5
-# reporting rule 980170, which never fires with this connector, and go-ftw
-# treats the test's own retry_once exhaustion as a FATAL error that aborts the
-# entire run (observed at the same test in 33745710564 AND 33749658477).
-# 920/921/980 are excluded on FULL-suite runs (see comment above). go-ftw v1.3
-# refuses to combine --include with --exclude ("you need to choose one"), so
-# single-test debug runs pass --include and NOT --exclude.
-if ($includeRegex -ne '') { $ftwArgs += @('--include', $includeRegex) }
-else { $ftwArgs += @('--exclude', '^(92[01]|980)') }
+# 920/921 (Protocol Enforcement/Attack) and 980 (CORRELATION) were once --exclude'd
+# outright. Measured on branch verify/excluded-families (run 33882128480): under
+# IIS defaults these families are ~96% green -- most 920/921 PROTOCOL tests expect
+# exactly the 400 http.sys returns, and 980 passes except 980170 (v3 noauditlog
+# never writes the entry). Only a handful of sub-tests genuinely fail:
+#   * 920/921 connection-level tests (http.sys rejects/hangs the malformed request)
+#   * 980170-1/2/3 (phase-5 reporting rule never fires under this connector)
+# 920410-1 / 920390-1 can HANG the connection (observed 33747110589 / 33748330919),
+# which makes go-ftw abort the whole run -- they are ignored for that reason.
+# All such sub-tests are listed in scripts/crs_ignore.txt (testoverride.ignore),
+# so the FULL suite now exercises 920/921/980 instead of skipping them. With no
+# blanket --exclude, single-test debug runs still pass --include (go-ftw v1.3
+# refuses to combine --include with --exclude, "you need to choose one").
+if ($includeRegex -ne '') {
+    $ftwArgs += @('--include', $includeRegex)
+} else {
+    # Full-suite run: exercise EVERY CRS family, including 920/921/980.
+    # Per-sub-test failures are hard-excluded via scripts/crs_ignore.txt, not by
+    # a blanket --exclude here.
+}
 # Full-suite runs print one line per test (~4300 "✔ passed" lines -> ~900KB of
 # CI log). Only the failures matter for the gate; --show-failures-only keeps the
 # log down to the summary plus whatever actually failed. Single-test debug runs
@@ -715,7 +716,7 @@ Write-Host "[8/8] Event log clean."
 # and the go-ftw-output.txt / modsec_crs_audit.log artifacts. Genuine
 # engine/config breakage still hard-fails regardless via [6/8] (blocking
 # probes), [7b/8] (phase-4 sentinel) and [8/8] (event-log hygiene).
-if ($env:MODSEC_IIS_NO_GATE -eq '1') {
+if ($env:MODSEC_IIS_NO_GATE -eq '1' -or $env:MODSEC_IIS_NO_GATE -ieq 'true') {
     if ($ftwCode -ne 0) {
         Write-Host "[9/8] WARNING: go-ftw exit=$ftwCode (MODSEC_IIS_NO_GATE=1, NOT gating). See go-ftw-output.txt."
     }
