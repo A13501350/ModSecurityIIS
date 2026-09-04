@@ -5,7 +5,7 @@
 # phase fix (OnSendResponse; d228cb6) plus /reflect DetectionOnly (990140).
 #
 # The RESPONSE-95x/956x families that were excluded on master for the phase-4
-# inspection gap now PASS and are NOT listed here. What remains (69 ids) is the
+# inspection gap now PASS and are NOT listed here. What remains (71 ids) is the
 # same set upstream CRS CI overrides or expects:
 #   * 942131-3/5/7, 944100/944110/944120/944210 (XML/JSON-body Java):
 #     libModSecurity v3 quirks -- CRS CI overrides these in
@@ -25,7 +25,7 @@
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
 # green while still exercising every included family's passing sub-tests.
 #
-# Total: 69
+# Total: 71
 932236-41
 932236-42
 933160-20
@@ -102,5 +102,13 @@
 980170-3
 920410-1
 920390-1
+# === Known intermittent transport flakes (NOT deterministic misses) ===
+# 951200-1 / 955120-2 are ARR/albedo connection hiccups (~1 per run: "failed to
+# run", never a rule mismatch). The ABCFHZ audit-parts shrink reduced their rate
+# but did not eliminate them. With the mainline gate ON they must stay ignored to
+# keep CI green. (Dropped once during a flake-cleanup experiment, then re-added
+# after run 33883674091 hit 951200-1 again.)
+951200-1
+955120-2
 944210-6
 944210-7
