@@ -1,7 +1,6 @@
 // ModSecurityIIS -- native IIS 7+ module built on libModSecurity v3.
 //
 // Flow: RegisterModule -> OnBeginRequest -> OnSendResponse -> OnPostEndRequest
-// All engine calls use the verified v3 API.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
