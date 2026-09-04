@@ -25,6 +25,25 @@
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
 # green while still exercising every included family's passing sub-tests.
 #
+# === Hard-limitation audit (run 33892666964: 67 of these 69 re-run UN-ignored
+# with --debug; all failed, none connector-fixable). go-ftw's three failure
+# shapes map exactly onto the causes below:
+#   * "Unexpectedly found IDs in the log" (33: 942131-3/5/7, 944100/944110/
+#     944120/944210) -- the rule FIRES on benign payloads: the v3
+#     REQUEST_BODY-always-present / chain-log false positives, the same set
+#     upstream CRS overrides in nginx-overrides.yaml.
+#   * "Failed to find IDs in the log" (20: 920180/920200/920273/920350/920430/
+#     920520/921190 -- http.sys ate the request before the WAF could log;
+#     932236/942521 -- upstream rule 200002 deny precedes the attack rule;
+#     933160/934101/941101/942101 -- URI-path pre-WAF rejection;
+#     980170 -- v3 never logs noauditlog rules).
+#   * "Failed to match response status" (10: 920100/920181/920272/920290/920620/
+#     920640) -- http.sys semantics (411 requires Content-Length, 502 on CL+TE,
+#     400 on paths Apache allows) or PL4 blocking benign requests by design
+#     (found 403; those pass at PL1).
+# Not in the batch: 920410-1 / 920390-1 (documented connection hangs, abort the
+# whole go-ftw run).
+#
 # Total: 69
 932236-41
 932236-42

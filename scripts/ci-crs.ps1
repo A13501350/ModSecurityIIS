@@ -454,12 +454,11 @@ $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
 # "permanent exclusion" mechanism is `testoverride.ignore`, which
 # overriddenTestResult() evaluates BEFORE the request is sent and marks the
 # test Ignored (not Failed), independently of --include.
-# The ids live in scripts/crs_ignore.txt (one id per line). As of run
-# 33402239005 this holds 245 ids -- the full set of sub-tests that still fail
-# with modsecurity.conf-recommended now Included. To regenerate: run CI, harvest
-# the failing `<id>` list (go-ftw prints "<id> failed" / "<id> failed to run")
-# into scripts/crs_ignore.txt. Every id here makes the run green (the test is
-# Ignored, not Failed); any failing sub-test NOT listed here turns CI red.
+# The ids live in scripts/crs_ignore.txt (one id per line; 69 as of run
+# 33892666964). To regenerate: run CI in measurement mode ($MeasureMode = $true),
+# harvest the failing `<id>` list (go-ftw prints "<id> failed" / "<id> failed to
+# run") into scripts/crs_ignore.txt. Every id here makes the run green (the test
+# is Ignored, not Failed); any failing sub-test NOT listed here turns CI red.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
 # crs_ignore.txt may contain `#` comment / section-header lines; only treat
 # lines matching <rule>-<sub> (e.g. "942100-15") as exclusions.
