@@ -20,13 +20,12 @@
 #     quotes/parens that are illegal in RFC 3986 paths (e.g. /get/"onmouseover=...,
 #     /get/eval(gzinflate(...)). Same class as the 920/921 pre-WAF rejections;
 #     the passing siblings of these files put the payload in query/body instead.
-#   * 934120-43, 951200-1: intermittent transport flakes (pass most runs; a
 #     transient ARR/albedo failure on one measurement). Not rule logic.
 #
 # These sub-tests are Ignored (not Failed) via testoverride.ignore so CI stays
 # green while still exercising every included family's passing sub-tests.
 #
-# Total: 43
+# Total: 41
 932236-41
 932236-42
 933160-20
@@ -68,5 +67,3 @@
 944210-41
 944210-6
 944210-7
-951200-1
-955120-2
