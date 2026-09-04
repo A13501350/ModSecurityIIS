@@ -509,6 +509,16 @@ $ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
 # retry-once" (observed at 980170-1 in run 33745710564). 20000 comfortably
 # covers the inter-marker distance of the full suite.
 $ftwArgs += @('--max-marker-log-lines', '20000')
+# Throttle to 1 request per 50ms (~20 req/s vs ~90 req/s unthrottled). go-ftw
+# opens a NEW raw TCP connection per request (ftwhttp has no keep-alive pool,
+# ftwhttp/client.go closes + re-dials every request), so the full suite fires
+# ~5-6k short-lived loopback connections in ~1 minute. That churn intermittently
+# exhausts Windows ephemeral ports / overflows the listen backlog -> ~1 quick
+# (~10-25ms) "failed to run" transport flake per run. Pacing the requests lets
+# TIME_WAIT entries drain between them: root-cause mitigation for the transport
+# flakes instead of ignoring their ids (951200-1/955120-2 were un-ignored in the
+# same change to prove this fix; re-add them only if the flakes come back).
+$ftwArgs += @('--rate-limit', '50ms')
 # 920/921 (Protocol Enforcement/Attack) and 980 (CORRELATION) were once --exclude'd
 # outright. Measured on branch verify/excluded-families (run 33882128480): under
 # IIS defaults these families are ~96% green -- most 920/921 PROTOCOL tests expect
