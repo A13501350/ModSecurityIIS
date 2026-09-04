@@ -1,17 +1,7 @@
 // ModSecurityIIS -- native IIS 7+ module built on libModSecurity v3.
 //
-// This file is the IIS-side connector. It is essentially version-agnostic
-// except for the engine calls, which go through the v3 API
-// (modsecurity::Transaction). The flow mirrors the v2 iis/ connector:
-//
-//   RegisterModule  -> registers the module factory + request notifications
-//   OnBeginRequest  -> create a Transaction, feed request line/headers/body
-//   OnSendResponse  -> feed response headers/body
-//   OnPostEndRequest-> processLogging + release the Transaction
-//
-// All ModSecurity call sites use the verified v3 API (confirmed against
-// libmodsecurity/headers: modsecurity.h, rules_set.h, transaction.h,
-// intervention.h).
+// Flow: RegisterModule -> OnBeginRequest -> OnSendResponse -> OnPostEndRequest
+// All engine calls use the verified v3 API.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -22,12 +12,12 @@
 #include <strsafe.h>
 #include <string>
 #include <vector>
-#include <memory>    // std::shared_ptr
-#include <new>       // std::nothrow
-#include <exception> // std::exception
-#include <cstdio>    // FILE*, fprintf (diag trace)
-#include <cstdarg>   // va_list (diag trace)
-#include <cstdlib>   // getenv (diag trace enable switch)
+#include <memory>
+#include <new>
+#include <exception>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
 
 #include "httpserv.h"
 
@@ -42,8 +32,7 @@
 IHttpServer *   g_pHttpServer = NULL;
 PVOID           g_pModuleContext = NULL;
 
-// Event Viewer handle, owned by the (singleton) CMyHttpModule instance and
-// shared with connector.cpp's server-log callback via this global.
+// Event Viewer handle, owned by CMyHttpModule and shared with connector.cpp.
 HANDLE          g_hEventLog = NULL;
 
 
@@ -124,19 +113,9 @@ static int SockAddrToPort(PSOCKADDR pAddr)
 }
 
 // Upper bound (bytes) of request/response body we allow the engine to buffer
-// for inspection. Without this the full body is copied into the transaction's
-// memory (bounded only by IIS maxAllowedContentLength), so a large upload can
-// exhaust worker-process memory. SecRequestBodyLimit is only checked AFTER the
-// whole body has been appended, hence the explicit cap here. Override with the
-// MODSEC_IIS_MAX_INSPECT_BODY_BYTES environment variable (decimal bytes).
+// for inspection. Override with MODSEC_IIS_MAX_INSPECT_BODY_BYTES env var.
 static size_t GetMaxInspectBodyBytes()
 {
-    // Inspected request/response body is buffered in the transaction's memory.
-    // Bound it to bound memory use (SecRequestBodyLimit only applies after the
-    // whole body is appended). Override via MODSEC_IIS_MAX_INSPECT_BODY_BYTES
-    // (decimal bytes). Default 128 MB. The function-local static is initialized
-    // exactly once, thread-safely (C++11 "magic statics", same InitOnce guard
-    // std::call_once uses) -- no data race, no hand-rolled spin/atomic.
     static const size_t cached = []() -> size_t
     {
         size_t v = 128 * 1024 * 1024;
@@ -154,15 +133,11 @@ static size_t GetMaxInspectBodyBytes()
 }
 
 // When the module is registered but a request's configuration cannot be read,
-// a WAF must not silently serve the request unprotected (that is a rule bypass).
-// By default we therefore fail-closed (reject). Set the environment variable
-// MODSEC_IIS_FAIL_CLOSED=0 to revert to the old fail-open behavior for
-// deployments where the module is globally registered but intentionally
-// unconfigured on some sites.
+// a WAF must not silently serve the request unprotected. Fail-closed by default;
+// set MODSEC_IIS_FAIL_CLOSED=0 to revert to fail-open.
 static bool ConfigFailClosed()
 {
-    // Default fail-closed; MODSEC_IIS_FAIL_CLOSED=0 opt-out. Function-local
-    // static init is thread-safe (C++11 magic statics): no data race, no spin.
+    // Default fail-closed; MODSEC_IIS_FAIL_CLOSED=0 opt-out.
     static const bool failClosed = []() -> bool
     {
         char buf[8] = { 0 };
@@ -194,19 +169,9 @@ static std::string VerbToString(HTTP_REQUEST* req)
     case HttpVerbUNLOCK:  return "UNLOCK";
     case HttpVerbSEARCH:  return "SEARCH";
     default:
-        // http.sys maps every non-enumerated method (PATCH, custom verbs,
-        // WebDAV extensions, ...) to HttpVerbUnknown and keeps the original
-        // bytes in pUnknownVerb. Report the real method so rules matching
-        // REQUEST_METHOD (e.g. @streq PATCH) keep working; fall back to
-        // "INVALID" only when the raw bytes are unavailable.
-        //
-        // NOTE: UnknownVerbLength is the verb length in BYTES, NOT including
-        // any NUL terminator (see http.h). pUnknownVerb is therefore not
-        // guaranteed to be NUL-terminated, so we pass exactly that length and
-        // never read one byte past it. The previous "+1" caused an out-of-bounds
-        // read and, when that trailing byte was the space after the verb on the
-        // request line, silently turned e.g. "PATCH" into "PATCH ", breaking
-        // rules such as @streq PATCH.
+        // http.sys maps non-enumerated methods to HttpVerbUnknown, keeping the
+        // original bytes in pUnknownVerb. Report the real method so rules
+        // matching REQUEST_METHOD keep working.
         if (req->Verb == HttpVerbUnknown && req->pUnknownVerb != NULL)
         {
             std::string verb = AToUtf8(req->pUnknownVerb,
@@ -221,11 +186,9 @@ static std::string VerbToString(HTTP_REQUEST* req)
 }
 
 // NOTE: the engine composes REQUEST_LINE / REQUEST_PROTOCOL itself by
-// prepending "HTTP/" to whatever we pass (transaction.cc: " HTTP/" +
-// http_version), so this returns the BARE version ("1.1", "2"). The
-// response side is the opposite: Transaction::processResponseHeaders
-// stores the protocol string verbatim into RESPONSE_PROTOCOL, so callers
-// there must pass the full "HTTP/x.y".
+// prepending "HTTP/" to whatever we pass. This returns the bare version
+// ("1.1", "2"). Response side is the opposite: processResponseHeaders stores
+// the protocol verbatim, so callers must pass the full "HTTP/x.y".
 static std::string VersionToString(HTTP_VERSION version)
 {
     if (HTTP_EQUAL_VERSION(version, 0, 9))  return "0.9";
@@ -256,18 +219,8 @@ static void ReportException(const char* where, const char* what) noexcept
     iis::WriteEventViewerLog(buf, EVENTLOG_ERROR_TYPE);
 }
 
-// DEBUG (diag/single-body-test): append-only file trace so we can prove, in a
-// live IIS run, whether the response-phase handlers (OnSendResponse /
-// OnPostEndRequest) are actually invoked and reach processResponseHeaders /
-// processResponseBody. The file lives under C:/inetpub/modsec/ which the
-// iis-smoke-diagnostics artifact uploads. Cheap and disabled-able: it only
-// writes when the path exists/creatable; failures are silently ignored.
-//
-// KEPT as a permanently available diagnostic, but DISABLED by default: the
-// trace only writes when the MODSEC_IIS_TRACE environment variable is set
-// (any non-empty value other than "0"). w3wp inherits the app pool's
-// environment, so set it on the app pool to enable. Evaluated once per
-// process; no per-request overhead when off.
+// DEBUG: append-only file trace to prove response-phase handlers are invoked.
+// Writes only when MODSEC_IIS_TRACE env var is set (non-empty, not "0").
 static int g_iisTraceEnabled = -1;
 
 static bool IisTraceEnabled()
@@ -287,16 +240,8 @@ static void IisTrace(const char* fmt, ...)
     {
         return;
     }
-    // Tried in order: w3wp's app-pool identity can only write where ITS audit
-    // log lives (C:/inetpub/logs/modsec-crs-audit -- proven writable because
-    // the engine writes audit.log there). C:/inetpub/modsec is the config root
-    // written by the elevated CI script and is NOT writable by w3wp, which is
-    // why an earlier trace attempt there silently produced no file at all.
+    // Tried in order: w3wp can only write where its audit log lives.
     static const char* kPaths[] = {
-        // First choice: ci-smoke's audit dir. w3wp demonstrably writes its
-        // audit.log there (204 KB observed) AND it is inside the uploaded
-        // iis-smoke-diagnostics artifact, so the trace is both writable and
-        // retrievable.
         "C:/inetpub/logs/modsec-audit/modsecurityiis-trace.log",
         "C:/inetpub/logs/modsec-crs-audit/modsecurityiis-trace.log",
         "C:/inetpub/modsec/modsecurityiis-trace.log"
@@ -422,8 +367,6 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     // the same transaction return false -- which is exactly what we want since
     // we check once after each phase.
     modsecurity::ModSecurityIntervention it;
-    // clean() nulls url/log then resets status/pause/disruptive, so that
-    // intervention::free() afterwards never frees uninitialized pointers.
     modsecurity::intervention::clean(&it);
 
     if (!tx->intervention(&it))
@@ -434,11 +377,9 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     bool disruptive = (it.disruptive != 0);
     int  status     = it.status;
 
-    // Copy the redirect URL out of the intervention BEFORE freeing it:
-    // intervention::free() (intervention.h:59-62) calls free() on it.url, so
-    // keeping a raw pointer into the struct would be a use-after-free.
+    // Copy the redirect URL before intervention::free() frees it.
     std::string redirectUrl = (it.url != nullptr) ? std::string(it.url) : std::string();
-    modsecurity::intervention::free(&it);   // release url/log owned by libmodsecurity
+    modsecurity::intervention::free(&it);
 
     if (!disruptive)
     {
@@ -484,21 +425,8 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         finalStatus = status;
     }
 
-    // Tell the ENGINE which status we actually returned. Without this the
-    // engine keeps m_httpCodeReturned at its constructor default of 200
-    // (transaction.cc:125) for every phase-1/phase-2 block, because
-    // processResponseHeaders() -- the only other place that assigns it
-    // (transaction.cc:992) -- never runs once we finish the request here.
-    // That default poisons three things:
-    //   * audit part F / "Access denied with code %d" render as 200
-    //     (transaction.cc:1522/1541), which is why a request the client saw
-    //     as 403 was logged as a 200 success;
-    //   * SecAuditEngine RelevantOnly filtering tests isRelevant(200)
-    //     (audit_log/audit_log.cc:298), so blocked requests can be dropped
-    //     from the audit log entirely -- a real visibility loss;
-    //   * the RESPONSE_STATUS variable, which phase-3+ rules may key on.
-    // updateStatusCode() sets both m_httpCodeReturned and RESPONSE_STATUS,
-    // and must run BEFORE FinishRequest() triggers processLogging().
+    // Tell the engine which status we returned; without this the audit log
+    // and RESPONSE_STATUS variable see the default 200 instead of the real code.
     tx->updateStatusCode(finalStatus);
 
     pHttpContext->SetRequestHandled();
@@ -572,34 +500,11 @@ BOOL CMyHttpModule::WriteEventViewerLog(LPCSTR szNotification, WORD category)
 // ---------------------------------------------------------------------------
 // Request entity body
 //
-// At RQ_BEGIN_REQUEST the entity body is usually NOT fully buffered yet: a
-// ReadEntityBody() returns only the bytes buffered so far, and a SHORT read
-// does NOT mean end-of-body. Measured: a 100,016-byte body trickled at 30 KB/s
-// was cut off at 49,152 bytes because the old loop treated that short read as
-// EOF -- the WAF inspected less than half the body, which is both a detection
-// gap and an evasion (trickle the body to hide payloads).
-//
-// So the loop must keep reading through short reads, which a SYNCHRONOUS
-// ReadEntityBody() cannot do safely: once the buffered data runs out it BLOCKS
-// waiting for more, and after the body has ended that never returns -- the
-// deadlock that stalled CI for ~44 minutes.
-//
-// Reading ASYNCHRONOUSLY lets us keep going without ever blocking:
-// ReadEntityBody(fAsync=TRUE) returns fCompletionPending=TRUE when the next
-// chunk has not arrived yet, we return RQ_NOTIFICATION_PENDING, and IIS calls
-// OnAsyncCompletion() when it lands. We stop at EOF / a zero-length read, or
-// once the declared Content-Length has been consumed.
-//
-// Two rules the first async attempt got wrong, both of which matter:
-//   * Do NOT call IHttpContext::PostCompletion(). That is for MODULE-OWNED async
-//     work (e.g. your own threadpool) and makes IIS re-enter the original
-//     notification. Here the I/O is IIS-tracked: IIS calls OnAsyncCompletion and
-//     we simply return the status from there. Doing both double-signals a single
-//     pending operation.
-//   * Filter on dwNotification / fPostNotification in OnAsyncCompletion: it is
-//     called for async operations started from ANY notification, so only handle
-//     the ones we began, and never PostCompletion for the rest (that would
-//     resume an operation that is not ours).
+// At RQ_BEGIN_REQUEST the entity body may not be fully buffered. Short reads
+// do NOT mean end-of-body. We read ASYNCHRONOUSLY (fAsync=TRUE) so we never
+// block the worker thread: when the next chunk has not arrived we return
+// RQ_NOTIFICATION_PENDING, and IIS calls OnAsyncCompletion when it lands.
+// We stop at EOF, a zero-length read, or once Content-Length is consumed.
 // ---------------------------------------------------------------------------
 
 // What the request declares about its entity body. length is 0 when unknown
@@ -666,16 +571,9 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         return FinishBodyRead(rsc, pHttpContext);
     }
 
-    // Pre-size the accumulator so multi-chunk bodies do not pay repeated
-    // reallocation + copy as they grow. The declared Content-Length is
-    // CLIENT-CONTROLLED, so it must never be used as an allocation size
-    // directly: a bogus "Content-Length: 4294967295" with no body would make us
-    // eagerly allocate gigabytes per request (a trivial memory-exhaustion DoS).
-    // Clamp: cover the common case (< 1 MiB) in one allocation, and let anything
-    // larger grow geometrically as it actually arrives. Chunked bodies declare no
-    // length, so they get no reserve.
-    // reserve() is a no-op once capacity is sufficient, which also makes this
-    // harmless when OnAsyncCompletion re-enters DriveBodyRead.
+    // Pre-size the accumulator so multi-chunk bodies don't pay repeated
+    // reallocation. Client-controlled Content-Length is clamped to 1 MiB
+    // (geometric growth handles larger bodies as they arrive).
     if (info.length > 0)
     {
         const size_t kPreReserveCap = 1024 * 1024;   // 1 MiB
@@ -691,8 +589,7 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
     {
         DWORD read     = 0;
         BOOL  fPending = FALSE;
-        // fAsync = TRUE: never block the worker thread. If the next chunk has not
-        // arrived yet we get fPending = TRUE and resume in OnAsyncCompletion.
+        // fAsync = TRUE: never block the worker thread.
         HRESULT hrr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
                                                (DWORD)sizeof(rsc->m_ReadBuf),
                                                TRUE /* async */, &read, &fPending);
@@ -737,13 +634,9 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 {
     try
     {
-        // Hand the FULL body back so the downstream handler still receives it.
-        // InsertEntityBody() inserts BEFORE any remaining unread entity body, so
-        // it is called exactly ONCE and only after the body has been drained --
-        // inserting per chunk while still reading would make the next
-        // ReadEntityBody() return our own copy. IIS does not copy the buffer, so
-        // it must outlive the request: allocate it from request-scoped memory
-        // rather than using the read buffer.
+        // Hand the FULL body back to the downstream handler via a single
+        // InsertEntityBody(). Must use request-scoped memory (IIS does not
+        // copy the buffer).
         IHttpRequest* pRequest = pHttpContext->GetRequest();
         if (pRequest != NULL && !rsc->m_Body.empty())
         {
@@ -754,11 +647,10 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                 memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
                 pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
             }
-            // Allocation failure: there is nothing safe to forward, so the
-            // handler simply sees an empty body. Never fail the request here.
+            // Allocation failure: forward an empty body. Never fail here.
         }
 
-        // Feed the body to the engine, bounded to bound memory use.
+        // Feed the body to the engine, bounded to cap memory use.
         const size_t maxInspect = GetMaxInspectBodyBytes();
         size_t take = rsc->m_Body.size();
         if (take > maxInspect)
@@ -774,7 +666,7 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     }
     catch (const std::exception& e)
     {
-        // Fail-closed: deny rather than let an exception escape the module.
+        // Fail-closed: deny rather than let an exception escape.
         ReportException("FinishBodyRead", e.what());
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
@@ -829,11 +721,9 @@ CMyHttpModule::OnBeginRequest(
     hr = MODSECURITY_STORED_CONTEXT::GetConfig(pHttpContext, &pConfig);
     if (FAILED(hr))
     {
-        // The configuration could not be read. A WAF must fail-closed: serving
-        // the request unprotected (the previous behavior) silently bypasses all
-        // rules. Reject the request and surface the failure in the Event Viewer.
-        // Set MODSEC_IIS_FAIL_CLOSED=0 to opt back into fail-open.
-        WriteEventViewerLog(
+    // The configuration could not be read. Fail-closed by default:
+    // serving the request unprotected bypasses all rules.
+    WriteEventViewerLog(
             "ModSecurityIIS: failed to read module configuration; "
             "failing closed (request rejected).",
             EVENTLOG_ERROR_TYPE);
@@ -870,11 +760,8 @@ CMyHttpModule::OnBeginRequest(
         break;
     }
 
-    // v3 API: Transaction(ModSecurity*, RulesSet*, void*) where the 3rd arg is
-    // the per-transaction log-callback data (passed back to ServerLogCallback).
-    // nothrow keeps the null check meaningful; internal engine allocations are
-    // covered by the try/catch around this handler. We keep a shared_ptr to the
-    // RulesSet on the request context so the cached rules object outlives this
+    // v3 API: Transaction(ModSecurity*, RulesSet*, void*). We keep a
+    // shared_ptr to the RulesSet so the cached object outlives this
     // transaction even if connector.cpp reloads the cache mid-flight.
     modsecurity::Transaction* tx =
         new (std::nothrow) modsecurity::Transaction(&iis::engine(), rules.get(), this);
@@ -932,11 +819,8 @@ CMyHttpModule::OnBeginRequest(
 
     // --- URI / method / version ---
     // Prefer the raw (unprocessed) URL: IIS has not decoded/normalized it, so
-    // ModSecurity applies its own decoding/normalization -- essential for
-    // encoded-evasion and path-traversal detection, and consistent with the
-    // Apache connector's REQUEST_URI semantics. pRawUrl is ANSI and already
-    // includes the query string ("/path?query"). Fall back to the cooked URL
-    // only if the raw pointer is absent (malformed request line).
+    // ModSecurity applies its own decoding -- essential for encoded-evasion
+    // and path-traversal detection. Fall back to cooked URL if raw is absent.
     std::string uri;
     if (req->pRawUrl != nullptr)
     {
@@ -1063,9 +947,7 @@ CMyHttpModule::OnBeginRequest(
 
 // ---------------------------------------------------------------------------
 // OnAsyncCompletion -- resumes an asynchronous entity-body read started from
-// ---------------------------------------------------------------------------
-// OnAsyncCompletion -- resumes an asynchronous entity-body read started from
-// OnBeginRequest (see the "Request entity body" comment block).
+// OnBeginRequest.
 // ---------------------------------------------------------------------------
 
 REQUEST_NOTIFICATION_STATUS
@@ -1079,11 +961,9 @@ CMyHttpModule::OnAsyncCompletion(
 {
     UNREFERENCED_PARAMETER(pProvider);
 
-    // OnAsyncCompletion is called for asynchronous operations started from ANY
-    // notification, so handle only the ones we began: an entity-body read from
-    // RQ_BEGIN_REQUEST, and never a post-event. Anything else is not ours --
-    // return without touching it. In particular do NOT call PostCompletion()
-    // here: that resumes an operation we did not start.
+    // Only handle completions for entity-body reads we started from
+    // RQ_BEGIN_REQUEST. Do NOT call PostCompletion() -- that is for
+    // module-owned async work and would double-signal this IIS-tracked I/O.
     if (pHttpContext == NULL || pCompletionInfo == NULL ||
         !(dwNotification & RQ_BEGIN_REQUEST) || fPostNotification)
     {
@@ -1180,9 +1060,8 @@ CMyHttpModule::OnSendResponse(
     HTTP_RESPONSE*             pRaw      = pResponse->GetRawHttpResponse();
 
     // --- response headers ---
-    // Fed exactly once per request: RQ_SEND_RESPONSE fires again for every
-    // explicit handler flush, and re-adding the (unchanged) header set would
-    // pollute the transaction with duplicates.
+    // Fed exactly once: RQ_SEND_RESPONSE fires again for every handler flush,
+    // so re-adding duplicates would pollute the transaction.
     if (!rsc->m_ResponseHeadersFed)
     {
 #define _TRANSHEADER(id,str)                                               \
@@ -1238,9 +1117,6 @@ CMyHttpModule::OnSendResponse(
     }
 
     // v3 API: processResponseHeaders(int code, const std::string& protocol).
-    // IHttpResponse::GetStatus returns void; status comes via OUT params.
-    // The response protocol mirrors the request protocol (HTTP/2 responses
-    // travel over HTTP/2; only report HTTP/1.1 when it really was 1.1).
     USHORT statusCode = 0;
     USHORT subStatus = 0;
     PCSTR  statusReason = NULL;
@@ -1263,16 +1139,11 @@ CMyHttpModule::OnSendResponse(
     }
 
     // --- response body: Mode A (block) vs Mode B (inspect-only) ---
-    // Mode A (responseBodyBlockingEnabled): feed the body to the engine and,
-    // once the COMPLETE body is present in a single notification (no
-    // HTTP_SEND_RESPONSE_FLAG_MORE_DATA), evaluate phase-4 right HERE and block
-    // -- replacing the response via Clear()+SetRequestHandled() BEFORE any body
-    // byte leaves the worker. This mirrors the v2 connector's buffering model.
-    // If the response is chunked/streaming (MORE_DATA is set), the already-
-    // queued bytes cannot be held, so THIS request is degraded to Mode B
-    // (inspect-only) and the body is allowed to flow.
-    // Mode B (default / responseBodyBlock off): accumulate only; phase-4 runs
-    // later in OnPostEndRequest for detection (never blocks, bytes already sent).
+    // Mode A (responseBodyBlock on): buffer the full body and evaluate phase-4
+    // synchronously, blocking before any byte leaves the worker. Streaming
+    // responses (MORE_DATA) degrade to Mode B.
+    // Mode B (default): accumulate only; phase-4 runs at final send for
+    // detection (never blocks, bytes already sent).
     {
     size_t respInspected = 0;
     const size_t maxInspect = GetMaxInspectBodyBytes();
@@ -1409,22 +1280,9 @@ CMyHttpModule::OnPostEndRequest(
     UNREFERENCED_PARAMETER(pHttpContext);
     UNREFERENCED_PARAMETER(pProvider);
 
-    // MEASURED (connector file trace, CI run 33733528207): in this IIS pipeline
-    // the RQ_END_REQUEST post-notification fires BEFORE RQ_SEND_RESPONSE -- all
-    // 13 observed OnSendResponse calls arrived after OnPostEndRequest. The old
-    // body of this handler was therefore actively harmful:
-    //   1. processResponseBody() ran with NO response headers fed yet
-    //      (addResponseHeader("Content-Type") happens only in OnSendResponse),
-    //      so the mime check in Transaction::processResponseBody early-returned
-    //      and phase 4 did nothing;
-    //   2. FinishRequest() deleted the transaction and nulled m_pTx;
-    //   3. OnSendResponse then found m_pTx == NULL and broke out -- so phase 3
-    //      and the response-body feed never ran at all (the root cause of every
-    //      RESPONSE-95x phase-4 regression failure and of Mode A never blocking).
     // The response phases now live entirely in OnSendResponse. The transaction
-    // is finalized by REQUEST_STORED_CONTEXT::CleanupStoredContext (destructor
-    // path: processLogging + delete), which IIS invokes after every notification
-    // has completed -- including RQ_SEND_RESPONSE.
+    // is finalized by REQUEST_STORED_CONTEXT::CleanupStoredContext (destructor:
+    // processLogging + delete), which IIS invokes after all notifications.
     return RQ_NOTIFICATION_CONTINUE;
 }
 

@@ -27,3 +27,24 @@ logs/
 failids*.txt
 go-ftw-output.txt
 modsec_crs_audit.log
+
+# Diagnostic run dumps (v* log/diag dirs, temporary test output)
+v[0-9]*log/
+v[0-9]*diag/
+v7_audit.log
+v7_ftw.txt
+v9dll/
+
+# Scratch test dirs
+ap/
+f2log/
+fdbg/
+fo/
+fr2/
+fr3log/
+fr4log/
+frlog/
+m1log/
+mb1log/
+od/
+od3/

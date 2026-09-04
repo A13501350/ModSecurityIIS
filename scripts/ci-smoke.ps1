@@ -1,24 +1,10 @@
-# IIS smoke test for ModSecurityIIS, designed for ephemeral CI machines
-# (GitHub Actions windows-latest = Windows Server with admin rights).
-#
-# Flow: ensure IIS -> stage engine dependency DLLs (dumpbin-driven) ->
-# deploy the module -> write a minimal modsecurity.conf + rules -> create
-# an app pool/site on 127.0.0.1:18080 -> assert behavior:
-#
-#   A  GET  normal UA               -> 200  (pass-through works)
-#   B  GET  UA "modsec-test-block"  -> 403  (phase 1 header rule)
-#   C  POST evil=<script>...        -> 403  (phase 2 request-body rule)
-#   D  POST benign body             -> 405  (no false positive; handler rejects verb)
-#   E  audit log contains rule ids 1001/1002
-#   F  Application event log has "ModSecurity" entries (server-log callback)
-#   P  GET  X-ModSec-Probe: logme    -> 200  (non-disruptive server-log path)
-#
-# Any failed assertion exits non-zero.
+# IIS smoke test for ModSecurityIIS.
+# Flow: ensure IIS -> stage DLLs -> deploy module -> write config ->
+# create app pool/site -> assert A-F + P behaviors.
 
 [CmdletBinding()]
 param(
-    # Directory holding modsecurityiis.dll + libModSecurity.dll (the build
-    # artifact).
+    # Directory holding modsecurityiis.dll + libModSecurity.dll.
     [Parameter(Mandatory = $true)][string]$DllDir,
 
     [string]$SiteRoot  = "C:\inetpub\modsectest",
@@ -65,19 +51,13 @@ $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
 Write-Host "[1/6] IIS ready."
 
 # --- 2) stage engine dependency DLLs ------------------------------------------
-# libModSecurity is built via Conan; ConanCenter Windows packages are static
-# by default, but if any dynamic dependency crept in, w3wp would fail to load
-# it. Locate every non-system import we can find and place it next to the
-# engine DLL.
+# Locate every non-system import and place it next to the engine DLL.
 $inetsrv = "$env:windir\System32\inetsrv"
 $depsOutput = & dumpbin /dependents $engine 2>&1 | Out-String
 Write-Host "== dumpbin /dependents libModSecurity.dll =="; Write-Host $depsOutput
 
-# Stage the dynamic VC++ runtime the engine links against (/MD). Without
-# this, resolution relies on the VS toolchain being on PATH -- true on the
-# runner, not necessarily on a clean deployment host. VS versions name the
-# redist folder differently (Microsoft.VC143.CRT / VC144...), so search it;
-# fall back to the OS copies in System32.
+# Stage the dynamic VC++ runtime the engine links against (/MD).
+# VS versions name the redist folder differently; fall back to System32.
 $crtNames = "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
 $crtSrcDirs = @()
 if ($env:VCToolsRedistDir) {
@@ -104,8 +84,7 @@ $missing = @()
 foreach ($m in [regex]::Matches($depsOutput, "(?im)^\s*(\S+\.dll)\s*$")) {
     $dep  = $m.Groups[1].Value
     $base = ($dep -replace "\.dll$", "")
-    # api-ms-win-crt-* are UCRT API Sets: virtual, always resolvable by the
-    # OS loader, and with no physical file under System32.
+    # api-ms-win-crt-* are UCRT API Sets: virtual, always resolvable.
     if ($base -like "api-ms-win-crt*") { continue }
     if ($systemDeps -contains $base) { continue }
     if (-not (Test-Path (Join-Path $env:windir "System32\$dep"))) { $missing += $dep.ToLower() }
@@ -136,9 +115,8 @@ Assert-True ($LASTEXITCODE -eq 0) "deploy script succeeded" "exit=$LASTEXITCODE"
 Assert-True (& $appcmd list modules /name:ModSecurityIIS | Select-String "ModSecurityIIS" -Quiet) `
             "native module registered" "appcmd list modules came back empty"
 
-# Schema files under inetsrv\config\schema are only picked up when the whole
-# IIS configuration stack reloads -- WAS/W3SVC alone is not enough, the
-# watcher lives in IISADMIN (this mirrors iisreset).
+# Schema files under inetsrv\config\schema require a full IIS config stack
+# reload (iisreset).
 function Restart-IisConfigStack {
     & iisreset /stop 2>&1 | Out-Null
     Start-Sleep -Seconds 2
@@ -151,8 +129,7 @@ function Restart-IisConfigStack {
 }
 Restart-IisConfigStack
 
-# Diagnostics: prove the schema file is where we put it and whether the
-# config system now knows the section.
+# Diagnostics: prove schema file location and section visibility.
 Write-Host "== schema file =="
 Get-Item "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml" |
     Format-Table FullName, Length, LastWriteTime
@@ -187,9 +164,7 @@ Write-Host "[3/6] Module registered, config stack restarted for schema."
 New-Item -ItemType Directory -Force $ConfRoot | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $ConfRoot "data") | Out-Null
 New-Item -ItemType Directory -Force "C:\inetpub\logs\modsec-audit" | Out-Null
-# GeoIP2 database directory. The @geoLookup operator and GEO-based CRS rules
-# need a MaxMind GeoIP2 .mmdb here; the directive is only emitted when the file
-# actually exists, so CI (no db) keeps its current behavior and stays green.
+# GeoIP2 database directory. Directive only emitted when .mmdb exists.
 New-Item -ItemType Directory -Force "C:\inetpub\modsec\GeoIP" | Out-Null
 $geoDb   = "C:\inetpub\modsec\GeoIP\GeoIP2-Country.mmdb"
 $geoLine = if (Test-Path $geoDb) {
@@ -204,8 +179,7 @@ SecRequestBodyAccess On
 SecResponseBodyAccess Off
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
-# Full auditing during smoke runs: lets us verify in the uploaded artifacts
-# whether the engine actually received the request body for phase-2 rules.
+# Full auditing during smoke runs to verify engine received the body.
 SecAuditEngine RelevantOnly
 SecAuditLog C:\inetpub\logs\modsec-audit\audit.log
 SecAuditLogType Serial
@@ -220,14 +194,10 @@ $rules = @"
 SecRule REQUEST_HEADERS:User-Agent "@streq modsec-test-block" "id:1001,phase:1,deny,status:403,msg:'smoke: blocked user-agent'"
 SecRule ARGS:evil "@rx <script>" "id:1002,phase:2,deny,status:403,msg:'smoke: blocked request body'"
 # Non-disruptive probe: libModSecurity only routes NON-disruptive matches to
-# the server-log callback (rule_with_actions.cc gates every serverLog call on
-# !m_isDisruptive); deny rules surface through the audit log instead. Rule
-# 1003 exists precisely to exercise the callback -> Event Viewer path.
+# the server-log callback (rule 1003 -> Event Viewer path).
 SecRule REQUEST_HEADERS:X-ModSec-Probe "@streq logme" "id:1003,phase:1,pass,log,msg:'smoke: non-disruptive probe'"
-# Body-completeness probe helper (non-disruptive): matches the probe body so the
-# transaction is audited under SecAuditEngine RelevantOnly and the request body
-# (audit part C) is written to the log. The marker sits at the START of the body
-# so it still matches even if the body was truncated.
+# Body-completeness probe helper (non-disruptive): matches the probe body so
+# the transaction is audited under SecAuditEngine RelevantOnly.
 SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe: request body completeness'"
 "@
 Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
@@ -275,15 +245,13 @@ function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
     $script:diagN++
     $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
     # Save status line + headers + first 2 KiB of body for post-mortem.
-    $code = & $curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
                 -w "%{http_code}" 2>$null
     "--- STATUS: $code ---" | Add-Content $out
     Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
     "--- BODY (first 2048 bytes) ---" | Add-Content $out
     Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
         ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
-    # Console: status + response headers only (full details are uploaded as
-    # job artifacts; echoing whole HTML error pages floods the CI log).
+    # Console: status + response headers only.
     Write-Host "== $Name => HTTP $code =="
     Get-Content "$out.headers" -ErrorAction SilentlyContinue |
         Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
@@ -300,8 +268,7 @@ $cC = Invoke-Case "C phase-2 body block" @(
 $cD = Invoke-Case "D benign POST passes to handler" @(
     "-X","POST","-H","Content-Type: text/plain","--data","hello",
     "http://127.0.0.1:$Port/hello.txt")
-# Exercises the non-disruptive server-log path (rule 1003 -> callback ->
-# Event Viewer); response is a plain 200.
+# Exercises the non-disruptive server-log path (rule 1003 -> Event Viewer).
 $cP = Invoke-Case "P non-disruptive log probe" @(
     "-H","X-ModSec-Probe: logme","http://127.0.0.1:$Port/hello.txt")
 
@@ -322,13 +289,8 @@ if ($auditOk) {
 }
 
 # --- 6b) request-body completeness probe -------------------------------------
-# Does the FULL entity body reach the audit log (part C) when the body is read
-# at RQ_BEGIN_REQUEST? The body is deliberately larger than the loop's 64 KiB
-# ReadEntityBody buffer (so a complete read needs >1 iteration) and is uploaded
-# slowly via --limit-rate, so it arrives in several TCP segments -- the exact
-# condition under which a synchronous ReadEntityBody can return a partial
-# (short) read and the loop's short-read break would truncate inspection.
-# Reported (not asserted): we want the measurement either way.
+# Does the FULL entity body reach the audit log (part C)? Body is larger than
+# the loop's 64 KiB buffer and uploaded slowly via --limit-rate.
 $probePad    = 100000
 $probeBody   = "bodyprobe=1&pad=" + ("Z" * $probePad)
 $bodyFile    = Join-Path $ConfRoot "bodyprobe-request.txt"

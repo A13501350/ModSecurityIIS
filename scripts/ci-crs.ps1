@@ -42,15 +42,13 @@ $auditDir = "C:\inetpub\logs\modsec-crs-audit"
 New-Item -ItemType Directory -Force $auditDir          | Out-Null
 New-Item -ItemType Directory -Force "$ConfRoot\data"   | Out-Null
 New-Item -ItemType Directory -Force "$ConfRoot\GeoIP"  | Out-Null
-# Pool identity needs write access for audit/tmp files (pool exists since the
-# smoke stage created it); read access to GeoIP so @geoLookup can open the db.
+# Pool identity needs write access for audit/tmp files and read access to GeoIP.
 $poolId = "IIS AppPool\$PoolName"
 icacls $auditDir         /grant "${poolId}:(OI)(CI)M" | Out-Null
 icacls "$ConfRoot\data"  /grant "${poolId}:(OI)(CI)M" | Out-Null
 icacls "$ConfRoot\GeoIP" /grant "${poolId}:(OI)(CI)R" | Out-Null
 
-# GeoIP2: only emit SecGeoLookupDB if a MaxMind .mmdb is actually present, so
-# CI (no db) keeps its current behavior; deploying the db enables GEO rules.
+# GeoIP2: only emit SecGeoLookupDB if a MaxMind .mmdb is actually present.
 $geoDb   = "$ConfRoot\GeoIP\GeoIP2-Country.mmdb"
 $geoLine = if (Test-Path $geoDb) {
     "SecGeoLookupDB $geoDb"
@@ -59,16 +57,8 @@ $geoLine = if (Test-Path $geoDb) {
 }
 
 $conf = Join-Path $ConfRoot "modsecurity-crs.conf"
-# Upstream "recommended" baseline config (provides the request-body processors
-# CRS relies on: rule 200000 XML, 200001/200006 JSON, plus 200002 parse-failure
-# handling, SecRequestBodyLimitAction, etc.). It ships `SecRuleEngine
-# DetectionOnly` and OVERRIDES our audit setup (SecAuditEngine RelevantOnly,
-# SecAuditLog /var/log/modsec_audit.log -- a Unix path), so we re-assert BOTH
-# the rule engine AND the audit settings AFTER the Include (libModSecurity takes
-# the LAST value for these directives). Without this Include, XML/JSON bodies are
-# never parsed into XML:/* / ARGS -- the root cause of ~100 historical CRS
-# exclusions. The file lives in the libmodsecurity submodule; the smoke-iis job
-# checks it out recursively so the path below resolves.
+# Upstream recommended baseline config. It ships SecRuleEngine DetectionOnly
+# and Unix audit paths, so we re-assert AFTER the Include.
 $recConf = (Join-Path $PSScriptRoot "..\libmodsecurity\modsecurity.conf-recommended") `
     -replace '\\', '/'
 if (-not (Test-Path $recConf)) {
@@ -77,34 +67,22 @@ if (-not (Test-Path $recConf)) {
 @"
 SecRuleEngine On
 SecRequestBodyAccess On
-# DEBUG (diag/single-body-test): enable response-body inspection so phase 4
-# evaluates RESPONSE_BODY. Combined with responseBodyBlock="true" on the
-# <ModSecurity> section, the connector engages Mode A (buffers the full body
-# and may BLOCK on phase-4 matches) instead of inspect-only.
+# Response-body inspection enabled (Mode A with responseBodyBlock=true).
 SecResponseBodyAccess On
-# DEBUG (diag/single-body-test): albedo /reflect echoes JSON with Content-Type
-# application/json. The default SecResponseBodyMimeType (text/plain text/html
-# text/xml) excludes application/json, so RESPONSE_BODY was NEVER populated for
-# these responses -> phase 4 rules (950150, 990130) had nothing to match. Add
-# application/json so the echo body is actually inspected.
+# Albedo echoes JSON; include it so phase-4 rules can inspect the body.
 SecResponseBodyMimeType text/plain text/html text/xml application/json application/javascript
 SecRequestBodyLimit 13107200
 SecRequestBodyNoFilesLimit 131072
-# Audit EVERYTHING (not RelevantOnly): go-ftw locates test boundaries via
-# X-CRS-Test marker requests that end in 200 -- under RelevantOnly those are
-# never audited and the runner cannot find its markers. Rule alerts (with
-# ids) land in the audit H part of every entry, which is what go-ftw greps.
+# Audit everything (not RelevantOnly): go-ftw locates test boundaries via
+# X-CRS-Test markers that end in 200 -- RelevantOnly never audited those.
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
 SecTmpDir $ConfRoot\data
 SecDataDir $ConfRoot\data
 $geoLine
-# Log marker required by go-ftw outside the CRS docker images (see go-ftw
-# README, "How log parsing works"): echoes the X-CRS-Test UUID into the log
-# and disables ALL other rules for marker requests. Loaded BEFORE the CRS
-# includes so it fires first in phase 1 and the removal takes effect before
-# any CRS rule runs -- otherwise PL4 matches would pollute no_expect_ids.
+# go-ftw log marker: echoes X-CRS-Test UUID, disables all other rules for
+# marker requests. Must load BEFORE CRS includes.
 SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
   "id:999999,\
   pass,\
@@ -112,85 +90,33 @@ SecRule REQUEST_HEADERS:X-CRS-Test "@rx ^.*$" \
   log,\
   msg:'X-CRS-Test %{MATCHED_VAR}',\
   ctl:ruleRemoveById=1-999999"
-# RESPONSE-95x/956x data-leak tests POST their leak payload (which is itself a
-# near-attack string, e.g. `[match sql-errors.data]...ODBC Syntax error...`) to
-# albedo's echo endpoint /reflect. With request-body parsing active (the
-# modsecurity.conf-recommended Include), those bodies match phase-2 ARGS rules
-# (942430/942431/942432 restricted-character, 932xxx, ...) -> anomaly score ->
-# 949110 blocks the request BEFORE albedo echoes it, so the phase-4 response
-# rule never fires and the test fails. No CRS regression test (930..956)
-# asserts an HTTP status -- they all only require the rule id in the log -- so
-# degrading the echo endpoint to DetectionOnly loses nothing except the
-# meaningless phase-2 block. Real blocking is still asserted by the [6/8]
-# SQLi/XSS probes, which hit "/", NOT /reflect. Must be phase 1 and BEFORE the
-# CRS includes so the engine switch applies to every later rule in this tx.
+# /reflect endpoint: degrade to DetectionOnly so phase-2 body parsing doesn't
+# block data-leak payloads before albedo can echo them. Phase 1, before CRS.
 SecRule REQUEST_URI "@rx ^/reflect([?].*)?$" \
   "id:990140,phase:1,pass,t:none,nolog,noauditlog,ctl:ruleEngine=DetectionOnly"
-# Raise the CRS paranoia level to 4 so the regression exercises EVERY rule
-# family. This MUST come BEFORE the includes and MUST say phase:1 explicitly:
-#   * CRS gates each paranoia block with a PAIR of skipAfter rules, one per
-#     phase (e.g. 942013 phase:1 / 942014 phase:2, both "PL @lt 2").
-#   * REQUEST-901-INITIALIZATION.conf rule 901125 (phase:1) defaults the level
-#     with "&TX:detection_paranoia_level @eq 0", i.e. only if not already set.
-# Emitted after the includes (and without a phase), these SecActions inherited
-# crs-setup.conf's last SecDefaultAction and ran at the END of phase 1 -- after
-# 901125 had already defaulted the level to 1 and after the phase:1 gates had
-# already fired skipAfter. Result: every phase:1 PL2+ rule was silently skipped
-# (942101 URI-path, 942152/942321 Referer/User-Agent, 942420/942421 Cookie all
-# showed ZERO audit hits), while phase:2 PL2-PL4 rules ran fine because the
-# variable was set by the time phase 2 started. Setting it here, before the
-# includes, makes 901125's "@eq 0" test false and both gates see 4.
-# We also fold in the request/body/arg tuning that the official CRS regression
-# suite (coreruleset/coreruleset@main/tests/regression, rule id 900005) pins
-# before running go-ftw -- arg/body length limits and UTF-8 validation that the
-# regression tests are written against. We deliberately DO NOT copy upstream's
-# `ctl:ruleEngine=DetectionOnly` (our run asserts real 403 blocks) nor
-# `ctl:ruleRemoveById=910000` (would only trim coverage). 901125 makes
-# detection_paranoia_level follow blocking_paranoia_level when unset, so setting
-# BPL=4 is sufficient, but we set DPL=4 explicitly too for robustness.
+# Paranoia level 4: exercise every CRS family. Must be phase:1 and BEFORE
+# includes (901125 defaults DPL only when unset). Body/arg tuning from the
+# official CRS regression suite (rule 900005).
 SecAction "id:990110,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.detection_paranoia_level=4,setvar:tx.blocking_paranoia_level=4,setvar:tx.crs_validate_utf8_encoding=1,setvar:tx.arg_name_length=100,setvar:tx.arg_length=400,setvar:tx.total_arg_length=64000,setvar:tx.max_num_args=255,setvar:tx.max_file_size=64100,setvar:tx.combined_file_sizes=65535"
-# Opt in to CRS 4.25.x XML ATTRIBUTE inspection. On the LTS branch this is a
-# runtime gate, not a config directive: rule 901180 (phase 1) defaults
-# tx.crs_xml_attr_inspect to 0 when it is unset, and rule 901181 (phase 2) then
-# applies ctl:ruleRemoveTargetByTag=<attack-protocol|attack-lfi|attack-rfi|
-# attack-rce|attack-php|attack-generic|attack-xss|attack-sqli|attack-fixation>;XML://@*
-# -- stripping the XML://@* target from every rule carrying one of those tags.
-# Such a rule then inspects only XML:/* (element text), so payloads hidden in
-# XML ATTRIBUTES are never examined and the rule silently never matches
-# (e.g. CRS test 930100-5 feeds its payload through the `probe` attribute).
-# CRS CI performs the same opt-in: tests/docker-compose.yml appends
-# `SecAction id:900511 ... setvar:tx.crs_xml_attr_inspect=1` to crs-setup.conf.
-# Must be phase 1 and must run BEFORE 901180, which only initializes the
-# variable when its count is still 0.
+# Opt in to CRS 4.25.x XML attribute inspection.
 SecAction "id:990120,phase:1,pass,t:none,nolog,noauditlog,setvar:tx.crs_xml_attr_inspect=1"
-# Load the upstream recommended baseline BEFORE the CRS includes. It sets
-# SecRuleEngine DetectionOnly (line 7) and OVERRIDES the audit settings above
-# (SecAuditEngine RelevantOnly, SecAuditLog /var/log/modsec_audit.log -- a Unix
-# path). We re-assert the rule engine AND the audit settings AFTER the Include,
-# since libModSecurity takes the LAST value for these directives.
+# Load upstream recommended baseline (sets SecRuleEngine DetectionOnly and
+# Unix audit paths). Re-assert engine and audit AFTER since libModSecurity
+# takes the LAST value.
 Include $recConf
 SecRuleEngine On
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
-# Shrink the audit log: I (compact request body) + E (response body) made each
-# transaction huge (~32 MB per full run). go-ftw slices the log between start
-# and end markers to check expect_ids, and under that write pressure a
-# transaction's entry can land OUTSIDE its slice -- the intermittent
-# "failed to run" flakes (run 33777809710: 955110-1 returned 200 and was
-# detected, yet 955110 was absent from the marker slice). H (rule ids) and F
-# (response headers) are what the assertions actually need.
+# H (rule ids) + F (response headers) only -- I/E caused ~32 MB per run and
+# marker-slice flakes.
 SecAuditLogParts ABCFHZ
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
 Include $(Join-Path $crsDir "rules\*.conf")
 Include $(Join-Path $crsDir "plugins\*-after.conf")
-# Relax the PL4 strict request-byte-range rule 920273 so JSON / space-bearing
-# request bodies are NOT denied at phase 2 before /reflect can echo the body
-# for the RESPONSE-95x data-leak tests. This is a debug-only relaxation: at
-# PL1 -- the level the official CRS regression runs at -- 920273 is inactive,
-# so this makes PL4 behave like PL1 for transport.
+# Relax PL4 byte-range rule 920273 so /reflect data-leak tests aren't blocked.
 SecRuleRemoveById 920273
 
 "@ | Set-Content $conf -Encoding Ascii
@@ -202,9 +128,7 @@ Write-Host "[2/8] Engine config written ($conf)"
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
 # go-ftw targets http://localhost (port 80) by default. Delete the Default
-# Web Site outright -- a later iisreset would otherwise bring it back up and
-# it would win the race for the :80 binding (observed: requests silently
-# landed in C:\inetpub\wwwroot, bypassing both the WAF and this site).
+# Web Site to win the :80 binding race.
 & $appcmd delete site "Default Web Site" 2>$null | Out-Null
 & $appcmd set site $SiteName /bindings:"http/*:80:"
 & $appcmd start site $SiteName
@@ -217,7 +141,6 @@ foreach ($i in 1..30) {
 }
 
 # Assert THIS site owns port 80 before anything else depends on it.
-$own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
            -SkipHttpErrorCheck -TimeoutSec 10
 if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsectest") {
     throw "port-80 ownership check failed ($($own.StatusCode)); ModSecTest is not serving localhost."
@@ -229,9 +152,7 @@ choco install urlrewrite iis-arr -y --no-progress | Out-Null
 & $appcmd set config /section:system.webServer/proxy /enabled:true
 if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
 
-# IMPORTANT: keep the site-level <ModSecurity> element -- overwriting
-# web.config without it silently disables the module (GetConfig finds no
-# section and skips securing entirely; observed as zero audit output).
+# IMPORTANT: keep the site-level <ModSecurity> element in web.config.
 @'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
@@ -258,10 +179,7 @@ foreach ($i in 1..30) {
 Write-Host "[4/8] URL Rewrite + ARR installed, proxy enabled."
 
 # --- 5) go-ftw + albedo ----------------------------------------------------------
-# Skip `go install` when the binary is already on PATH (restored from the
-# cached GOPATH/bin by the "Cache Go tools" workflow step). `go install ...@latest`
-# always rebuilds from source, so the guard is what actually makes the cache pay
-# off; on a cold cache the install still runs.
+# Skip `go install` when the binary is already on PATH (cached).
 if (Get-Command go-ftw -ErrorAction SilentlyContinue) {
     Write-Host "[5/8] go-ftw already on PATH (cached) -- skipping install."
 } else {
@@ -304,9 +222,7 @@ function Write-ProbeDiagnostics {
 }
 
 function New-GlobalProxyRule {
-    # Promote the proxy rule to a GLOBAL rewrite rule (applicationHost.config,
-    # evaluated in BeginRequest) -- site-level distributed rules proved
-    # unreliable in this environment.
+    # Promote the proxy rule to a GLOBAL rewrite rule in applicationHost.config.
     $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
     [xml]$doc = Get-Content $ahConfig
     $sws = $doc.configuration."system.webServer"
@@ -393,72 +309,24 @@ if ($newSlice -notmatch '\[id "941\d{3}"\]') {
 Write-Host "[6/8] sanity: SQLi/XSS logged by CRS in audit log (or not -- see WARN above)."
 
 # --- 7) go-ftw over the full IIS-feasible CRS family set -------------------------
-# Policy: maximize the NUMBER of CRS families exercised while keeping CI green,
-# WITHOUT turning whole families off. The CRS regression runs at IIS DEFAULTS (we
-# do NOT relax Request Filtering -- allowDoubleEscaping / maxUrl / maxQueryString
-# -- to make tests pass; any request IIS rejects itself, e.g. 404.11 double-escape,
-# 404.14/404.15 length, 400 malformed protocol, is genuinely not seen by the WAF
-# and is excluded by design).
-#
-# The full suite exercises EVERY IIS-feasible CRS family (no blanket --exclude).
 # Every failing sub-test is hard-excluded via scripts/crs_ignore.txt using
-# go-ftw's testoverride.ignore mechanism (see below), which marks the test Ignored
-# (not Failed) BEFORE the request is sent. This
-# keeps CI green (go-ftw exits 0 once every failure is ignored) while still
-# exercising every family's PASSING sub-tests -- maximizing coverage.
-#
-# Families once excluded (now INCLUDED -- see run 33882128480):
-#   920xxx / 921xxx / 980xxx were historically --exclude'd (http.sys rejects
-#     malformed PROTOCOL requests; 980170 never fires under v3). They are now run
-#     in full; only ~28 specific sub-tests are ignored (see scripts/crs_ignore.txt).
-#   959xxx: was listed here but the --exclude regex only ever covered 920/921/980,
-#     so 959 already ran and passes under IIS defaults -- no action needed.
-#
-# CRITICAL ROOT-CAUSE FIX (this change): libModSecurity v3 does NOT auto-detect
-# XML/JSON request-body types -- Transaction::addRequestHeader() only sets the body
-# processor for multipart/form-data and application/x-www-form-urlencoded. XML/JSON
-# processors are enabled ONLY by the upstream recommended config (rules 200000 XML,
-# 200001/200006 JSON). That config was never Included before, so XML/JSON bodies
-# were never parsed into XML:/* or ARGS -- ~100 of the historical exclusions were
-# simply body-parse misses, NOT a connector bug. We now Include
-# modsecurity.conf-recommended (see the Include above) and re-assert SecRuleEngine
-# On + the audit settings it overrides. With that, exclusions dropped 341 -> 245
-# (measured, run 33402239005). The connector body-read code itself is correct: the
-# full entity body is forwarded to the engine before processRequestBody().
-#
-# The REMAINING failures are genuine IIS-connector request-body inspection
-# gaps plus http.sys pre-WAF rejections (404.11/14/15) and a few upstream-
-# intended denials (recommended rule 200002 "failed to parse request body ->
-# deny 400" fires on malformed multipart/form-data). See
-# scripts/crs_ignore.txt header for the full breakdown. To regenerate: run CI
-# with $MeasureMode = $false, harvest the failing ids into crs_ignore.txt.
+# go-ftw's testoverride.ignore mechanism. The full suite exercises EVERY
+# IIS-feasible CRS family (no blanket --exclude).
 #
 # MEASUREMENT OVERRIDE: set $true to skip testoverride.ignore entirely and
-# measure the raw failure count. Default (green CI) run uses
-# scripts/crs_ignore.txt -- refreshed after the response phase fix (d228cb6)
-# and the merge of master's XML-attribute/body-parse opt-ins.
+# measure the raw failure count.
 $MeasureMode = $false
-# empty = run the FULL IIS-feasible suite (every family, including 920/921/980).
-# Set to e.g. '^950150-1$' (or '^(92[01]|980)' for just the formerly-excluded
-# families) to debug a single test / family via --include.
+# empty = run the FULL IIS-feasible suite. Set to e.g. '^950150-1$' to debug
+# a single test via --include.
 $SingleTest = ''
 $includeRegex = $SingleTest
 
 $ftwConfig = Join-Path $ConfRoot "ftw.yaml"
 $auditPathForYaml = (Join-Path $auditDir "audit.log") -replace '\\', '/'
-# Hardcoded per-sub-test exclusions. go-ftw matches the FULL test id, e.g.
-# "942100-15". IMPORTANT: go-ftw's config `exclude:` key CANNOT override the
-# `--include` flag -- in needToSkipTest() a test matched by --include is never
-# skipped, so an `exclude:` entry for a sub-test inside an included family is
-# silently ignored and the sub-test still runs (and fails). The correct
-# "permanent exclusion" mechanism is `testoverride.ignore`, which
-# overriddenTestResult() evaluates BEFORE the request is sent and marks the
-# test Ignored (not Failed), independently of --include.
-# The ids live in scripts/crs_ignore.txt (one id per line; 69 as of run
-# 33892666964). To regenerate: run CI in measurement mode ($MeasureMode = $true),
-# harvest the failing `<id>` list (go-ftw prints "<id> failed" / "<id> failed to
-# run") into scripts/crs_ignore.txt. Every id here makes the run green (the test
-# is Ignored, not Failed); any failing sub-test NOT listed here turns CI red.
+# Hardcoded per-sub-test exclusions via testoverride.ignore (NOT the
+# config-level exclude: key, which cannot override --include).
+# The ids live in scripts/crs_ignore.txt. To regenerate: run CI with
+# $MeasureMode = $true, harvest failing ids into crs_ignore.txt.
 $ignoreFile = Join-Path $PSScriptRoot "crs_ignore.txt"
 # crs_ignore.txt may contain `#` comment / section-header lines; only treat
 # lines matching <rule>-<sub> (e.g. "942100-15") as exclusions.
@@ -496,62 +364,32 @@ if ($MeasureMode) {
 } else {
     Write-Host "[7/8] Running go-ftw (all families, exclusions applied)..."
 }
-# Default output (NOT -o github) so the complete failure reason for "failed to
-# run" is captured -- the github format collapses it to a placeholder.
-# --debug was decisive for the single-test diagnostics (it prints the real
-# "Failed to find IDs in the log" instead of a one-line summary) but produces
-# per-request request/response dumps, which is unmanageable across 4883 tests,
-# so it is only enabled for single-test debug runs.
+# Default output (NOT -o github) so the complete failure reason is captured.
 $ftwArgs = @('run', '-d', $testsDir, '--config', $ftwConfig)
-# Default is 500 lines: with SecAuditEngine On over 4883 tests the audit log
-# grows far faster than that and go-ftw aborts mid-run with "Error:
-# retry-once" (observed at 980170-1 in run 33745710564). 20000 comfortably
-# covers the inter-marker distance of the full suite.
+# Default is 500 lines; with SecAuditEngine On over 4883 tests the audit log
+# grows far faster and go-ftw aborts mid-run. 20000 covers the suite.
 $ftwArgs += @('--max-marker-log-lines', '20000')
-# Throttle to 1 request per 30ms (~33 req/s vs ~90 req/s unthrottled). go-ftw
-# opens a NEW raw TCP connection per request (ftwhttp has no keep-alive pool,
-# ftwhttp/client.go closes + re-dials every request), so the full suite fires
-# ~5-6k short-lived loopback connections in ~1 minute. That churn intermittently
-# exhausts Windows ephemeral ports / overflows the listen backlog -> ~1 quick
-# (~10-25ms) "failed to run" transport flake per run. Pacing the requests lets
-# TIME_WAIT entries drain between them: root-cause mitigation for the transport
-# flakes instead of ignoring their ids (951200-1/955120-2 were un-ignored in the
-# same change to prove this fix; re-add them only if the flakes come back).
+# Throttle to ~33 req/s. go-ftw opens a new TCP connection per request, so
+# the full suite fires ~5-6k connections in ~1 minute. Pacing lets
+# TIME_WAIT entries drain, mitigating ephemeral-port exhaustion flakes.
 $ftwArgs += @('--rate-limit', '30ms')
-# 920/921 (Protocol Enforcement/Attack) and 980 (CORRELATION) were once --exclude'd
-# outright. Measured on branch verify/excluded-families (run 33882128480): under
-# IIS defaults these families are ~96% green -- most 920/921 PROTOCOL tests expect
-# exactly the 400 http.sys returns, and 980 passes except 980170 (v3 noauditlog
-# never writes the entry). Only a handful of sub-tests genuinely fail:
-#   * 920/921 connection-level tests (http.sys rejects/hangs the malformed request)
-#   * 980170-1/2/3 (phase-5 reporting rule never fires under this connector)
-# 920410-1 / 920390-1 can HANG the connection (observed 33747110589 / 33748330919),
-# which makes go-ftw abort the whole run -- they are ignored for that reason.
-# All such sub-tests are listed in scripts/crs_ignore.txt (testoverride.ignore),
-# so the FULL suite now exercises 920/921/980 instead of skipping them. With no
-# blanket --exclude, single-test debug runs still pass --include (go-ftw v1.3
-# refuses to combine --include with --exclude, "you need to choose one").
+# 920/921 (Protocol Enforcement/Attack) and 980 (CORRELATION): full suite now
+# exercises these families instead of skipping them. Only specific sub-tests
+# are ignored (see scripts/crs_ignore.txt).
 if ($includeRegex -ne '') {
     $ftwArgs += @('--include', $includeRegex)
 } else {
-    # Full-suite run: exercise EVERY CRS family, including 920/921/980.
-    # Per-sub-test failures are hard-excluded via scripts/crs_ignore.txt, not by
-    # a blanket --exclude here.
+    # Full-suite run: exercise EVERY CRS family.
 }
-# Full-suite runs print one line per test (~4300 "✔ passed" lines -> ~900KB of
-# CI log). Only the failures matter for the gate; --show-failures-only keeps the
-# log down to the summary plus whatever actually failed. Single-test debug runs
-# keep the per-test lines (there is only one).
+# Full-suite runs print one line per test (~4300 lines). Only failures matter;
+# --show-failures-only keeps the log compact.
 if ($SingleTest -eq '') { $ftwArgs += '--show-failures-only' }
 if ($SingleTest -ne '' -or $env:MODSEC_IIS_FTW_DEBUG -eq '1' -or $env:MODSEC_IIS_FTW_DEBUG -ieq 'true') { $ftwArgs += '--debug' }
-# go-ftw stdout goes ONLY into go-ftw-output.txt (uploaded as the crs-ftw-logs
-# artifact), never to the run log: a full-suite --debug run would otherwise
-# dump every request/response into the run log (~tens of MB). The run log gets
-# the compact summary below instead; the full detail lives in the artifact.
+# go-ftw stdout goes ONLY into go-ftw-output.txt (uploaded as artifact),
+# never to the run log.
 & $ftwExe @ftwArgs 2>&1 | Out-File -FilePath "$PWD\go-ftw-output.txt" -Encoding utf8
 $ftwCode = $LASTEXITCODE
-# Compact per-test rollup for the run log: passed/failed/skipped counts and the
-# failing test ids (detail is in go-ftw-output.txt).
+# Compact per-test rollup for the run log.
 $gOut = Get-Content "$PWD\go-ftw-output.txt" -ErrorAction SilentlyContinue
 $fails = $gOut | Select-String -Pattern 'failed (in|to run)|failed: \d' | ForEach-Object { $_.Line } |
          Where-Object { $_ -notmatch 'go-ftw output|Starting|Running go-ftw' }
@@ -562,22 +400,15 @@ if ($fails) {
     $fails | Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.Trim())" }
 }
 Write-Host "go-ftw exit code: $ftwCode"
-Write-Host "go-ftw exit code: $ftwCode"
 
 $auditSrc = Join-Path $auditDir "audit.log"
 Copy-Item $auditSrc "$PWD\modsec_crs_audit.log" -Force -ErrorAction SilentlyContinue
 
 # --- 7a) opt-in diagnostic capability (default OFF) ------------------------
-# IIS Failed Request Tracing (FREB): logs a NOTIFY_MODULE_START/END pair for
-# every module on every pipeline notification, so it shows from IIS's own point
-# of view whether ModSecurityIIS's response handlers are invoked. It costs a
-# Windows feature install + a full iisreset. PROVEN LIMITATION: after
-# Enable-WindowsOptionalFeature IIS-HttpTracing the box is in a servicing-pending
-# state where iisreset can no longer bring the site up -- tried BEFORE the first
-# iisreset (run 33776649545: connection refused at the [3/8] ownership check) and
-# mid-run before go-ftw (run 33773592685: site stayed down, go-ftw could not
-# connect). So FREB can only be enabled AFTER go-ftw -- it captures the manual
-# probes only, never the suite. Still useful for targeted probes, so it stays.
+# IIS Failed Request Tracing (FREB). PROVEN LIMITATION: after enabling
+# IIS-HttpTracing the box is servicing-pending and iisreset cannot bring the
+# site up. So FREB can only be enabled AFTER go-ftw -- it captures manual
+# probes only, never the suite.
 $frebOn = ($env:MODSEC_IIS_FREB -eq '1') -or ($env:MODSEC_IIS_FREB -ieq 'true')
 if ($frebOn) {
     $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
@@ -585,7 +416,6 @@ if ($frebOn) {
     Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
     try {
         # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics.
-        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
             -NoRestart -ErrorAction Stop | Out-Null
         Write-Host "[7a/8] IIS-HttpTracing feature enabled."
     } catch {
@@ -630,8 +460,7 @@ if ($frebOn) {
     } catch {
         Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
     }
-    # This script runs with $ErrorActionPreference = "Stop": a single error line
-    # from iisreset becomes a terminating error. Wrap and keep it non-fatal.
+    # iisreset /start returns immediately; wait until W3SVC is really up.
     $eap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -647,7 +476,6 @@ if ($frebOn) {
         Start-Sleep -Seconds 1
     }
     # W3SVC Running is NOT enough: start the site and wait until it answers.
-    & $appcmd start site $SiteName 2>&1 | Out-Null
     $up = $false
     foreach ($i in 1..30) {
         try {
@@ -693,9 +521,7 @@ if ($MeasureMode) {
     Write-Host "--- go-ftw raw failure list (MEASUREMENT) ---"
     Select-String -Pattern "failed to run:" -Path "$PWD\go-ftw-output.txt" | ForEach-Object { $_.Line }
 } else {
-    # Dumping the whole audit log here balloons the CI log to ~67 MB (run
-    # 33751539867). Instead print a compact rollup: rule ids that fired, by
-    # frequency -- the file itself is uploaded as modsec_crs_audit.log anyway.
+    # Dumping the whole log balloons CI log to ~67 MB. Print compact rollup.
     Write-Host "--- CRS audit rule-id rollup (top 25) ---"
     if (Test-Path $auditSrc) {
         $ids = Select-String -Path $auditSrc -Pattern '\[id "(\d+)"\]' -AllMatches |
@@ -718,13 +544,8 @@ if ($bad) {
 }
 Write-Host "[8/8] Event log clean."
 
-# go-ftw result gating: ON by default (a real regression turns the run red).
-# Intermittent transport flakes (a different sub-test every ~run) would
-# otherwise page with a failure notification each time; for diagnostic runs
-# only, set MODSEC_IIS_NO_GATE=1 to exit 0 and leave the failures in the log
-# and the go-ftw-output.txt / modsec_crs_audit.log artifacts. Genuine
-# engine/config breakage still hard-fails regardless via [6/8] (blocking
-# probes), [7b/8] (phase-4 sentinel) and [8/8] (event-log hygiene).
+# go-ftw result gating: ON by default. For diagnostic runs, set
+# MODSEC_IIS_NO_GATE=1 to exit 0 and leave failures in the log.
 if ($env:MODSEC_IIS_NO_GATE -eq '1' -or $env:MODSEC_IIS_NO_GATE -ieq 'true') {
     if ($ftwCode -ne 0) {
         Write-Host "[9/8] WARNING: go-ftw exit=$ftwCode (MODSEC_IIS_NO_GATE=1, NOT gating). See go-ftw-output.txt."

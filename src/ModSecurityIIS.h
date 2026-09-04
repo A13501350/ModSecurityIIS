@@ -61,42 +61,25 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 
     modsecurity::Transaction*           m_pTx;
     IHttpContext*                       m_pHttpContext;
-    // Keeps the RulesSet alive for the lifetime of this transaction. The engine
-    // caches RulesSet objects by config-file path; holding a shared_ptr here
-    // lets the cache safely reload (and free the old copy) without dangling the
-    // raw pointer the Transaction was constructed with.
+    // Keeps the RulesSet alive for the lifetime of this transaction.
     std::shared_ptr<modsecurity::RulesSet> m_pRules;
-    // RQ_SEND_RESPONSE can fire several times per request (every explicit
-    // handler Flush/SendResponse). Response headers must be fed to the
-    // transaction exactly once; entity chunks are delivered incrementally,
-    // one batch per notification.
+    // RQ_SEND_RESPONSE can fire several times per request. Response headers
+    // must be fed exactly once.
     bool                      m_ResponseHeadersFed;
-    // Mirrors the IIS <system.webServer/ModSecurity @responseBodyBlock> switch
-    // for this request. When true (and response-body access + rule engine are
-    // enabled) the connector buffers the full body and may BLOCK responses;
-    // when false the response is inspected but never blocked.
+    // Mirrors the IIS <responseBodyBlock> switch. When true and response-body
+    // access + rule engine are enabled, the connector may block responses.
     bool                      m_ResponseBodyBlock;
-    // Set once phase-4 has been evaluated in OnSendResponse (Mode A), so
-    // OnPostEndRequest skips the deferred re-evaluation.
+    // Set once phase-4 has been evaluated in OnSendResponse (Mode A).
     bool                      m_ResponseBodyEvaluated;
-    // HTTP version of the request line ("HTTP/1.1", "HTTP/2", ...). The
-    // response protocol mirrors the request protocol, so it is reused when
-    // feeding Transaction::processResponseHeaders.
+    // HTTP version of the request line ("HTTP/1.1", "HTTP/2", ...).
     std::string               m_Protocol;
 
-    // --- entity-body read state ----------------------------------------------
+    // --- entity-body read state ---
     // The entity body is drained chunk by chunk into m_Body and handed back to
-    // IIS with a SINGLE InsertEntityBody() once the body is complete. Rationale:
-    //   * InsertEntityBody() inserts BEFORE any remaining unread entity body, so
-    //     calling it while we are still reading would make the next
-    //     ReadEntityBody return our own copy (duplication / endless loop).
-    //   * IIS does not copy the buffer -- it must live until the end of the
-    //     request, so the final insert uses request-scoped memory
-    //     (IHttpContext::AllocateRequestMemory), never the read buffer.
+    // IIS with a SINGLE InsertEntityBody() once the body is complete.
     std::vector<char>         m_Body;
     char                      m_ReadBuf[65536];
-    // True while an asynchronous ReadEntityBody() is in flight. OnAsyncCompletion
-    // uses it to tell our own completions apart from any other async operation.
+    // True while an async ReadEntityBody() is in flight.
     bool                      m_BodyReadActive;
 };
 
@@ -124,13 +107,8 @@ public:
         IN IHttpEventProvider * pProvider
     );
 
-    // Called by IIS when an asynchronous operation started from OnBeginRequest
-    // completes -- that is how the entity body is drained without ever blocking a
-    // worker thread. Only operations WE started are handled (RQ_BEGIN_REQUEST,
-    // non-post, with a read of ours in flight); everything else is passed back
-    // untouched. The status is returned directly from here: PostCompletion() is
-    // deliberately NOT used, because that is for module-owned async work and
-    // would double-signal this IIS-tracked I/O.
+    // Called by IIS when an async operation from OnBeginRequest completes.
+    // Only handles RQ_BEGIN_REQUEST completions with a read of ours in flight.
     REQUEST_NOTIFICATION_STATUS
     OnAsyncCompletion(
         IN IHttpContext * pHttpContext,
