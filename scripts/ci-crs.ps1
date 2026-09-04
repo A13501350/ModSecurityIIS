@@ -173,7 +173,14 @@ SecRuleEngine On
 SecAuditEngine On
 SecAuditLog $auditDir\audit.log
 SecAuditLogType Serial
-SecAuditLogParts ABIJDEFHZ
+# Shrink the audit log: I (compact request body) + E (response body) made each
+# transaction huge (~32 MB per full run). go-ftw slices the log between start
+# and end markers to check expect_ids, and under that write pressure a
+# transaction's entry can land OUTSIDE its slice -- the intermittent
+# "failed to run" flakes (run 33777809710: 955110-1 returned 200 and was
+# detected, yet 955110 was absent from the marker slice). H (rule ids) and F
+# (response headers) are what the assertions actually need.
+SecAuditLogParts ABCFHZ
 Include $(Join-Path $crsDir "crs-setup.conf")
 Include $(Join-Path $crsDir "plugins\*-config.conf")
 Include $(Join-Path $crsDir "plugins\*-before.conf")
