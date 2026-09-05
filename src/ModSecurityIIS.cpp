@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <new>
 #include <exception>
 #include <cstdio>
@@ -243,6 +245,25 @@ static void ReportException(const char* where, const char* what) noexcept
                 where != NULL ? where : "?",
                 what != NULL ? what : "unknown error");
     iis::WriteEventViewerLog(buf, EVENTLOG_ERROR_TYPE);
+}
+
+// Report the FIRST occurrence of a repeating per-request failure, once per
+// process. Failing to load rules/config is a condition every request would
+// hit; writing an event per request floods the Application log (itself a DoS
+// surface) without adding information beyond the first entry.
+static void ReportOnce(const char* key, const char* message)
+{
+    static std::mutex s_mutex;
+    static std::unordered_set<std::string> s_seen;
+    if (key == NULL || message == NULL)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (s_seen.insert(std::string(key)).second)
+    {
+        iis::WriteEventViewerLog(message, EVENTLOG_ERROR_TYPE);
+    }
 }
 
 // DEBUG: append-only file trace to prove response-phase handlers are invoked.
@@ -804,10 +825,9 @@ CMyHttpModule::OnBeginRequest(
     {
     // The configuration could not be read. Fail-closed by default:
     // serving the request unprotected bypasses all rules.
-    WriteEventViewerLog(
+    ReportOnce("config-read",
             "ModSecurityIIS: failed to read module configuration; "
-            "failing closed (request rejected).",
-            EVENTLOG_ERROR_TYPE);
+            "failing closed (request rejected).");
         if (!ConfigFailClosed())
         {
             hr = S_OK;          // operator opted out -> pass through
@@ -837,7 +857,9 @@ CMyHttpModule::OnBeginRequest(
     std::shared_ptr<modsecurity::RulesSet> rules = iis::getRules(configFile, &rulesErr);
     if (rules == nullptr)
     {
-        WriteEventViewerLog(rulesErr.c_str(), EVENTLOG_ERROR_TYPE);
+        std::string msg = "ModSecurityIIS: failed to load rules from '"
+                          + configFile + "': " + rulesErr;
+        ReportOnce("rules-load", msg.c_str());
         break;
     }
 
