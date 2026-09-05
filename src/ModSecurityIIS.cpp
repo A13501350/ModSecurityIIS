@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <charconv>
+#include <system_error>
 #include <atomic>
 #include <new>
 #include <exception>
@@ -148,8 +150,13 @@ static size_t GetMaxInspectBodyBytes()
                                           buf, (DWORD)sizeof(buf));
         if (n > 0 && n < (DWORD)sizeof(buf))
         {
-            unsigned long long x = _strtoui64(buf, NULL, 10);
-            if (x > 0) v = (size_t)x;
+            // from_chars rejects trailing/leading garbage strtoui64 accepts.
+            unsigned long long x = 0;
+            const auto res = std::from_chars(buf, buf + n, x);
+            if (res.ec == std::errc() && res.ptr == buf + n && x > 0)
+            {
+                v = (size_t)x;
+            }
         }
         return v;
     }();
@@ -611,8 +618,14 @@ static EntityBodyInfo GetEntityBodyInfo(HTTP_REQUEST* req)
     }
     memcpy(tmp, cl.pRawValue, n);
     tmp[n] = '\0';
-    info.length  = _strtoui64(tmp, NULL, 10);
-    info.hasBody = (info.length > 0);
+    // Whole buffer must be a valid number, else treat the body as absent.
+    unsigned long long x = 0;
+    const auto res = std::from_chars(tmp, tmp + n, x);
+    if (res.ec == std::errc() && res.ptr == tmp + n && x > 0)
+    {
+        info.length  = x;
+        info.hasBody = true;
+    }
     return info;
 }
 
