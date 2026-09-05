@@ -1,6 +1,7 @@
 // ModSecurityIIS -- native IIS 7+ module built on libModSecurity v3.
 //
-// Flow: RegisterModule -> OnBeginRequest -> OnSendResponse -> OnPostEndRequest
+// Flow: RegisterModule -> OnBeginRequest -> OnAsyncCompletion (async entity
+// body reads) -> OnSendResponse -> OnPostEndRequest
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -43,6 +44,13 @@ static std::string WToUtf8(const WCHAR* w, int byteLen)
 {
     if (w == nullptr || byteLen <= 0)
     {
+        return "";
+    }
+    if (byteLen % (int)sizeof(WCHAR) != 0)
+    {
+        // A dangling byte means the input is not a whole number of UTF-16
+        // units; refuse it rather than let the integer division silently
+        // drop the tail.
         return "";
     }
     int wlen = byteLen / (int)sizeof(WCHAR);
@@ -220,6 +228,15 @@ static void ReportException(const char* where, const char* what) noexcept
 
 // DEBUG: append-only file trace to prove response-phase handlers are invoked.
 // Writes only when MODSEC_IIS_TRACE env var is set (non-empty, not "0").
+//
+// Known limitations, accepted ON PURPOSE because this is a debug-only
+// facility (do not "fix" without rethinking the facility):
+//   * g_iisTraceEnabled lazy init is a data race in the C++-standard sense;
+//     benign here (int read/write, every racer computes the same value).
+//   * IisTrace() fopen/fclose per call is syscall-heavy -- acceptable since
+//     tracing is opt-in and off in production.
+//   * Trace paths are hardcoded to C:/inetpub/logs/...; on non-default IIS
+//     installs fopen silently fails (NULL -> no write).
 static int g_iisTraceEnabled = -1;
 
 static bool IisTraceEnabled()
@@ -290,7 +307,10 @@ static void AppendResponseFileChunk(modsecurity::Transaction* tx,
         if (length == (ULONGLONG)HTTP_BYTE_RANGE_TO_EOF)
         {
             LARGE_INTEGER fs;
-            length = GetFileSizeEx(hDup, &fs)
+            // start beyond EOF (or at it): nothing to inspect. Without the
+            // explicit clamp the unsigned subtraction would underflow into a
+            // huge range that only the later zero-byte ReadFile bails out.
+            length = (GetFileSizeEx(hDup, &fs) && fs.QuadPart > li.QuadPart)
                          ? (ULONGLONG)(fs.QuadPart - li.QuadPart)
                          : 0;
         }
@@ -397,6 +417,9 @@ static bool ApplyIntervention(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
     // A disruptive action was requested. Prefer a redirect when the rule
     // supplied one; otherwise honor the explicit status (defaulting to 403).
     IHttpResponse* pResponse = pHttpContext->GetResponse();
+    // Clear() deliberately wipes headers and entity other modules may have
+    // set: a WAF block response must not leak any upstream content (cached
+    // body fragments, headers added earlier in the pipeline).
     pResponse->Clear();
     int finalStatus = status;
     if (!redirectUrl.empty())
@@ -659,7 +682,17 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                 memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
                 pRequest->InsertEntityBody(pBody, (DWORD)rsc->m_Body.size());
             }
-            // Allocation failure: forward an empty body. Never fail here.
+            else
+            {
+                // Allocation failure: forward an empty body rather than fail
+                // the request, but leave a trace -- a silent empty-body POST
+                // reaching the backend is near-impossible to debug there.
+                iis::WriteEventViewerLog(
+                    "ModSecurityIIS: AllocateRequestMemory failed while "
+                    "re-forwarding the request body; the handler sees an "
+                    "EMPTY body for this request",
+                    EVENTLOG_ERROR_TYPE);
+            }
         }
 
         // Feed the body to the engine, bounded to cap memory use.
@@ -814,6 +847,12 @@ CMyHttpModule::OnBeginRequest(
     }
 
     HTTP_REQUEST* req = pRequest->GetRawHttpRequest();
+    if (req == NULL)
+    {
+        // Defensive: IIS contractually provides the raw request here; guard
+        // anyway so a NULL cannot take the worker down.
+        break;
+    }
 
     // --- connection ---
     PSOCKADDR pRemote = pRequest->GetRemoteAddress();
@@ -842,7 +881,9 @@ CMyHttpModule::OnBeginRequest(
     {
         std::string path = WToUtf8(req->CookedUrl.pAbsPath, req->CookedUrl.AbsPathLength);
         uri = path;
-        if (req->CookedUrl.QueryStringLength > 0)
+        // A lone "?" is not a query string; requiring a full WCHAR keeps the
+        // subtraction below from underflowing.
+        if (req->CookedUrl.QueryStringLength >= sizeof(WCHAR))
         {
             uri += "?";
             uri += WToUtf8(req->CookedUrl.pQueryString + 1,
@@ -1069,7 +1110,18 @@ CMyHttpModule::OnSendResponse(
 
     modsecurity::Transaction* tx = rsc->m_pTx;
     IHttpResponse*             pResponse = pHttpContext->GetResponse();
-    HTTP_RESPONSE*             pRaw      = pResponse->GetRawHttpResponse();
+    HTTP_RESPONSE*             pRaw      = (pResponse != NULL)
+                                            ? pResponse->GetRawHttpResponse()
+                                            : NULL;
+    if (pResponse == NULL || pRaw == NULL)
+    {
+        // Defensive: IIS provides a response object on every
+        // RQ_SEND_RESPONSE, but nothing in the contract guarantees the raw
+        // view is available (e.g. kernel-mode send paths). Without it there
+        // is nothing to inspect -- skip the response phases entirely rather
+        // than dereference NULL and take the worker down.
+        break;
+    }
 
     // --- response headers ---
     // Fed exactly once: RQ_SEND_RESPONSE fires again for every handler flush,
@@ -1221,8 +1273,10 @@ CMyHttpModule::OnSendResponse(
             {
                 CHAR szLength[21];
                 ZeroMemory(szLength, sizeof(szLength));
+                // %Iu + size_t: the cap is env-tunable, so respInspected can
+                // exceed 2 GiB where an (int) cast would go negative.
                 StringCchPrintfA(szLength, sizeof(szLength) / sizeof(CHAR) - 1,
-                                 "%d", (int)respInspected);
+                                 "%Iu", respInspected);
                 pHttpContext->GetResponse()->SetHeader(HttpHeaderContentLength,
                                                        szLength,
                                                        (USHORT)strlen(szLength),
