@@ -624,6 +624,17 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         {
             return FinishBodyRead(rsc, pHttpContext);
         }
+        // Accumulation cap: the engine never inspects past maxInspect bytes
+        // (GetMaxInspectBodyBytes), so holding more only burns memory -- with a
+        // chunked upload (no Content-Length) m_Body would otherwise grow until
+        // EOF and exhaust the worker's memory before the engine's
+        // SecRequestBodyLimit can apply. Stop here: the unread remainder stays
+        // on the connection, and the handler still receives the FULL body
+        // (FinishBodyRead re-inserts our prefix BEFORE that remainder).
+        if (rsc->m_Body.size() >= GetMaxInspectBodyBytes())
+        {
+            return FinishBodyRead(rsc, pHttpContext);
+        }
         // Otherwise loop for the next chunk.
     }
 }
@@ -633,9 +644,11 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 {
     try
     {
-        // Hand the FULL body back to the downstream handler via a single
-        // InsertEntityBody(). Must use request-scoped memory (IIS does not
-        // copy the buffer).
+        // Hand the accumulated body back to the downstream handler via a
+        // single InsertEntityBody(). When the accumulation cap engaged this is
+        // a PREFIX of the entity: IIS inserts it BEFORE the unread remainder,
+        // so the handler still receives the complete body. Must use
+        // request-scoped memory (IIS does not copy the buffer).
         IHttpRequest* pRequest = pHttpContext->GetRequest();
         if (pRequest != NULL && !rsc->m_Body.empty())
         {
