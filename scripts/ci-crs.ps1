@@ -141,6 +141,7 @@ foreach ($i in 1..30) {
 }
 
 # Assert THIS site owns port 80 before anything else depends on it.
+$own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
            -SkipHttpErrorCheck -TimeoutSec 10
 if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsectest") {
     throw "port-80 ownership check failed ($($own.StatusCode)); ModSecTest is not serving localhost."
@@ -416,6 +417,7 @@ if ($frebOn) {
     Write-Host "[7a/8] enabling IIS Failed Request Tracing -> $frebDir"
     try {
         # -All is required: IIS-HttpTracing sits under IIS-HealthAndDiagnostics.
+        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
             -NoRestart -ErrorAction Stop | Out-Null
         Write-Host "[7a/8] IIS-HttpTracing feature enabled."
     } catch {
@@ -476,6 +478,7 @@ if ($frebOn) {
         Start-Sleep -Seconds 1
     }
     # W3SVC Running is NOT enough: start the site and wait until it answers.
+    & $appcmd start site $SiteName 2>&1 | Out-Null
     $up = $false
     foreach ($i in 1..30) {
         try {

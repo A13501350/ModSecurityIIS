@@ -245,6 +245,7 @@ function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
     $script:diagN++
     $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
     # Save status line + headers + first 2 KiB of body for post-mortem.
+    $code = & $curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
                 -w "%{http_code}" 2>$null
     "--- STATUS: $code ---" | Add-Content $out
     Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
