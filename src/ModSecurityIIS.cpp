@@ -379,13 +379,30 @@ static PCSTR StandardReason(int status)
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 406: return "Not Acceptable";
+    case 407: return "Proxy Authentication Required";
     case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 411: return "Length Required";
+    case 412: return "Precondition Failed";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
+    case 415: return "Unsupported Media Type";
+    case 416: return "Range Not Satisfiable";
+    case 418: return "I'm a teapot";
+    case 421: return "Misdirected Request";
+    case 422: return "Unprocessable Content";
+    case 423: return "Locked";
+    case 428: return "Precondition Required";
     case 429: return "Too Many Requests";
+    case 431: return "Request Header Fields Too Large";
+    case 451: return "Unavailable For Legal Reasons";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    case 505: return "HTTP Version Not Supported";
     default:  return "Rejected by ModSecurity";
     }
 }
