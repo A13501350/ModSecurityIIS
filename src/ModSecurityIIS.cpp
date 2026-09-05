@@ -1465,81 +1465,62 @@ RegisterModule(
     IHttpServer *                   pHttpServer
 )
 {
-    HRESULT                  hr = S_OK;
-    CMyHttpModuleFactory *   pFactory = NULL;
-    bool                     registered = false;
-
     UNREFERENCED_PARAMETER(dwServerVersion);
 
     if (pModuleInfo == NULL || pHttpServer == NULL)
     {
-        hr = HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER);
-        goto Finished;
+        return HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER);
     }
 
     g_pModuleContext = pModuleInfo->GetId();
     g_pHttpServer    = pHttpServer;
 
+    // Owned by this scope until SetRequestNotifications succeeds; the
+    // unique_ptr deletes it on any early return (allocation failure, a
+    // failed SetRequestNotifications). Once registration succeeds we
+    // release() it: IIS then owns the factory and frees it at module unload,
+    // so a later failure (e.g. SetPriorityForRequestNotification) must NOT
+    // delete it -- the released pointer simply leaks to IIS rather than
+    // double-freeing.
+    std::unique_ptr<CMyHttpModuleFactory> factory;
+    HRESULT hr = S_OK;
     try
     {
-    pFactory = new (std::nothrow) CMyHttpModuleFactory();
-    if (pFactory == NULL)
-    {
-        hr = HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
-        goto Finished;
-    }
+        factory.reset(new (std::nothrow) CMyHttpModuleFactory());
+        if (factory == NULL)
+        {
+            return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+        }
 
-    hr = pModuleInfo->SetRequestNotifications(
-            pFactory,
-            RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE,
-            RQ_END_REQUEST);
-    IisTrace("RegisterModule: SetRequestNotifications(BEGIN|SEND_RESPONSE, "
-             "post=END_REQUEST) hr=0x%08x", (unsigned int)hr);
-    if (FAILED(hr))
-    {
-        goto Finished;
-    }
-    // From a successful SetRequestNotifications on, IIS owns pFactory and
-    // deletes it when the server unloads the module. Deleting it here too
-    // would be a double free -- on later failure paths just leak the
-    // pointer and let IIS clean up.
-    registered = true;
+        hr = pModuleInfo->SetRequestNotifications(
+                factory.get(),
+                RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE,
+                RQ_END_REQUEST);
+        IisTrace("RegisterModule: SetRequestNotifications(BEGIN|SEND_RESPONSE, "
+                 "post=END_REQUEST) hr=0x%08x", (unsigned int)hr);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+        // Ownership moves to IIS here.
+        factory.release();
 
-    hr = pModuleInfo->SetPriorityForRequestNotification(RQ_BEGIN_REQUEST, PRIORITY_ALIAS_FIRST);
-    if (FAILED(hr))
-    {
-        goto Finished;
-    }
-    hr = pModuleInfo->SetPriorityForRequestNotification(RQ_SEND_RESPONSE, PRIORITY_ALIAS_LAST);
-    if (FAILED(hr))
-    {
-        goto Finished;
-    }
-
-    pFactory = NULL;
+        hr = pModuleInfo->SetPriorityForRequestNotification(RQ_BEGIN_REQUEST, PRIORITY_ALIAS_FIRST);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+        hr = pModuleInfo->SetPriorityForRequestNotification(RQ_SEND_RESPONSE, PRIORITY_ALIAS_LAST);
+        return hr;
     }
     catch (const std::exception& e)
     {
         ReportException("RegisterModule", e.what());
-        hr = E_UNEXPECTED;
+        return E_UNEXPECTED;
     }
     catch (...)
     {
         ReportException("RegisterModule", NULL);
-        hr = E_UNEXPECTED;
+        return E_UNEXPECTED;
     }
-
- Finished:
-    if (pFactory != NULL)
-    {
-        // Delete only when ownership never moved to IIS (registration itself
-        // failed). After a successful SetRequestNotifications IIS owns the
-        // factory -- deleting here would double-free at module unload.
-        if (!registered)
-        {
-            delete pFactory;
-        }
-        pFactory = NULL;
-    }
-    return hr;
 }
