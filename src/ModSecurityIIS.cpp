@@ -1182,6 +1182,27 @@ CMyHttpModule::OnAsyncCompletion(
 // OnSendResponse
 // ---------------------------------------------------------------------------
 
+// Decide how OnSendResponse's catch blocks continue after an exception.
+// Bytes already queued for the client cannot be recalled, so the historical
+// policy was always CONTINUE. But when the exception struck BEFORE the
+// response phases started (no headers fed, phase 4 not evaluated), nothing
+// has been committed and the response would go out un-inspected -- stop it.
+static REQUEST_NOTIFICATION_STATUS SendResponseExceptionPolicy(
+    REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext) noexcept
+{
+    if (rsc != NULL && rsc->m_pTx != NULL &&
+        !rsc->m_ResponseHeadersFed && !rsc->m_ResponseBodyEvaluated)
+    {
+        IHttpResponse* pResp = pHttpContext->GetResponse();
+        if (pResp != NULL)
+        {
+            pResp->SetStatus(500, "Internal Server Error");
+        }
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    return RQ_NOTIFICATION_CONTINUE;
+}
+
 REQUEST_NOTIFICATION_STATUS
 CMyHttpModule::OnSendResponse(
     IN IHttpContext * pHttpContext,
@@ -1418,13 +1439,13 @@ CMyHttpModule::OnSendResponse(
         // let IIS finish delivering the already-inspected response.
         IisTrace("OnSendResponse: EXCEPTION %s", e.what());
         ReportException("OnSendResponse", e.what());
-        return RQ_NOTIFICATION_CONTINUE;
+        return SendResponseExceptionPolicy(rsc, pHttpContext);
     }
     catch (...)
     {
         IisTrace("OnSendResponse: EXCEPTION (unknown)");
         ReportException("OnSendResponse", NULL);
-        return RQ_NOTIFICATION_CONTINUE;
+        return SendResponseExceptionPolicy(rsc, pHttpContext);
     }
 
     return RQ_NOTIFICATION_CONTINUE;
