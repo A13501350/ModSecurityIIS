@@ -172,9 +172,25 @@ static std::string VerbToString(HTTP_REQUEST* req)
     case HttpVerbPROPFIND:   return "PROPFIND";
     case HttpVerbPROPPATCH: return "PROPPATCH";
     case HttpVerbMKCOL:   return "MKCOL";
+    case HttpVerbMKWORKSPACE:    return "MKWORKSPACE";
+    case HttpVerbCHECKIN:        return "CHECKIN";
+    case HttpVerbCHECKOUT:       return "CHECKOUT";
+    case HttpVerbUNCHECKOUT:     return "UNCHECKOUT";
+    case HttpVerbUPDATE:         return "UPDATE";
+    case HttpVerbLABEL:          return "LABEL";
+    case HttpVerbREPORT:         return "REPORT";
+    case HttpVerbVERSIONCONTROL: return "VERSION-CONTROL";
+    case HttpVerbORDERMEMBER:    return "ORDERMEMBER";
+    case HttpVerbSUBSCRIBE:      return "SUBSCRIBE";
+    case HttpVerbUNSUBSCRIBE:    return "UNSUBSCRIBE";
+    case HttpVerbPOLL:    return "POLL";
     case HttpVerbLOCK:    return "LOCK";
     case HttpVerbUNLOCK:  return "UNLOCK";
     case HttpVerbSEARCH:  return "SEARCH";
+    case HttpVerbInvalid:
+    case HttpVerbUnparsed:
+        // Not a real method -- http.sys itself rejected/unparsed it.
+        return "INVALID";
     default:
         // http.sys maps non-enumerated methods to HttpVerbUnknown, keeping the
         // original bytes in pUnknownVerb. Report the real method so rules
@@ -188,7 +204,10 @@ static std::string VerbToString(HTTP_REQUEST* req)
                 return verb;
             }
         }
-        return "INVALID";
+        // A value from a FUTURE SDK (an enumerated verb this build does not
+        // know) must not be reported as "INVALID" -- the numeric keeps
+        // REQUEST_METHOD distinguishable.
+        return "HTTP-VERB-" + std::to_string((int)req->Verb);
     }
 }
 
