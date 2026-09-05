@@ -860,7 +860,20 @@ CMyHttpModule::OnBeginRequest(
         std::string msg = "ModSecurityIIS: failed to load rules from '"
                           + configFile + "': " + rulesErr;
         ReportOnce("rules-load", msg.c_str());
-        break;
+        // Same policy as the config-read failure above: an unparseable or
+        // unreadable rules file means every request would be served
+        // unprotected. Fail closed by default; MODSEC_IIS_FAIL_CLOSED=0
+        // opts out.
+        if (!ConfigFailClosed())
+        {
+            break;              // operator opted out -> pass through
+        }
+        IHttpResponse* pRespFail = pHttpContext->GetResponse();
+        if (pRespFail != NULL)
+        {
+            pRespFail->SetStatus(500, "Internal Server Error");
+        }
+        return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
     // v3 API: Transaction(ModSecurity*, RulesSet*, void*). We keep a
