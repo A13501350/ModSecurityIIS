@@ -1367,6 +1367,7 @@ RegisterModule(
 {
     HRESULT                  hr = S_OK;
     CMyHttpModuleFactory *   pFactory = NULL;
+    bool                     registered = false;
 
     UNREFERENCED_PARAMETER(dwServerVersion);
 
@@ -1398,6 +1399,11 @@ RegisterModule(
     {
         goto Finished;
     }
+    // From a successful SetRequestNotifications on, IIS owns pFactory and
+    // deletes it when the server unloads the module. Deleting it here too
+    // would be a double free -- on later failure paths just leak the
+    // pointer and let IIS clean up.
+    registered = true;
 
     hr = pModuleInfo->SetPriorityForRequestNotification(RQ_BEGIN_REQUEST, PRIORITY_ALIAS_FIRST);
     if (FAILED(hr))
@@ -1426,7 +1432,13 @@ RegisterModule(
  Finished:
     if (pFactory != NULL)
     {
-        delete pFactory;
+        // Delete only when ownership never moved to IIS (registration itself
+        // failed). After a successful SetRequestNotifications IIS owns the
+        // factory -- deleting here would double-free at module unload.
+        if (!registered)
+        {
+            delete pFactory;
+        }
         pFactory = NULL;
     }
     return hr;
