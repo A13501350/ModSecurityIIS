@@ -13,8 +13,6 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include <mutex>
-#include <unordered_set>
 #include <atomic>
 #include <new>
 #include <exception>
@@ -264,24 +262,6 @@ static void ReportException(const char* where, const char* what) noexcept
     iis::WriteEventViewerLog(buf, EVENTLOG_ERROR_TYPE);
 }
 
-// Report the FIRST occurrence of a repeating per-request failure, once per
-// process. Failing to load rules/config is a condition every request would
-// hit; writing an event per request floods the Application log (itself a DoS
-// surface) without adding information beyond the first entry.
-static void ReportOnce(const char* key, const char* message)
-{
-    static std::mutex s_mutex;
-    static std::unordered_set<std::string> s_seen;
-    if (key == NULL || message == NULL)
-    {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_seen.insert(std::string(key)).second)
-    {
-        iis::WriteEventViewerLog(message, EVENTLOG_ERROR_TYPE);
-    }
-}
 
 // DEBUG: append-only file trace to prove response-phase handlers are invoked.
 // Writes only when MODSEC_IIS_TRACE env var is set (non-empty, not "0").
@@ -861,10 +841,16 @@ CMyHttpModule::OnBeginRequest(
     if (FAILED(hr))
     {
     // The configuration could not be read. Fail-closed by default:
-    // serving the request unprotected bypasses all rules.
-    ReportOnce("config-read",
-            "ModSecurityIIS: failed to read module configuration; "
-            "failing closed (request rejected).");
+    // serving the request unprotected bypasses all rules. Log once per
+    // process -- every request would otherwise flood the Application log.
+    static std::atomic<bool> s_configFailLogged{ false };
+    if (!s_configFailLogged.exchange(true))
+    {
+        WriteEventViewerLog(
+                "ModSecurityIIS: failed to read module configuration; "
+                "failing closed (request rejected).",
+                EVENTLOG_ERROR_TYPE);
+    }
         if (!ConfigFailClosed())
         {
             hr = S_OK;          // operator opted out -> pass through
@@ -894,9 +880,14 @@ CMyHttpModule::OnBeginRequest(
     std::shared_ptr<modsecurity::RulesSet> rules = iis::getRules(configFile, &rulesErr);
     if (rules == nullptr)
     {
-        std::string msg = "ModSecurityIIS: failed to load rules from '"
-                          + configFile + "': " + rulesErr;
-        ReportOnce("rules-load", msg.c_str());
+        // Log once per process: a broken rules file fails every request.
+        static std::atomic<bool> s_rulesFailLogged{ false };
+        if (!s_rulesFailLogged.exchange(true))
+        {
+            std::string msg = "ModSecurityIIS: failed to load rules from '"
+                              + configFile + "': " + rulesErr;
+            iis::WriteEventViewerLog(msg.c_str(), EVENTLOG_ERROR_TYPE);
+        }
         // Same policy as the config-read failure above: an unparseable or
         // unreadable rules file means every request would be served
         // unprotected. Fail closed by default; MODSEC_IIS_FAIL_CLOSED=0
