@@ -93,6 +93,22 @@ static std::string SockAddrToIp(PSOCKADDR pAddr)
     {
         return "";
     }
+    // Dual-stack listeners report IPv4 peers as ::ffff:a.b.c.d. The engine's
+    // @ipMatch / @ipMatchFromFile rules list plain IPv4/CIDR, which would
+    // never match the mapped form -- unwrap it so IP rules behave the same
+    // whether the socket came in over AF_INET or an AF_INET6 mapped address.
+    if (pAddr->sa_family == AF_INET6)
+    {
+        SOCKADDR_IN6* in6 = (SOCKADDR_IN6*)pAddr;
+        if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr))
+        {
+            const UCHAR* b = in6->sin6_addr.u.Byte;
+            char mapped[16];
+            _snprintf_s(mapped, sizeof(mapped), _TRUNCATE,
+                        "%u.%u.%u.%u", b[12], b[13], b[14], b[15]);
+            return std::string(mapped);
+        }
+    }
     char buf[NI_MAXHOST] = { 0 };
     int salen = (pAddr->sa_family == AF_INET)
                     ? (int)sizeof(SOCKADDR_IN)
