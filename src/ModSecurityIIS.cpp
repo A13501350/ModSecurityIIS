@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <atomic>
 #include <new>
 #include <exception>
 #include <cstdio>
@@ -735,6 +736,20 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         // (FinishBodyRead re-inserts our prefix BEFORE that remainder).
         if (rsc->m_Body.size() >= GetMaxInspectBodyBytes())
         {
+            // Detection is fail-open past the cap BY DESIGN (the engine never
+            // sees the excess), but it must not be silent: one event per
+            // process tells the operator the cap is being exercised.
+            static std::atomic<bool> s_capLogged{ false };
+            bool expected = false;
+            if (s_capLogged.compare_exchange_strong(expected, true))
+            {
+                iis::WriteEventViewerLog(
+                    "ModSecurityIIS: a request body reached the inspection "
+                    "cap (MODSEC_IIS_MAX_INSPECT_BODY_BYTES); bytes beyond "
+                    "it are forwarded to the application but NOT inspected "
+                    "(logged once per process)",
+                    EVENTLOG_WARNING_TYPE);
+            }
             return FinishBodyRead(rsc, pHttpContext);
         }
         // Otherwise loop for the next chunk.
