@@ -327,17 +327,21 @@ static void IisTrace(const char* fmt, ...)
 // DuplicateHandle + SetFilePointerEx on the copy, then stream the requested
 // byte range through the engine in bounded buffers (a whole-file allocation
 // would spike memory on large downloads).
-static void AppendResponseFileChunk(modsecurity::Transaction* tx,
+static ULONGLONG AppendResponseFileChunk(modsecurity::Transaction* tx,
                                     HANDLE hFile,
                                     ULONGLONG start,
                                     ULONGLONG length)
 {
+    // Returns the number of bytes ACTUALLY appended -- the caller must
+    // account by this value, not by the requested range, or the inspection
+    // cap is consumed by bytes that were never read.
+    ULONGLONG appended = 0;
     HANDLE hDup = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), hFile,
                          GetCurrentProcess(), &hDup,
                          0, FALSE, DUPLICATE_SAME_ACCESS))
     {
-        return;
+        return 0;
     }
 
     LARGE_INTEGER li;
@@ -368,10 +372,12 @@ static void AppendResponseFileChunk(modsecurity::Transaction* tx,
                 break;
             }
             tx->appendResponseBody((const unsigned char*)buf, (size_t)got);
+            appended += got;
             length -= got;
         }
     }
     CloseHandle(hDup);
+    return appended;
 }
 
 
@@ -1311,11 +1317,10 @@ CMyHttpModule::OnSendResponse(
             }
             if (length > 0)
             {
-                AppendResponseFileChunk(tx,
+                respInspected += AppendResponseFileChunk(tx,
                                         chunk->FromFileHandle.FileHandle,
                                         start,
                                         length);
-                respInspected += (size_t)length;
             }
         }
         // HttpDataChunkFromFragmentCache: IIS exposes no API for a module to
