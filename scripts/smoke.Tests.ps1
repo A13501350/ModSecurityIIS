@@ -39,7 +39,9 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
     $script:diagN  = 0
 
     # Send one request, persist a short post-mortem, and return its status code.
-    function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
+    # Defined as script:-scoped so BeforeAll/It (separate child scopes in the
+    # run phase) can see it -- a plain `function` here would not be visible.
+    function script:Invoke-Case([string]$Name, [string[]]$CurlArgs) {
         $script:diagN++
         $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
         $code = & $script:curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
@@ -55,7 +57,7 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
         return @{ Name = $Name; Status = [int]($code ?? "0") }
     }
 
-    function Restart-IisConfigStack {
+    function script:Restart-IisConfigStack {
         & iisreset /stop 2>&1 | Out-Null
         Start-Sleep -Seconds 2
         & iisreset /start 2>&1 | Out-Null
