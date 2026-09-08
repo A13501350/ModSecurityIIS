@@ -20,16 +20,10 @@ if "%VERSION%"=="" set "VERSION=1.0.0"
 set "OUT=%~3"
 if "%OUT%"=="" set "OUT=%REPO%\build\msi"
 
-if not exist "%DLLDIR%\modsecurityiis.dll" (
-    echo build_msi: modsecurityiis.dll not found in "%DLLDIR%" - build the module first.
-    exit /b 1
-)
+if not exist "%DLLDIR%\modsecurityiis.dll" goto :NoDll
 
 where heat.exe >nul 2>nul
-if errorlevel 1 (
-    echo build_msi: WiX Toolset v3 (heat/candle/light) not found on PATH.
-    exit /b 1
-)
+if errorlevel 1 goto :NoWix
 
 if not exist "%OUT%" mkdir "%OUT%"
 if errorlevel 1 exit /b 1
@@ -50,3 +44,12 @@ light.exe -nologo -ext WixUtilExtension -ext WixUIExtension ^
 if errorlevel 1 exit /b 1
 
 echo build_msi: %OUT%\ModSecurityIIS.msi
+exit /b 0
+
+:NoDll
+echo build_msi: modsecurityiis.dll not found in "%DLLDIR%" - build the module first.
+exit /b 1
+
+:NoWix
+echo build_msi: WiX Toolset v3 (heat/candle/light) not found on PATH.
+exit /b 1
