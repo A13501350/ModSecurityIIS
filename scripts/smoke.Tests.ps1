@@ -13,13 +13,6 @@
 # server-log -> Event Viewer callback. It deliberately does NOT run the CRS
 # suite (that is the slower, flakier L2 layer in scripts/ci-crs.ps1).
 #
-# NO SHELLING OUT TO appcmd.exe: IIS is driven through Microsoft.Web.Administration
-# (the API appcmd itself sits on). Plain HTTP cases go through Invoke-WebRequest
-# (pwsh 7, -SkipHttpErrorCheck). The ONE exception is the 6b body-completeness
-# probe, which keeps curl.exe --limit-rate 10k: Invoke-WebRequest has no rate
-# limiting, and the slow upload is what exercises the engine's async body-read
-# path. iisreset / icacls / msiexec also remain.
-#
 # PESTER SCOPING (pester.dev/docs/usage/setup-and-teardown): only BeforeAll
 # runs in the Run phase -- a .Tests.ps1 file's top-level code executes during
 # DISCOVERY only, and Describe-body statements are not visible to BeforeAll/It.
@@ -44,57 +37,14 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
     BeforeAll {
         $ErrorActionPreference = "Stop"
 
-        $curl  = "$env:windir\System32\curl.exe"
-        $audit = "C:\inetpub\logs\modsec-audit\audit.log"
+        $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+        $curl   = "$env:windir\System32\curl.exe"
+        $audit  = "C:\inetpub\logs\modsec-audit\audit.log"
 
         # Helper functions are defined here, inside BeforeAll, so they exist in
         # the Run phase and are visible to every It block (Pester v5 docs:
-        # import/dot-source helpers in BeforeAll).
-
-        # --- Microsoft.Web.Administration ------------------------------------
-        # The API under appcmd.exe. pwsh 7 does not probe the GAC, so load the
-        # copy IIS ships in inetsrv; fall back to the IISAdministration module.
-        if (-not ("Microsoft.Web.Administration.ServerManager" -as [type])) {
-            $mwaDll = "$env:windir\System32\inetsrv\Microsoft.Web.Administration.dll"
-            if (Test-Path $mwaDll) {
-                Add-Type -Path $mwaDll
-            } else {
-                Import-Module IISAdministration -SkipEditionCheck -ErrorAction Stop
-                if (-not ("Microsoft.Web.Administration.ServerManager" -as [type])) {
-                    throw "Microsoft.Web.Administration could not be loaded."
-                }
-            }
-        }
-
-        function New-ServerManager {
-            [Microsoft.Web.Administration.ServerManager]::new()
-        }
-
-        # Set attributes on the site-level ModSecurity section. This is the
-        # equivalent of `appcmd set config <site> /section:ModSecurity ... /commit:site`:
-        # the write lands in the site's own web.config.
-        function Set-SiteModSecConfig([string]$Site, [hashtable]$Attrs) {
-            $sm = New-ServerManager
-            try {
-                $webCfg = $sm.GetWebConfiguration($Site)
-                $sec = $webCfg.GetSection("system.webServer/ModSecurity")
-                if (-not $sec) {
-                    throw "section system.webServer/ModSecurity not found in web config for site '$Site'"
-                }
-                foreach ($k in $Attrs.Keys) {
-                    # ConfigurationElement's string indexer does not bind
-                    # reliably from PowerShell (returns null -> cryptic
-                    # "property 'Value' cannot be found"), so go through the
-                    # explicit GetAttribute API.
-                    $attr = $sec.GetAttribute($k)
-                    if (-not $attr) {
-                        throw "attribute '$k' missing from the ModSecurity section schema"
-                    }
-                    $attr.Value = $Attrs[$k]
-                }
-                $sm.CommitChanges()
-            } finally { $sm.Dispose() }
-        }
+        # import/dot-source helpers in BeforeAll). They avoid reads of outer
+        # scope state where the value is a constant.
 
         # Reload the IIS configuration stack so a freshly installed schema file
         # under inetsrv\config\schema becomes visible to the config system.
@@ -108,44 +58,21 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
             }
         }
 
-        # Send one request via Invoke-WebRequest (curl.exe replacement), persist
-        # a short post-mortem, and return its status code.
-        function Invoke-Case([string]$Name, [hashtable]$Req) {
+        # Send one request, persist a short post-mortem, and return its status.
+        function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
+            $exe = "$env:windir\System32\curl.exe"
             $out = "$ConfRoot\diag\case-$($Name -replace '[^A-Za-z0-9]+','-').txt"
-            $params = @{
-                Uri                = $Req["Uri"]
-                Method             = $Req["Method"]
-                SkipHttpErrorCheck = $true   # pwsh 7: keep 4xx/5xx as a response
-                TimeoutSec         = 60
-            }
-            $headers = $Req["Headers"]
-            if ($headers -and $headers["User-Agent"]) {
-                # Set via the dedicated parameter (safe on every PS edition).
-                $params.UserAgent = $headers["User-Agent"]
-                $rest = @{}
-                foreach ($k in $headers.Keys) {
-                    if ($k -ne "User-Agent") { $rest[$k] = $headers[$k] }
-                }
-                $headers = $rest
-            }
-            if ($headers -and $headers.Count) { $params.Headers = $headers }
-            if ($Req["Body"]) {
-                $params.Body = $Req["Body"]
-                if ($Req["ContentType"]) { $params.ContentType = $Req["ContentType"] }
-            }
-            $resp = Invoke-WebRequest @params
-            $code = [int]$resp.StatusCode
-
+            $code = & $exe @CurlArgs -s -D "$out.headers" -o "$out.body" `
+                        -w "%{http_code}" 2>$null
             "--- STATUS: $code ---" | Add-Content $out
-            $resp.Headers.GetEnumerator() | Select-Object -First 25 |
-                ForEach-Object { "{0}: {1}" -f $_.Key, ($_.Value -join ", ") } | Add-Content $out
+            Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
             "--- BODY (first 2048 bytes) ---" | Add-Content $out
-            $body = "$($resp.Content)"
-            $body.Substring(0, [Math]::Min(2048, $body.Length)) | Add-Content $out
+            Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
             Write-Host "== $Name => HTTP $code =="
-            $resp.Headers.GetEnumerator() | Select-Object -First 12 |
-                ForEach-Object { Write-Host ("   {0}: {1}" -f $_.Key, ($_.Value -join ", ")) }
-            return @{ Name = $Name; Status = $code }
+            Get-Content "$out.headers" -ErrorAction SilentlyContinue |
+                Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
+            return @{ Name = $Name; Status = [int]($code ?? "0") }
         }
 
         $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -219,131 +146,78 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
 "@
         Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
 
-        # --- 3) site (via Microsoft.Web.Administration) ---------------------
+        # --- 3) site -------------------------------------------------------
         New-Item -ItemType Directory -Force $SiteRoot | Out-Null
         Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
 
-        $sm = New-ServerManager
-        try {
-            $oldSite = $sm.Sites[$SiteName]
-            if ($oldSite) { $sm.Sites.Remove($oldSite) }
-            $oldPool = $sm.ApplicationPools[$PoolName]
-            if ($oldPool) { $sm.ApplicationPools.Remove($oldPool) }
+        & $appcmd delete site    $SiteName 2>$null | Out-Null
+        & $appcmd delete apppool $PoolName 2>$null | Out-Null
+        & $appcmd add apppool /name:$PoolName
+        & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
 
-            $pool = $sm.ApplicationPools.Add($PoolName)
-            $pool.ProcessModel.LoadUserProfile = $false
-
-            # Use the (siteName, port, physicalPath, protocol) overload: the
-            # string-bindingInformation overload is ambiguous for PowerShell's
-            # binder (it tries to convert the path to int port).
-            $site = $sm.Sites.Add($SiteName, $Port, $SiteRoot, "http")
-            $site.Applications["/"].ApplicationPoolName = $PoolName
-            $sm.CommitChanges()
-        } finally { $sm.Dispose() }
-
-        # The pool's virtual account (IIS AppPool\<name>) only resolves to a SID
-        # after the pool exists, so grants must come after the commit above.
         $poolId = "IIS AppPool\$PoolName"
         icacls "C:\inetpub\logs\modsec-audit" /grant "${poolId}:(OI)(CI)M" | Out-Null
         icacls "$ConfRoot\data"               /grant "${poolId}:(OI)(CI)M" | Out-Null
         icacls "C:\inetpub\modsec\GeoIP"      /grant "${poolId}:(OI)(CI)R" | Out-Null
 
-        # Enable ModSecurity for the site; retry in case the schema reload from
-        # step 1 races us (same reasoning as the appcmd retries it replaces).
+        & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot /bindings:"http/*:$($Port):"
+        & $appcmd set app "$SiteName/" /applicationPool:$PoolName
+
         $sectionOk = $false
         foreach ($try in 1..5) {
-            try {
-                Set-SiteModSecConfig $SiteName @{
-                    enabled    = $true
-                    configFile = "C:\inetpub\modsec\modsecurity.conf"
-                }
-                $sectionOk = $true
-                break
-            } catch {
-                Write-Warning "set config attempt $try failed: $($_.Exception.Message)"
-                Restart-IisConfigStack
-            }
+            $out = & $appcmd set config $SiteName /section:ModSecurity `
+                /enabled:true /configFile:"C:\inetpub\modsec\modsecurity.conf" /commit:site 2>&1
+            if ($LASTEXITCODE -eq 0) { $sectionOk = $true; break }
+            Write-Warning "set config attempt $try failed: $out"
+            Start-Sleep -Seconds 3
         }
         if (-not $sectionOk) {
             throw "ModSecurity section could not be configured for site '$SiteName'."
         }
-
-        $sm = New-ServerManager
-        try {
-            $sm.Sites[$SiteName].Start()
-            $sm.Sites | Select-Object Name, State | Format-Table -AutoSize | Out-String | Write-Host
-        } finally { $sm.Dispose() }
+        & $appcmd start site $SiteName
+        & $appcmd list sites
     }
 
     It "native module registered by install" {
-        # appcmd list modules equivalent: the module must appear in the
-        # applicationHost.config collections that make it a native IIS module.
-        $sm = New-ServerManager
-        try {
-            $ah = $sm.GetApplicationHostConfiguration()
-            $inModules = @($ah.GetSection("system.webServer/modules").GetCollection() |
-                Where-Object { "$($_["name"])" -eq "ModSecurityIIS" }).Count -gt 0
-            $inGlobals = @($ah.GetSection("system.webServer/globalModules").GetCollection() |
-                Where-Object { "$($_["name"])" -eq "ModSecurityIIS" }).Count -gt 0
-            ($inModules -or $inGlobals) | Should -BeTrue
-        } finally { $sm.Dispose() }
+        $out = & $appcmd list modules /name:ModSecurityIIS 2>&1 | Out-String
+        $out | Should -Match "ModSecurityIIS"
     }
 
     It "schema/section visible to config system" {
-        # appcmd list config /section:... equivalent: the config system can
-        # resolve the section, which proves the schema is loaded.
-        $sm = New-ServerManager
-        try {
-            $ah = $sm.GetApplicationHostConfiguration()
-            { $null = $ah.GetSection("system.webServer/ModSecurity") } | Should -Not -Throw
-        } finally { $sm.Dispose() }
+        & $appcmd list config /section:system.webServer/ModSecurity 2>&1 | Out-Null
+        $LASTEXITCODE | Should -Be 0
     }
 
     It "A pass-through GET returns 200" {
-        $cA = Invoke-Case "A pass-through GET" @{
-            Uri     = "http://127.0.0.1:$Port/hello.txt"
-            Method  = "GET"
-            Headers = @{ "User-Agent" = "normal-client" }
-        }
+        $cA = Invoke-Case "A pass-through GET" @(
+            "-H","User-Agent: normal-client","http://127.0.0.1:$Port/hello.txt")
         $cA.Status | Should -Be 200
     }
 
     It "B phase-1 header rule blocks with 403" {
-        $cB = Invoke-Case "B phase-1 header block" @{
-            Uri     = "http://127.0.0.1:$Port/hello.txt"
-            Method  = "GET"
-            Headers = @{ "User-Agent" = "modsec-test-block" }
-        }
+        $cB = Invoke-Case "B phase-1 header block" @(
+            "-H","User-Agent: modsec-test-block","http://127.0.0.1:$Port/hello.txt")
         $cB.Status | Should -Be 403
     }
 
     It "C phase-2 request-body rule blocks with 403" {
-        $cC = Invoke-Case "C phase-2 body block" @{
-            Uri         = "http://127.0.0.1:$Port/"
-            Method      = "POST"
-            Body        = "evil=<script>alert(1)</script>"
-            ContentType = "application/x-www-form-urlencoded"
-        }
+        $cC = Invoke-Case "C phase-2 body block" @(
+            "-X","POST","-H","Content-Type: application/x-www-form-urlencoded",
+            "--data","evil=<script>alert(1)</script>","http://127.0.0.1:$Port/")
         $cC.Status | Should -Be 403
     }
 
     It "D benign POST is not a false positive (405 from static handler)" {
-        $cD = Invoke-Case "D benign POST passes to handler" @{
-            Uri         = "http://127.0.0.1:$Port/hello.txt"
-            Method      = "POST"
-            Body        = "hello"
-            ContentType = "text/plain"
-        }
+        $cD = Invoke-Case "D benign POST passes to handler" @(
+            "-X","POST","-H","Content-Type: text/plain","--data","hello",
+            "http://127.0.0.1:$Port/hello.txt")
         # 405 proves the request reached the static-file handler untouched.
         $cD.Status | Should -Be 405
     }
 
     It "P non-disruptive log probe returns 200" {
-        $cP = Invoke-Case "P non-disruptive log probe" @{
-            Uri     = "http://127.0.0.1:$Port/hello.txt"
-            Method  = "GET"
-            Headers = @{ "X-ModSec-Probe" = "logme" }
-        }
+        $cP = Invoke-Case "P non-disruptive log probe" @(
+            "-H","X-ModSec-Probe: logme","http://127.0.0.1:$Port/hello.txt")
         $cP.Status | Should -Be 200
     }
 
@@ -363,12 +237,9 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
         Set-Content -Path $bodyFile -Value $probeBody -NoNewline -Encoding ascii
 
         $auditOff = if (Test-Path $audit) { (Get-Item $audit).Length } else { 0 }
-        # curl --limit-rate keeps the slow upload that exercises the engine's
-        # async body-read path (Invoke-WebRequest has no rate limiting).
-        $probeCode = & $curl -s -o "$ConfRoot\bodyprobe-response.bin" -w "%{http_code}" --limit-rate 10k `
+        & $curl -s -o "$ConfRoot\bodyprobe-response.bin" -w "%{http_code}" --limit-rate 10k `
                  -X POST -H "Content-Type: application/x-www-form-urlencoded" `
                  --data-binary "@$bodyFile" "http://127.0.0.1:$Port/" 2>$null
-        Write-Host "[6b] throttled POST => HTTP $probeCode"
         Start-Sleep -Seconds 3   # let the audit writer flush
 
         $slice = $null
