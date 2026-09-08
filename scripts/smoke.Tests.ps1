@@ -14,7 +14,10 @@
 # suite (that is the slower, flakier L2 layer in scripts/ci-crs.ps1).
 
 param(
-    [string]$Msi = "",
+    # The launcher (ci-smoke.ps1) passes the MSI path via $env:MODSEC_IIS_SMOKE_MSI
+    # because Invoke-Pester -Path cannot forward script arguments. Empty = test an
+    # already-installed module.
+    [string]$Msi = ($env:MODSEC_IIS_SMOKE_MSI ?? ""),
     [string]$SiteRoot  = "C:\inetpub\modsectest",
     [string]$ConfRoot  = "C:\inetpub\modsec",
     [int]   $Port      = 18080,

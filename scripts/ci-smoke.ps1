@@ -25,24 +25,17 @@ if (-not (Get-Module -ListAvailable -Name Pester)) {
 }
 Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
 
-$testFile = Join-Path $PSScriptRoot "..\tests\iis\smoke.Tests.ps1"
+$testFile = Join-Path $PSScriptRoot "smoke.Tests.ps1"
 if (-not (Test-Path $testFile)) { throw "smoke test not found: $testFile" }
-# Resolve the '..' so Pester's file discovery can locate the .Tests.ps1.
-# (An un-normalized path with '..' makes Pester report "No test files were found".)
-$testFile = (Resolve-Path $testFile).Path
+
+# Invoke-Pester -Path is the reliable single-file invocation (the -Script
+# @{ Path=...; Parameters=... } form fails to discover a single-file
+# container in Pester 5.9). The test reads $env:MODSEC_IIS_SMOKE_MSI for the
+# MSI path; the other params keep their in-file defaults.
+$env:MODSEC_IIS_SMOKE_MSI = $Msi
 
 try {
-    $result = Invoke-Pester -Script @{
-        Path = $testFile
-        Parameters = @{
-            Msi       = $Msi
-            SiteRoot  = $SiteRoot
-            ConfRoot  = $ConfRoot
-            Port      = $Port
-            SiteName  = $SiteName
-            PoolName  = $PoolName
-        }
-    } -PassThru -Output Detailed
+    $result = Invoke-Pester -Path $testFile -PassThru -Output Detailed
 } catch {
     Write-Host "Invoke-Pester failed: $_"
     exit 1
