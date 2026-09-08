@@ -264,6 +264,11 @@ jobs:
           Assert-True (-not (Test-Path "$installDir\modsecurity.conf")) "configuration removed"
           Assert-True (-not ([bool](Select-String -Path $ahConfig -Pattern 'name="ModSecurity"' -Quiet))) "config section removed"
 
+          # The last native call is `appcmd list modules` against a module that
+          # is (correctly) gone, so it leaves a non-zero $LASTEXITCODE for the
+          # runner to pick up. Assertions above use throw, not exit codes.
+          exit 0
+
       - name: Upload MSI
         if: always()
         uses: actions/upload-artifact@v7
