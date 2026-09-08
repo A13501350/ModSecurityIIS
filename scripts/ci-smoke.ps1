@@ -1,11 +1,11 @@
 # IIS smoke test for ModSecurityIIS.
-# Flow: ensure IIS -> stage DLLs -> deploy module -> write config ->
-# create app pool/site -> assert A-F + P behaviors.
+# Flow: ensure IIS -> install the module (from an MSI, or use an existing
+# install) -> write config -> create app pool/site -> assert A-F + P behaviors.
 
 [CmdletBinding()]
 param(
-    # Directory holding modsecurityiis.dll + libModSecurity.dll.
-    [Parameter(Mandatory = $true)][string]$DllDir,
+    # MSI to install before testing. Omit to test an already installed module.
+    [string]$Msi,
 
     [string]$SiteRoot  = "C:\inetpub\modsectest",
     [string]$ConfRoot  = "C:\inetpub\modsec",
@@ -30,13 +30,6 @@ $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIde
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Must run elevated."
 }
-$dll    = Join-Path $DllDir "modsecurityiis.dll"
-$engine = Join-Path $DllDir "libModSecurity.dll"
-foreach ($f in @($dll, $engine)) {
-    if (-not (Test-Path $f)) { throw "Missing artifact file: $f" }
-}
-Write-Host "== Artifacts found =="
-Get-ChildItem $DllDir | Format-Table Name, Length
 
 # --- 1) ensure IIS ------------------------------------------------------------
 $features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, `
@@ -48,72 +41,26 @@ if ($features | Where-Object { -not $_.Installed }) {
 }
 if ((Get-Service W3SVC).Status -ne "Running") { Start-Service W3SVC }
 $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
-Write-Host "[1/6] IIS ready."
+Write-Host "[1/5] IIS ready."
 
-# --- 2) stage engine dependency DLLs ------------------------------------------
-# Locate every non-system import and place it next to the engine DLL.
+if ($Msi) {
+    if (-not (Test-Path $Msi)) { throw "MSI not found: $Msi" }
+    $log = Join-Path (Get-Location).Path "msi-install.log"
+    Write-Host "== Installing $Msi =="
+    $p = Start-Process msiexec.exe -Wait -PassThru `
+         -ArgumentList @("/i", (Resolve-Path $Msi).Path, "/qn", "/norestart", "/l*v", $log)
+    Assert-True ($p.ExitCode -eq 0) "MSI installed" "msiexec exit=$($p.ExitCode) (log: $log)"
+}
+
 $inetsrv = "$env:windir\System32\inetsrv"
-$depsOutput = & dumpbin /dependents $engine 2>&1 | Out-String
-Write-Host "== dumpbin /dependents libModSecurity.dll =="; Write-Host $depsOutput
 
-# Stage the dynamic VC++ runtime the engine links against (/MD).
-# VS versions name the redist folder differently; fall back to System32.
-$crtNames = "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
-$crtSrcDirs = @()
-if ($env:VCToolsRedistDir) {
-    $crtSrcDirs += Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory `
-                    -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
-                    Select-Object -ExpandProperty FullName
-}
-foreach ($c in $crtNames) {
-    $src = $crtSrcDirs | ForEach-Object { Join-Path $_ $c } |
-           Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $src) { $src = Join-Path $env:windir "System32\$c" }
-    if (Test-Path $src) {
-        Copy-Item $src (Join-Path $inetsrv $c) -Force
-    } else {
-        Write-Warning "VC runtime $c not found anywhere"
-    }
-}
-
-$systemDeps = @("kernel32", "user32", "advapi32", "ws2_32", "ws2_64", `
-                "iphlpapi", "bcrypt", "crypt32", "msvcrt", "ucrtbase", `
-                "vcruntime140", "vcruntime140_1", "msvcp140", "ntdll", `
-                "ole32", "shell32")
-$missing = @()
-foreach ($m in [regex]::Matches($depsOutput, "(?im)^\s*(\S+\.dll)\s*$")) {
-    $dep  = $m.Groups[1].Value
-    $base = ($dep -replace "\.dll$", "")
-    # api-ms-win-crt-* are UCRT API Sets: virtual, always resolvable.
-    if ($base -like "api-ms-win-crt*") { continue }
-    if ($systemDeps -contains $base) { continue }
-    if (-not (Test-Path (Join-Path $env:windir "System32\$dep"))) { $missing += $dep.ToLower() }
-}
-foreach ($dep in $missing) {
-    Write-Host "Staging dynamic dependency: $dep"
-    $roots = @("$env:USERPROFILE\.conan2", "$env:GITHUB_WORKSPACE\build") |
-             Where-Object { $_ -and (Test-Path $_) }
-    $found = if ($roots) {
-        Get-ChildItem $roots -Recurse -Filter $dep `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-    } else { $null }
-    if ($found) {
-        Copy-Item $found.FullName $inetsrv -Force
-        Write-Host "  copied from $($found.FullName)"
-    } else {
-        Write-Warning "Dependency $dep not found anywhere -- module load may fail."
-    }
-}
-Copy-Item $dll    $inetsrv -Force
-Copy-Item $engine $inetsrv -Force
-Write-Host "[2/6] DLLs staged in $inetsrv"
-
-# --- 3) schema + event source + module registration ---------------------------
-& "$PSScriptRoot\deploy-modsecurityiis.ps1" -DllDir $DllDir -InstallDir $inetsrv
-Assert-True ($LASTEXITCODE -eq 0) "deploy script succeeded" "exit=$LASTEXITCODE"
+# --- 2) module registration ---------------------------------------------------
+# The MSI (or a previous install) owns the DLLs, schema and event source; the
+# only thing left to check here is that IIS really has the native module.
 & $appcmd list modules /name:ModSecurityIIS
 Assert-True (& $appcmd list modules /name:ModSecurityIIS | Select-String "ModSecurityIIS" -Quiet) `
-            "native module registered" "appcmd list modules came back empty"
+            "native module registered" `
+            "appcmd list modules came back empty -- install the MSI first"
 
 # Schema files under inetsrv\config\schema require a full IIS config stack
 # reload (iisreset).
@@ -158,9 +105,9 @@ if (-not $declared) {
 }
 Assert-True $declared "schema/section visible to config system" `
             "system.webServer/ModSecurity still undeclared after restarts"
-Write-Host "[3/6] Module registered, config stack restarted for schema."
+Write-Host "[2/5] Module registered, config stack restarted for schema."
 
-# --- 4) engine config + rules --------------------------------------------------
+# --- 3) engine config + rules --------------------------------------------------
 New-Item -ItemType Directory -Force $ConfRoot | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $ConfRoot "data") | Out-Null
 New-Item -ItemType Directory -Force "C:\inetpub\logs\modsec-audit" | Out-Null
@@ -201,9 +148,9 @@ SecRule REQUEST_HEADERS:X-ModSec-Probe "@streq logme" "id:1003,phase:1,pass,log,
 SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe: request body completeness'"
 "@
 Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
-Write-Host "[4/6] Engine configuration written."
+Write-Host "[3/5] Engine configuration written."
 
-# --- 5) site -------------------------------------------------------------------
+# --- 4) site -------------------------------------------------------------------
 New-Item -ItemType Directory -Force $SiteRoot | Out-Null
 Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
 
@@ -235,9 +182,9 @@ foreach ($try in 1..5) {
 Assert-True $sectionOk "ModSecurity section configured" "appcmd kept rejecting the section"
 & $appcmd start site $SiteName
 & $appcmd list sites
-Write-Host "[5/6] Site '$SiteName' listening on 127.0.0.1:$Port"
+Write-Host "[4/5] Site '$SiteName' listening on 127.0.0.1:$Port"
 
-# --- 6) functional assertions ---------------------------------------------------
+# --- 5) functional assertions ---------------------------------------------------
 New-Item -ItemType Directory -Force "$ConfRoot\diag" | Out-Null
 $curl = "$env:windir\System32\curl.exe"
 $script:diagN = 0
@@ -300,7 +247,7 @@ Set-Content -Path $bodyFile -Value $probeBody -NoNewline -Encoding ascii
 
 $auditOff = if (Test-Path $audit) { (Get-Item $audit).Length } else { 0 }
 $probeResp = Join-Path $ConfRoot "bodyprobe-response.bin"
-$probeCode = & $curl -s -o $probeResp -w "%{http_code}" --limit-rate 30k `
+$probeCode = & $curl -s -o $probeResp -w "%{http_code}" --limit-rate 10k `
                  -X POST -H "Content-Type: application/x-www-form-urlencoded" `
                  --data-binary "@$bodyFile" "http://127.0.0.1:$Port/" 2>$null
 Start-Sleep -Seconds 3   # let the audit writer flush

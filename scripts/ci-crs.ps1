@@ -6,7 +6,6 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$DllDir,   # unused here; kept for symmetry/logging
     [string]$CrsVersion = "v4.25.1",
     [string]$ConfRoot   = "C:\inetpub\modsec",
     [string]$SiteRoot   = "C:\inetpub\modsectest",

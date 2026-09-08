@@ -53,18 +53,7 @@ cmake --build build --config Release
 
 This produces `build/modsecurityiis.dll` with a copy of `libModSecurity.dll`
 next to it (single-config generators like Ninja; with the Visual Studio
-generator the path is `build/Release/`). Deploy both DLLs to the IIS modules
-directory -- or run the deployment script:
-
-```bat
-powershell -ExecutionPolicy Bypass -File scripts\deploy-modsecurityiis.ps1 -DllDir build
-```
-
-The script copies the DLLs into `%windir%\System32\inetsrv`, installs the
-configuration schema (`ModSecurity.xml`), registers the "ModSecurity"
-**Application event source** (without this registry key Event Viewer cannot
-render the messages our DLL reports), and registers the native module. Pass
-`-Uninstall` to reverse all of it.
+generator the path is `build/Release/`). Install them with the MSI below.
 
 ## Installing with the MSI
 
@@ -77,11 +66,19 @@ The MSI installs the module into `%windir%\System32\inetsrv`, the schema into
 `inetsrv\config\schema`, a default `modsecurity.conf` into
 `C:\Program Files\ModSecurityIIS`, declares the
 `system.webServer/ModSecurity` section, and registers the native module
-`ModSecurityIIS` plus the event source. Uninstall removes all of it and a newer
-package upgrades in place (`MajorUpgrade`). The section is added with the
-default `enabled="false"`, so nothing is filtered until you enable it per site.
-Restart the IIS configuration stack (`iisreset`) after install so IIS picks up
-the new schema.
+`ModSecurityIIS` plus the "ModSecurity" **Application event source** (without
+this registry key Event Viewer cannot render the messages our DLL reports).
+Uninstall removes all of it and a newer package upgrades in place
+(`MajorUpgrade`). The section is added with the default `enabled="false"`, so
+nothing is filtered until you enable it per site. Restart the IIS configuration
+stack (`iisreset`) after install so IIS picks up the new schema.
+
+The package does not bundle the Visual C++ runtime; the target machine needs
+the VC++ 2015-2022 redistributable that matches the build.
+
+CI installs this MSI on the runner and runs the smoke tests plus the OWASP CRS
+suite against it (`smoke-iis` job), and a separate `package` job exercises
+install -> upgrade -> uninstall.
 
 ## Enable in IIS
 

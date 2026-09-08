@@ -288,15 +288,16 @@ jobs:
             upgrade.log
             uninstall.log
 
-  # Experimental: deploy the freshly built module to a live IIS on the runner
-  # and assert real blocking behavior (header rule, request-body rule,
-  # pass-through, audit log, event log). Failure here fails the workflow.
+  # Experimental: install the packaged MSI and assert real blocking behavior
+  # (header rule, request-body rule, pass-through, audit log, event log), then
+  # run the OWASP CRS suite. Failure here fails the workflow.
   smoke-iis:
     runs-on: windows-latest
     # The build job still runs on reuse, but its Configure/Build/Upload steps are
     # gated (if: inputs.build_run_id == '') so the ~6-min compile + DLL upload are
-    # skipped; smoke-iis downloads the reused DLL directly via the run-id input.
-    needs: build
+    # skipped. Installing from the MSI means this job no longer needs the raw
+    # DLL artifact: package downloads it (reused or fresh) and builds the MSI.
+    needs: [build, package]
 
     steps:
       - name: Checkout (with submodules, recursive)
@@ -304,29 +305,24 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download built DLLs
+      - name: Download MSI
         uses: actions/download-artifact@v8
         with:
-          name: modsecurityiis
-          path: artifact
-          # Reuse a prior run's DLL when build_run_id is supplied; otherwise fall
-          # back to THIS run's own artifact (uploaded by the build job above).
-          # The fallback must be explicit: handing the action an EMPTY run-id makes
-          # it request .../runs/NaN/artifacts and fail with 404, so a plain full
-          # build could never download the DLL it had just produced.
-          run-id: ${{ inputs.build_run_id != '' && inputs.build_run_id || github.run_id }}
+          name: modsecurityiis-msi
+          path: msi
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      # dumpbin (used by the smoke script to list libModSecurity imports)
-      # comes with the MSVC toolchain.
-      - name: Set up MSVC toolchain
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
 
       - name: Run IIS smoke test
         shell: pwsh
-        run: ./scripts/ci-smoke.ps1 -DllDir artifact
+        run: ./scripts/ci-smoke.ps1 -Msi msi/ModSecurityIIS.msi
+
+      - name: Upload MSI install log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iis-msi-install-log
+          if-no-files-found: ignore
+          path: msi-install.log
 
       - name: Set up Go
         id: setup-go
@@ -373,7 +369,7 @@ jobs:
           # it must not redden the workflow. Debug runs therefore opt out of
           # go-ftw gating; normal runs keep it ON.
           MODSEC_IIS_NO_GATE: ${{ inputs.no_gate == true || inputs.ftw_debug == true }}
-        run: ./scripts/ci-crs.ps1 -DllDir artifact
+        run: ./scripts/ci-crs.ps1
 
       - name: Upload smoke diagnostics
         if: always()
