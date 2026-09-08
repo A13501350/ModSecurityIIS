@@ -87,8 +87,7 @@
       <!-- Event Viewer needs the message table compiled into our DLL,
            otherwise every entry reads "The description for Event ID ...". -->
       <Component Id="CmpEventSource" Guid="{59569197-D083-4EBD-857E-24154A5B7B5A}" Win64="yes">
-        <util:EventSource Id="ModSecurityEventSource"
-                          Name="ModSecurity"
+        <util:EventSource Name="ModSecurity"
                           Log="Application"
                           EventMessageFile="[INETSRV]modsecurityiis.dll"
                           SupportsErrors="yes"
