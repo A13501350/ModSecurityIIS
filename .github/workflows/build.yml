@@ -14,6 +14,8 @@ run-name: >-
 on:
   push:
     branches: [ master ]
+    # A v* tag runs the full pipeline and then publishes a GitHub Release.
+    tags: [ 'v*' ]
     # Skip the ~40-min build on doc/meta-only changes. A push that touches any
     # source, build script, config or the submodule pointer still triggers;
     # only commits where EVERY changed file matches paths-ignore are skipped.
@@ -399,3 +401,54 @@ jobs:
           path: |
             go-ftw-output.txt
             modsec_crs_audit.log
+
+  # Publish a GitHub Release when a v* tag is pushed. Runs only after the
+  # whole pipeline (build -> package -> smoke/CRS) has passed, so a release
+  # always contains an MSI that passed the tests on this exact commit.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, package, smoke-iis]
+    runs-on: windows-latest
+    permissions:
+      # GITHUB_TOKEN is read-only by default; creating a release needs write.
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # A tag that disagrees with VERSION would ship an MSI whose
+      # ProductVersion does not match the release it is attached to.
+      - name: "Guard: tag must match VERSION"
+        shell: pwsh
+        run: |
+          $ver = (Get-Content VERSION -TotalCount 1).Trim()
+          if ("${{ github.ref_name }}" -ne $ver) {
+              throw "tag '${{ github.ref_name }}' does not match VERSION '$ver'"
+          }
+
+      - name: Download MSI
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis-msi
+          path: msi
+
+      - name: Download DLLs
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis
+          path: dlls
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = (Get-Content VERSION -TotalCount 1).Trim()
+          # Plain numeric versions (vX.Y.Z, optionally +g<hash>) are full
+          # releases; anything with a prerelease segment (v0.0.1-vibe) is
+          # marked pre-release.
+          $flags = @()
+          if ($ver -match "-") { $flags += "--prerelease" }
+          gh release create "${{ github.ref_name }}" (Get-ChildItem msi/*.msi, dlls/*.dll) `
+              --title $ver --generate-notes @flags
