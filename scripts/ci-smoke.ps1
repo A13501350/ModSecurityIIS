@@ -1,4 +1,4 @@
-# Launcher for the ModSecurityIIS Pester smoke test (tests/iis/smoke.Tests.ps1).
+# Launcher for the ModSecurityIIS Pester smoke test.
 #
 # Keeps the old `-Msi` contract so the CI call (./scripts/ci-smoke.ps1 -Msi $msi)
 # and local runs keep working unchanged; all assertions now live in the Pester
