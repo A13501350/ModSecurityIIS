@@ -7,7 +7,9 @@ rem Maintenance Fee, and it is preinstalled on GitHub's windows runners.
 rem
 rem Usage: iis\build_msi.bat [dll-dir] [version] [out-dir]
 rem   dll-dir  directory holding modsecurityiis.dll (default build\Release)
-rem   version  MSI ProductVersion, x.y.z           (default 1.0.0)
+rem   version  MSI ProductVersion, x.y.z           (default: numeric part of
+rem            the repo's VERSION file, e.g. "v0.0.1-vibe" -> 0.0.1 -- MSI
+rem            ProductVersion must be purely numeric)
 rem   out-dir  where the .wixobj/.msi go           (default build\msi)
 
 setlocal
@@ -16,9 +18,18 @@ for %%I in ("%~dp0..") do set "REPO=%%~fI"
 set "DLLDIR=%~1"
 if "%DLLDIR%"=="" set "DLLDIR=%REPO%\build\Release"
 set "VERSION=%~2"
-if "%VERSION%"=="" set "VERSION=1.0.0"
 set "OUT=%~3"
 if "%OUT%"=="" set "OUT=%REPO%\build\msi"
+
+rem Base the package name on the full VERSION string; the ProductVersion is
+rem the numeric prefix only. Single-line ifs: inside a ( ... ) block the %V%
+rem expansion would happen before "set V" executes.
+set "VERSTRING="
+if exist "%REPO%\VERSION" set /p VERSTRING=<"%REPO%\VERSION"
+if "%VERSTRING%"=="" set "VERSTRING=v0.0.0"
+set "V=%VERSTRING%"
+if "%VERSION%"=="" if "%V:~0,1%"=="v" set "V=%V:~1%"
+if "%VERSION%"=="" for /f "delims=-" %%a in ("%V%") do set "VERSION=%%a"
 
 rem A trailing backslash inside a quoted -d value escapes the closing quote,
 rem which makes the preprocessor swallow every argument after it.
@@ -44,10 +55,11 @@ candle.exe -nologo -arch x64 -dVersion=%VERSION% -dDllDir="%DLLDIR%" ^
 if errorlevel 1 exit /b 1
 
 light.exe -nologo -ext WixUtilExtension -ext WixUIExtension ^
-    -out "%OUT%\ModSecurityIIS.msi" "%OUT%\installer.wixobj" "%OUT%\dlls.wixobj"
+    -out "%OUT%\ModSecurityIIS-%VERSTRING%.msi" ^
+    "%OUT%\installer.wixobj" "%OUT%\dlls.wixobj"
 if errorlevel 1 exit /b 1
 
-echo build_msi: %OUT%\ModSecurityIIS.msi
+echo build_msi: %OUT%\ModSecurityIIS-%VERSTRING%.msi
 exit /b 0
 
 :NoDll

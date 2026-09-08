@@ -1,6 +1,28 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(ModSecurityIIS C CXX)
+# Single source of truth for the version: the first line of the VERSION file,
+# e.g. "v0.0.1-vibe". The numeric part feeds project()/VERSIONINFO/MSI; the
+# full string (plus a short git hash when available) lands in the binary.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MODSECURITYIIS_VERSION LIMIT_COUNT 1)
+string(REGEX MATCH "^v?([0-9]+)\\.([0-9]+)\\.([0-9]+)" _ver "${MODSECURITYIIS_VERSION}")
+if(NOT _ver)
+    message(FATAL_ERROR "Cannot parse a numeric x.y.z version out of '${MODSECURITYIIS_VERSION}'")
+endif()
+project(ModSecurityIIS
+        VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}"
+        LANGUAGES C CXX)
+
+set(MODSECURITYIIS_VERSION_FULL "${MODSECURITYIIS_VERSION}")
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_sha OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_git_sha)
+        string(APPEND MODSECURITYIIS_VERSION_FULL "+g${_git_sha}")
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -102,7 +124,13 @@ set(MODULE_SOURCES
     src/connector.cpp
     src/ModSecurityIIS.def
     ${MC_RC}
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
 )
+
+# VS_VERSION_INFO (Explorer > Properties > Details) + MODSECURITYIIS_VERSION
+# for the code, both generated from the VERSION file.
+configure_file(src/version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
+configure_file(src/version.h.in "${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
 
 # ---------------------------------------------------------------------------
 # The IIS native module.

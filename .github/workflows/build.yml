@@ -195,20 +195,24 @@ jobs:
 
       # heat.exe harvests everything in the directory it is pointed at, so
       # stage only the DLLs (the artifact also carries a build log).
+      # MSI ProductVersion is numeric: strip the prerelease tag off VERSION
+      # ("v0.0.1-vibe" -> 0.0.1). The upgrade test bumps the patch.
       - name: Build MSI
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force msi-input | Out-Null
           Get-ChildItem artifact -Recurse -Filter *.dll |
               Copy-Item -Destination msi-input -Force
-          .\iis\build_msi.bat msi-input 1.0.${{ github.run_number }} msi-out
+          $base = ((Get-Content VERSION -TotalCount 1).Trim() -replace "^v","") -replace "-.*$",""
+          .\iis\build_msi.bat msi-input $base msi-out
 
       # Upgrade needs a second, higher ProductVersion sharing the same
       # UpgradeCode.
       - name: Build higher-version MSI
         shell: pwsh
         run: |
-          .\iis\build_msi.bat msi-input "1.0.$(${{ github.run_number }} + 1)" msi-out2
+          $maj, $min, $pat = (((Get-Content VERSION -TotalCount 1).Trim() -replace "^v","") -replace "-.*$","").Split(".")
+          .\iis\build_msi.bat msi-input "$maj.$min.$([int]$pat + 1)" msi-out2
 
       - name: Install, upgrade, uninstall
         shell: pwsh
@@ -217,8 +221,10 @@ jobs:
           $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
           $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
           $installDir = "C:\Program Files\ModSecurityIIS"
-          $v1 = (Resolve-Path msi-out\ModSecurityIIS.msi).Path
-          $v2 = (Resolve-Path msi-out2\ModSecurityIIS.msi).Path
+          $maj, $min, $pat = (((Get-Content VERSION -TotalCount 1).Trim() -replace "^v","") -replace "-.*$","").Split(".")
+          $expected = "$maj.$min.$([int]$pat + 1)"
+          $v1 = (Get-ChildItem msi-out -Filter *.msi | Select-Object -First 1).FullName
+          $v2 = (Get-ChildItem msi-out2 -Filter *.msi | Select-Object -First 1).FullName
 
           function Invoke-Msi([string[]]$MsiArgs, [string]$Log) {
               $p = Start-Process msiexec.exe -ArgumentList $MsiArgs -Wait -PassThru
@@ -247,7 +253,6 @@ jobs:
           Assert-True (Test-Path "$installDir\modsecurity.conf") "default configuration installed"
           Assert-True ([bool](Select-String -Path $ahConfig -Pattern 'name="ModSecurity"' -Quiet)) "config section declared"
 
-          $expected = "1.0.$(${{ github.run_number }} + 1)"
           Invoke-Msi @("/i", $v2, "/qn", "/norestart", "/l*v", "upgrade.log") "upgrade.log"
           $installed = @(Get-InstalledVersion)
           Assert-True ($installed.Count -eq 1) "upgrade leaves a single product"
@@ -275,7 +280,7 @@ jobs:
         with:
           name: modsecurityiis-msi
           if-no-files-found: warn
-          path: msi-out/ModSecurityIIS.msi
+          path: msi-out/*.msi
 
       - name: Upload MSI logs
         if: always()
@@ -314,7 +319,9 @@ jobs:
 
       - name: Run IIS smoke test
         shell: pwsh
-        run: ./scripts/ci-smoke.ps1 -Msi msi/ModSecurityIIS.msi
+        run: |
+          $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
+          ./scripts/ci-smoke.ps1 -Msi $msi
 
       - name: Upload MSI install log
         if: always()

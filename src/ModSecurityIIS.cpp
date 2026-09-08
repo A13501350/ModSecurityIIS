@@ -24,6 +24,8 @@
 
 #include "httpserv.h"
 
+#include "version.h"
+
 #include "ModSecurityIIS.h"
 #include "mymodulefactory.h"
 #include "moduleconfig.h"
@@ -1524,7 +1526,22 @@ RegisterModule(
             return hr;
         }
         hr = pModuleInfo->SetPriorityForRequestNotification(RQ_SEND_RESPONSE, PRIORITY_ALIAS_LAST);
-        return hr;
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        // Announce the build so Event Viewer shows exactly which version is
+        // running (the message file renders this as "%1").
+        HANDLE hEventLog = RegisterEventSourceA(NULL, "ModSecurity");
+        if (hEventLog != NULL)
+        {
+            LPCSTR msg = "ModSecurityIIS " MODSECURITYIIS_VERSION " registered";
+            ReportEventA(hEventLog, EVENTLOG_INFORMATION_TYPE, 0, 0x1,
+                         NULL, 1, 0, &msg, NULL);
+            DeregisterEventSource(hEventLog);
+        }
+        return S_OK;
     }
     catch (const std::exception& e)
     {

@@ -80,6 +80,15 @@ CI installs this MSI on the runner and runs the smoke tests plus the OWASP CRS
 suite against it (`smoke-iis` job), and a separate `package` job exercises
 install -> upgrade -> uninstall.
 
+## Versioning
+
+The version lives in one place: the `VERSION` file (`v0.0.1-vibe`). The
+numeric prefix (`0.0.1`) becomes the DLL's VS_VERSIONINFO numbers and the MSI
+ProductVersion (MSI requires pure `x.y.z`). The full string plus a short git
+hash (e.g. `v0.0.1-vibe+g1a2b3c4`) lands in the DLL's File/ProductVersion
+strings, in a "ModSecurityIIS ... registered" line in the Application event
+log at startup, and in the MSI file name (`ModSecurityIIS-v0.0.1-vibe.msi`).
+
 ## Enable in IIS
 
 1. Register the native module and add the `system.webServer/ModSecurity`
