@@ -4,8 +4,8 @@
 # scripts/ci-smoke.ps1. Run it via the launcher (keeps the -Msi contract):
 #     ./scripts/ci-smoke.ps1 -Msi <path-to.msi>
 # or directly:
-#     Invoke-Pester -Script @{ Path = 'tests/iis/smoke.Tests.ps1';
-#                              Parameters = @{ Msi = 'foo.msi' } } -Output Detailed
+#     $env:MODSEC_IIS_SMOKE_MSI = 'foo.msi'
+#     Invoke-Pester -Path scripts/smoke.Tests.ps1 -Output Detailed
 #
 # The test installs (optionally) the MSI, wires a site that loads the engine
 # with a few hand-written rules, and asserts phase-1/phase-2 blocking,
@@ -25,41 +25,45 @@ param(
     [string]$PoolName  = "ModSecTestPool"
 )
 
-$ErrorActionPreference = "Stop"
-
-$script:appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
-$script:curl   = "$env:windir\System32\curl.exe"
-$script:audit  = "C:\inetpub\logs\modsec-audit\audit.log"
-$script:diagN  = 0
-
-# Send one request, persist a short post-mortem, and return its status code.
-function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
-    $script:diagN++
-    $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
-    $code = & $script:curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
-                -w "%{http_code}" 2>$null
-    "--- STATUS: $code ---" | Add-Content $out
-    Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
-    "--- BODY (first 2048 bytes) ---" | Add-Content $out
-    Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
-    Write-Host "== $Name => HTTP $code =="
-    Get-Content "$out.headers" -ErrorAction SilentlyContinue |
-        Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
-    return @{ Name = $Name; Status = [int]($code ?? "0") }
-}
-
-function Restart-IisConfigStack {
-    & iisreset /stop 2>&1 | Out-Null
-    Start-Sleep -Seconds 2
-    & iisreset /start 2>&1 | Out-Null
-    foreach ($i in 1..30) {
-        if ((Get-Service W3SVC).Status -eq "Running") { break }
-        Start-Sleep -Seconds 1
-    }
-}
+# Helpers and shared state are defined INSIDE the Describe block (see below) so
+# they exist during Pester's run phase -- a .Tests.ps1 file's top-level code
+# only runs during discovery, so file-scope functions vanish when It/BeforeAll run.
 
 Describe "ModSecurityIIS smoke (L1 integration)" {
+
+    $ErrorActionPreference = "Stop"
+
+    $script:appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+    $script:curl   = "$env:windir\System32\curl.exe"
+    $script:audit  = "C:\inetpub\logs\modsec-audit\audit.log"
+    $script:diagN  = 0
+
+    # Send one request, persist a short post-mortem, and return its status code.
+    function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
+        $script:diagN++
+        $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
+        $code = & $script:curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
+                    -w "%{http_code}" 2>$null
+        "--- STATUS: $code ---" | Add-Content $out
+        Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
+        "--- BODY (first 2048 bytes) ---" | Add-Content $out
+        Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
+        Write-Host "== $Name => HTTP $code =="
+        Get-Content "$out.headers" -ErrorAction SilentlyContinue |
+            Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
+        return @{ Name = $Name; Status = [int]($code ?? "0") }
+    }
+
+    function Restart-IisConfigStack {
+        & iisreset /stop 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+        & iisreset /start 2>&1 | Out-Null
+        foreach ($i in 1..30) {
+            if ((Get-Service W3SVC).Status -eq "Running") { break }
+            Start-Sleep -Seconds 1
+        }
+    }
 
     BeforeAll {
         $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
