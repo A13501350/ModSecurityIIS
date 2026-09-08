@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX installer for the ModSecurityIIS native IIS module (x64).
+
+  Installs:  modsecurityiis.dll + engine DLL -> %SystemRoot%\System32\inetsrv
+             ModSecurity.xml schema          -> ...\inetsrv\config\schema
+             default rule configuration      -> [INSTALLFOLDER]
+             "ModSecurity" event source      -> Windows Application log
+  Registers: the <system.webServer/ModSecurity> config section and the native
+             module "ModSecurityIIS". The section is added with its default
+             enabled="false", so installing never starts filtering traffic;
+             enable it per site once the configuration is in place.
+
+  Toolchain: authored for the WiX Toolset v3 (candle/light/heat). v3.14.1 is
+  the last v3 release and its repository was archived in Feb 2025; v6 and v7
+  binaries are published under the Open Source Maintenance Fee EULA, and v4+
+  uses a different authoring schema. v3 stays free of both.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <Product Id="*"
+           Name="ModSecurityIIS"
+           Language="1033"
+           Codepage="1252"
+           Version="$(var.Version)"
+           Manufacturer="ModSecurityIIS"
+           UpgradeCode="{34077DBA-A39C-4B5B-A025-8238559D7D5C}">
+
+    <Package Id="*"
+             Description="ModSecurity WAF module for IIS"
+             Manufacturer="ModSecurityIIS"
+             InstallerVersion="200"
+             Languages="1033"
+             Compressed="yes"
+             InstallScope="perMachine"
+             InstallPrivileges="elevated"
+             Platform="x64"
+             SummaryCodepage="1252" />
+
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of ModSecurityIIS is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Real administrator detection: per-machine install must not silently
+         continue with a filtered token. -->
+    <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
+    <Property Id="ARPNOMODIFY" Value="yes" Secure="yes" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)iis\license.rtf" />
+    <UIRef Id="WixUI_InstallDir" />
+
+    <!-- IIS presence: the registry value is a DWORD, which AppSearch reports
+         as "#10", so the reliable signal is the property being set at all;
+         we do not compare it numerically. -->
+    <Property Id="IISINSTALLED">
+      <RegistrySearch Id="IisInstalled"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\InetStp"
+                      Name="MajorVersion"
+                      Type="raw"
+                      Win64="yes" />
+    </Property>
+
+    <Condition Message="ModSecurityIIS requires IIS to be installed.">
+      <![CDATA[Installed OR IISINSTALLED]]>
+    </Condition>
+    <Condition Message="ModSecurityIIS requires a 64-bit version of Windows.">
+      <![CDATA[VersionNT64]]>
+    </Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="System64Folder" Name="SystemFolder">
+        <Directory Id="INETSRV" Name="inetsrv">
+          <Directory Id="INETSRVCONFIG" Name="config">
+            <Directory Id="SCHEMAFOLDER" Name="schema" />
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="ModSecurityIIS" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INETSRV">
+      <!-- Event Viewer needs the message table compiled into our DLL,
+           otherwise every entry reads "The description for Event ID ...". -->
+      <Component Id="CmpEventSource" Guid="{59569197-D083-4EBD-857E-24154A5B7B5A}" Win64="yes">
+        <util:EventSource Id="ModSecurityEventSource"
+                          Name="ModSecurity"
+                          Log="Application"
+                          EventMessageFile="[INETSRV]modsecurityiis.dll"
+                          SupportsErrors="yes"
+                          SupportsWarnings="yes"
+                          SupportsInformationals="yes"
+                          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="SCHEMAFOLDER">
+      <Component Id="CmpSchema" Guid="{FAA29D97-4FD0-4C4B-833D-6BDC040A6056}" Win64="yes">
+        <File Id="FileSchema" Name="ModSecurity.xml"
+              Source="$(var.RepoRoot)ModSecurity.xml" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="CmpConfig" Guid="{D7D1C8F9-C639-4B62-9CEB-F5F2DC640A93}" Win64="yes">
+        <File Id="FileModsecurityConf" Name="modsecurity.conf"
+              Source="$(var.RepoRoot)iis\modsecurity.conf" KeyPath="yes" />
+
+        <!-- Declare <section name="ModSecurity"> so the section is usable,
+             then point it at the configuration we just installed. Removed in
+             reverse order on uninstall. -->
+        <util:XmlConfig Id="CfgSectionDeclare"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementPath="//configuration/configSections/sectionGroup[\[]@name='system.webServer'[\]]"
+                        VerifyPath="section[\[]@name='ModSecurity'[\]]"
+                        Action="create" Node="element" Name="section"
+                        Sequence="1" On="install" />
+        <!-- ElementId targets the element created above; those entries must not
+             repeat ElementPath/Action/Node/On. -->
+        <util:XmlConfig Id="CfgSectionName"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementId="CfgSectionDeclare" Name="name"
+                        Value="ModSecurity" Sequence="2" />
+        <util:XmlConfig Id="CfgSectionOverride"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementId="CfgSectionDeclare" Name="overrideModeDefault"
+                        Value="Allow" Sequence="3" />
+        <util:XmlConfig Id="CfgSectionAllowDefinition"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementId="CfgSectionDeclare" Name="allowDefinition"
+                        Value="Everywhere" Sequence="4" />
+
+        <util:XmlConfig Id="CfgModSecurity"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementPath="/configuration/system.webServer"
+                        VerifyPath="/configuration/system.webServer/ModSecurity"
+                        Action="create" Node="element" Name="ModSecurity"
+                        Sequence="5" On="install" />
+        <util:XmlConfig Id="CfgModSecurityConfigFile"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementPath="/configuration/system.webServer/ModSecurity"
+                        Name="configFile"
+                        Value="[INSTALLFOLDER]modsecurity.conf"
+                        Sequence="6" On="install" />
+
+        <util:XmlConfig Id="CfgModSecurityRemove"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementPath="/configuration/system.webServer"
+                        VerifyPath="/configuration/system.webServer/ModSecurity"
+                        Action="delete" Node="element" Name="ModSecurity"
+                        Sequence="1" On="uninstall" />
+        <util:XmlConfig Id="CfgSectionRemove"
+                        File="[INETSRV]config\applicationHost.config"
+                        ElementPath="//configuration/configSections/sectionGroup[\[]@name='system.webServer'[\]]"
+                        VerifyPath="section[\[]@name='ModSecurity'[\]]"
+                        Action="delete" Node="element" Name="section"
+                        Sequence="2" On="uninstall" />
+      </Component>
+
+      <Component Id="CmpSupport" Guid="{3BE0C17E-B82C-4475-B9A4-19AEA08E1C09}" Win64="yes">
+        <File Id="FileUnicodeMapping" Name="unicode.mapping"
+              Source="$(var.RepoRoot)libmodsecurity\unicode.mapping" KeyPath="yes" />
+        <File Id="FileLicense" Name="LICENSE"
+              Source="$(var.RepoRoot)LICENSE" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Built DLLs (modsecurityiis.dll, libModSecurity.dll, ...) harvested by
+         heat into this component group in build_msi.bat. -->
+    <ComponentGroupRef Id="ModSecDlls" />
+
+    <!-- appcmd is the only IIS management tool guaranteed to be present.
+         Unregister first when removing so the module is not left pointing at a
+         DLL that is about to be deleted. -->
+    <CustomAction Id="RegisterModule"
+                  Directory="INETSRV"
+                  Execute="deferred" Impersonate="no" Return="check"
+                  ExeCommand="&quot;[System64Folder]inetsrv\appcmd.exe&quot; install module /name:&quot;ModSecurityIIS&quot; /image:&quot;[INETSRV]modsecurityiis.dll&quot; /add:true" />
+    <CustomAction Id="UnregisterModule"
+                  Directory="INETSRV"
+                  Execute="deferred" Impersonate="no" Return="ignore"
+                  ExeCommand="&quot;[System64Folder]inetsrv\appcmd.exe&quot; uninstall module /module.name:&quot;ModSecurityIIS&quot;" />
+
+    <InstallExecuteSequence>
+      <!-- Clearing any existing registration first keeps install idempotent on
+           a box where the module was registered by hand. -->
+      <Custom Action="UnregisterModule" Before="RegisterModule">
+        <![CDATA[NOT Installed AND NOT REMOVE]]>
+      </Custom>
+      <Custom Action="RegisterModule" After="InstallFiles">
+        <![CDATA[NOT Installed AND NOT REMOVE]]>
+      </Custom>
+      <Custom Action="UnregisterModule" Before="RemoveFiles">
+        <![CDATA[Installed AND REMOVE="ALL"]]>
+      </Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

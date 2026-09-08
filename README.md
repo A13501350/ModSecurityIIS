@@ -60,11 +60,28 @@ directory -- or run the deployment script:
 powershell -ExecutionPolicy Bypass -File scripts\deploy-modsecurityiis.ps1 -DllDir build
 ```
 
-The script copies the DLLs into `%windir%\System32\inetsrv\ModSecurityIIS`,
-installs the configuration schema (`ModSecurity.xml`), registers the
-"ModSecurity" **Application event source** (without this registry key Event
-Viewer cannot render the messages our DLL reports), and registers the native
-module via appcmd. A WiX-based MSI does not exist yet.
+The script copies the DLLs into `%windir%\System32\inetsrv`, installs the
+configuration schema (`ModSecurity.xml`), registers the "ModSecurity"
+**Application event source** (without this registry key Event Viewer cannot
+render the messages our DLL reports), and registers the native module. Pass
+`-Uninstall` to reverse all of it.
+
+## Installing with the MSI
+
+```bat
+iis\build_msi.bat build\Release 1.0.0        :: requires WiX Toolset v3
+msiexec /i build\msi\ModSecurityIIS.msi
+```
+
+The MSI installs the module into `%windir%\System32\inetsrv`, the schema into
+`inetsrv\config\schema`, a default `modsecurity.conf` into
+`C:\Program Files\ModSecurityIIS`, declares the
+`system.webServer/ModSecurity` section, and registers the native module
+`ModSecurityIIS` plus the event source. Uninstall removes all of it and a newer
+package upgrades in place (`MajorUpgrade`). The section is added with the
+default `enabled="false"`, so nothing is filtered until you enable it per site.
+Restart the IIS configuration stack (`iisreset`) after install so IIS picks up
+the new schema.
 
 ## Enable in IIS
 

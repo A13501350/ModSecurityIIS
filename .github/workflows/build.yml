@@ -171,6 +171,118 @@ jobs:
             build/*.dll
             build/libmodsecurity_build/build_libmodsecurity.log
 
+  # Packages the built DLL into an MSI and drives it through install,
+  # in-place upgrade and uninstall on the runner's IIS.
+  package:
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules, recursive)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Download built DLLs
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis
+          path: artifact
+          # Same reuse rule as smoke-iis: a prior run's DLL when build_run_id
+          # is set, otherwise this run's own artifact.
+          run-id: ${{ inputs.build_run_id != '' && inputs.build_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # heat.exe harvests everything in the directory it is pointed at, so
+      # stage only the DLLs (the artifact also carries a build log).
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force msi-input | Out-Null
+          Get-ChildItem artifact -Recurse -Filter *.dll |
+              Copy-Item -Destination msi-input -Force
+          .\iis\build_msi.bat msi-input 1.0.${{ github.run_number }} msi-out
+
+      # Upgrade needs a second, higher ProductVersion sharing the same
+      # UpgradeCode.
+      - name: Build higher-version MSI
+        shell: pwsh
+        run: |
+          .\iis\build_msi.bat msi-input "1.0.$(${{ github.run_number }} + 1)" msi-out2
+
+      - name: Install, upgrade, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+          $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+          $installDir = "C:\Program Files\ModSecurityIIS"
+          $v1 = (Resolve-Path msi-out\ModSecurityIIS.msi).Path
+          $v2 = (Resolve-Path msi-out2\ModSecurityIIS.msi).Path
+
+          function Invoke-Msi([string[]]$MsiArgs, [string]$Log) {
+              $p = Start-Process msiexec.exe -ArgumentList $MsiArgs -Wait -PassThru
+              if ($p.ExitCode -ne 0) {
+                  Get-Content $Log -ErrorAction SilentlyContinue | Write-Host
+                  throw "msiexec $($MsiArgs -join ' ') failed with $($p.ExitCode)"
+              }
+          }
+          function Assert-True([bool]$Ok, [string]$What) {
+              if (-not $Ok) { throw "FAILED: $What" }
+              Write-Host "PASS: $What"
+          }
+          function Test-ModuleRegistered {
+              [bool](& $appcmd list modules /name:ModSecurityIIS 2>$null |
+                     Select-String "ModSecurityIIS" -Quiet)
+          }
+          function Get-InstalledVersion {
+              (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" |
+               Where-Object { $_.DisplayName -eq "ModSecurityIIS" }).DisplayVersion
+          }
+
+          Invoke-Msi @("/i", $v1, "/qn", "/norestart", "/l*v", "install.log") "install.log"
+          Assert-True (Test-ModuleRegistered) "module registered by install"
+          Assert-True (Test-Path "$env:windir\System32\inetsrv\modsecurityiis.dll") "DLL installed to inetsrv"
+          Assert-True (Test-Path "$env:windir\System32\inetsrv\config\schema\ModSecurity.xml") "schema installed"
+          Assert-True (Test-Path "$installDir\modsecurity.conf") "default configuration installed"
+          Assert-True ([bool](Select-String -Path $ahConfig -Pattern 'name="ModSecurity"' -Quiet)) "config section declared"
+
+          $expected = "1.0.$(${{ github.run_number }} + 1)"
+          Invoke-Msi @("/i", $v2, "/qn", "/norestart", "/l*v", "upgrade.log") "upgrade.log"
+          $installed = @(Get-InstalledVersion)
+          Assert-True ($installed.Count -eq 1) "upgrade leaves a single product"
+          Assert-True ($installed[0] -eq $expected) "upgraded to $expected (found $($installed[0]))"
+          Assert-True (Test-ModuleRegistered) "module still registered after upgrade"
+
+          # A worker process that loaded the module keeps the DLL locked, which
+          # would downgrade every removal below to "delete on reboot".
+          Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
+          Stop-Service WAS -Force -ErrorAction SilentlyContinue
+          Invoke-Msi @("/x", $v2, "/qn", "/norestart", "/l*v", "uninstall.log") "uninstall.log"
+          Assert-True (-not (Test-ModuleRegistered)) "module unregistered by uninstall"
+          Assert-True (-not (Test-Path "$env:windir\System32\inetsrv\modsecurityiis.dll")) "DLL removed"
+          Assert-True (-not (Test-Path "$installDir\modsecurity.conf")) "configuration removed"
+          Assert-True (-not ([bool](Select-String -Path $ahConfig -Pattern 'name="ModSecurity"' -Quiet))) "config section removed"
+
+      - name: Upload MSI
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: modsecurityiis-msi
+          if-no-files-found: warn
+          path: msi-out/ModSecurityIIS.msi
+
+      - name: Upload MSI logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-logs
+          if-no-files-found: ignore
+          path: |
+            install.log
+            upgrade.log
+            uninstall.log
+
   # Experimental: deploy the freshly built module to a live IIS on the runner
   # and assert real blocking behavior (header rule, request-body rule,
   # pass-through, audit log, event log). Failure here fails the workflow.
