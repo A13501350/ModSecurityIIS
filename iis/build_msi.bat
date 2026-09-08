@@ -40,7 +40,7 @@ if errorlevel 1 exit /b 1
 
 candle.exe -nologo -arch x64 -dVersion=%VERSION% -dDllDir="%DLLDIR%" ^
     -dRepoRoot="%REPO%" -ext WixUtilExtension -ext WixUIExtension ^
-    -out "%OUT%\" "%REPO%\iis\installer.wxs" "%OUT%\dlls.wxs"
+    -out "%OUT%\\" "%REPO%\iis\installer.wxs" "%OUT%\dlls.wxs"
 if errorlevel 1 exit /b 1
 
 light.exe -nologo -ext WixUtilExtension -ext WixUIExtension ^
