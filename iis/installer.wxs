@@ -195,7 +195,7 @@
       <!-- One entry only: an action may appear once per sequence table. Clears
            any existing registration first (idempotent on a box where the module
            was registered by hand) and also covers full uninstall. Unregistering
-           after RemoveFiles is harmless -- appcmd only edits configuration. -->
+           after RemoveFiles is harmless; appcmd only edits configuration. -->
       <Custom Action="UnregisterModule" Before="RegisterModule">
         <![CDATA[NOT Installed OR REMOVE="ALL"]]>
       </Custom>
