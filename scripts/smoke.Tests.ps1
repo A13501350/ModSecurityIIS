@@ -12,6 +12,13 @@
 # pass-through, audit-log writes, request-body completeness and the
 # server-log -> Event Viewer callback. It deliberately does NOT run the CRS
 # suite (that is the slower, flakier L2 layer in scripts/ci-crs.ps1).
+#
+# PESTER SCOPING (pester.dev/docs/usage/setup-and-teardown): only BeforeAll
+# runs in the Run phase -- a .Tests.ps1 file's top-level code executes during
+# DISCOVERY only, and Describe-body statements are not visible to BeforeAll/It.
+# Everything the tests need (shared paths, helper functions) is therefore
+# defined inside BeforeAll: "All variables defined in BeforeAll are available
+# to all child blocks and tests."
 
 param(
     # The launcher (ci-smoke.ps1) passes the MSI path via $env:MODSEC_IIS_SMOKE_MSI
@@ -25,49 +32,49 @@ param(
     [string]$PoolName  = "ModSecTestPool"
 )
 
-# Helpers and shared state are defined INSIDE the Describe block (see below) so
-# they exist during Pester's run phase -- a .Tests.ps1 file's top-level code
-# only runs during discovery, so file-scope functions vanish when It/BeforeAll run.
-
 Describe "ModSecurityIIS smoke (L1 integration)" {
 
-    $ErrorActionPreference = "Stop"
-
-    $script:appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
-    $script:curl   = "$env:windir\System32\curl.exe"
-    $script:audit  = "C:\inetpub\logs\modsec-audit\audit.log"
-    $script:diagN  = 0
-
-    # Send one request, persist a short post-mortem, and return its status code.
-    # Defined as script:-scoped so BeforeAll/It (separate child scopes in the
-    # run phase) can see it -- a plain `function` here would not be visible.
-    function script:Invoke-Case([string]$Name, [string[]]$CurlArgs) {
-        $script:diagN++
-        $out = "$ConfRoot\diag\case-$($script:diagN)-$($Name -replace '[^A-Za-z0-9]+','-').txt"
-        $code = & $script:curl @CurlArgs -s -D "$out.headers" -o "$out.body" `
-                    -w "%{http_code}" 2>$null
-        "--- STATUS: $code ---" | Add-Content $out
-        Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
-        "--- BODY (first 2048 bytes) ---" | Add-Content $out
-        Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
-        Write-Host "== $Name => HTTP $code =="
-        Get-Content "$out.headers" -ErrorAction SilentlyContinue |
-            Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
-        return @{ Name = $Name; Status = [int]($code ?? "0") }
-    }
-
-    function script:Restart-IisConfigStack {
-        & iisreset /stop 2>&1 | Out-Null
-        Start-Sleep -Seconds 2
-        & iisreset /start 2>&1 | Out-Null
-        foreach ($i in 1..30) {
-            if ((Get-Service W3SVC).Status -eq "Running") { break }
-            Start-Sleep -Seconds 1
-        }
-    }
-
     BeforeAll {
+        $ErrorActionPreference = "Stop"
+
+        $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
+        $curl   = "$env:windir\System32\curl.exe"
+        $audit  = "C:\inetpub\logs\modsec-audit\audit.log"
+
+        # Helper functions are defined here, inside BeforeAll, so they exist in
+        # the Run phase and are visible to every It block (Pester v5 docs:
+        # import/dot-source helpers in BeforeAll). They avoid reads of outer
+        # scope state where the value is a constant.
+
+        # Reload the IIS configuration stack so a freshly installed schema file
+        # under inetsrv\config\schema becomes visible to the config system.
+        function Restart-IisConfigStack {
+            & iisreset /stop 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+            & iisreset /start 2>&1 | Out-Null
+            foreach ($i in 1..30) {
+                if ((Get-Service W3SVC).Status -eq "Running") { break }
+                Start-Sleep -Seconds 1
+            }
+        }
+
+        # Send one request, persist a short post-mortem, and return its status.
+        function Invoke-Case([string]$Name, [string[]]$CurlArgs) {
+            $exe = "$env:windir\System32\curl.exe"
+            $out = "$ConfRoot\diag\case-$($Name -replace '[^A-Za-z0-9]+','-').txt"
+            $code = & $exe @CurlArgs -s -D "$out.headers" -o "$out.body" `
+                        -w "%{http_code}" 2>$null
+            "--- STATUS: $code ---" | Add-Content $out
+            Get-Content "$out.headers" -ErrorAction SilentlyContinue | Select-Object -First 25 | Add-Content $out
+            "--- BODY (first 2048 bytes) ---" | Add-Content $out
+            Get-Content "$out.body" -Raw -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.Substring(0, [Math]::Min(2048, $_.Length)) } | Add-Content $out
+            Write-Host "== $Name => HTTP $code =="
+            Get-Content "$out.headers" -ErrorAction SilentlyContinue |
+                Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
+            return @{ Name = $Name; Status = [int]($code ?? "0") }
+        }
+
         $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "Must run elevated."
@@ -102,6 +109,7 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
         New-Item -ItemType Directory -Force (Join-Path $ConfRoot "data") | Out-Null
         New-Item -ItemType Directory -Force "C:\inetpub\logs\modsec-audit" | Out-Null
         New-Item -ItemType Directory -Force "C:\inetpub\modsec\GeoIP" | Out-Null
+        New-Item -ItemType Directory -Force "$ConfRoot\diag" | Out-Null
         $geoDb   = "C:\inetpub\modsec\GeoIP\GeoIP2-Country.mmdb"
         $geoLine = if (Test-Path $geoDb) {
             "SecGeoLookupDB $geoDb"
@@ -138,26 +146,26 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
 "@
         Set-Content (Join-Path $ConfRoot "rules.conf") $rules -Encoding Ascii
 
-        # --- 4) site -------------------------------------------------------
+        # --- 3) site -------------------------------------------------------
         New-Item -ItemType Directory -Force $SiteRoot | Out-Null
         Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
 
-        & $script:appcmd delete site    $SiteName 2>$null | Out-Null
-        & $script:appcmd delete apppool $PoolName 2>$null | Out-Null
-        & $script:appcmd add apppool /name:$PoolName
-        & $script:appcmd set apppool $PoolName /processModel.loadUserProfile:false
+        & $appcmd delete site    $SiteName 2>$null | Out-Null
+        & $appcmd delete apppool $PoolName 2>$null | Out-Null
+        & $appcmd add apppool /name:$PoolName
+        & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
 
         $poolId = "IIS AppPool\$PoolName"
         icacls "C:\inetpub\logs\modsec-audit" /grant "${poolId}:(OI)(CI)M" | Out-Null
         icacls "$ConfRoot\data"               /grant "${poolId}:(OI)(CI)M" | Out-Null
         icacls "C:\inetpub\modsec\GeoIP"      /grant "${poolId}:(OI)(CI)R" | Out-Null
 
-        & $script:appcmd add site /name:$SiteName /physicalPath:$SiteRoot /bindings:"http/*:$($Port):"
-        & $script:appcmd set app "$SiteName/" /applicationPool:$PoolName
+        & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot /bindings:"http/*:$($Port):"
+        & $appcmd set app "$SiteName/" /applicationPool:$PoolName
 
         $sectionOk = $false
         foreach ($try in 1..5) {
-            $out = & $script:appcmd set config $SiteName /section:ModSecurity `
+            $out = & $appcmd set config $SiteName /section:ModSecurity `
                 /enabled:true /configFile:"C:\inetpub\modsec\modsecurity.conf" /commit:site 2>&1
             if ($LASTEXITCODE -eq 0) { $sectionOk = $true; break }
             Write-Warning "set config attempt $try failed: $out"
@@ -166,17 +174,17 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
         if (-not $sectionOk) {
             throw "ModSecurity section could not be configured for site '$SiteName'."
         }
-        & $script:appcmd start site $SiteName
-        & $script:appcmd list sites
+        & $appcmd start site $SiteName
+        & $appcmd list sites
     }
 
     It "native module registered by install" {
-        $out = & $script:appcmd list modules /name:ModSecurityIIS 2>&1 | Out-String
+        $out = & $appcmd list modules /name:ModSecurityIIS 2>&1 | Out-String
         $out | Should -Match "ModSecurityIIS"
     }
 
     It "schema/section visible to config system" {
-        & $script:appcmd list config /section:system.webServer/ModSecurity 2>&1 | Out-Null
+        & $appcmd list config /section:system.webServer/ModSecurity 2>&1 | Out-Null
         $LASTEXITCODE | Should -Be 0
     }
 
@@ -214,10 +222,10 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
     }
 
     It "E audit log written and contains rules 1001/1002" {
-        $auditOk = (Test-Path $script:audit) -and ((Get-Item $script:audit).Length -gt 0)
+        $auditOk = (Test-Path $audit) -and ((Get-Item $audit).Length -gt 0)
         $auditOk | Should -BeTrue
         if ($auditOk) {
-            $hits = Select-String -Path $script:audit -Pattern '"100[12]"' -Quiet
+            $hits = Select-String -Path $audit -Pattern '"100[12]"' -Quiet
             $hits | Should -BeTrue
         }
     }
@@ -228,15 +236,15 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
         $bodyFile  = Join-Path $ConfRoot "bodyprobe-request.txt"
         Set-Content -Path $bodyFile -Value $probeBody -NoNewline -Encoding ascii
 
-        $auditOff = if (Test-Path $script:audit) { (Get-Item $script:audit).Length } else { 0 }
-        & $script:curl -s -o "$ConfRoot\bodyprobe-response.bin" -w "%{http_code}" --limit-rate 10k `
+        $auditOff = if (Test-Path $audit) { (Get-Item $audit).Length } else { 0 }
+        & $curl -s -o "$ConfRoot\bodyprobe-response.bin" -w "%{http_code}" --limit-rate 10k `
                  -X POST -H "Content-Type: application/x-www-form-urlencoded" `
                  --data-binary "@$bodyFile" "http://127.0.0.1:$Port/" 2>$null
         Start-Sleep -Seconds 3   # let the audit writer flush
 
         $slice = $null
-        if (Test-Path $script:audit) {
-            $fs = [System.IO.File]::Open($script:audit, "Open", "Read", "ReadWrite")
+        if (Test-Path $audit) {
+            $fs = [System.IO.File]::Open($audit, "Open", "Read", "ReadWrite")
             try {
                 $fs.Position = [Math]::Min($auditOff, $fs.Length)
                 $slice = (New-Object System.IO.StreamReader($fs)).ReadToEnd()
