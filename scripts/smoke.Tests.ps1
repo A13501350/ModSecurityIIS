@@ -78,7 +78,20 @@ Describe "ModSecurityIIS smoke (L1 integration)" {
             try {
                 $webCfg = $sm.GetWebConfiguration($Site)
                 $sec = $webCfg.GetSection("system.webServer/ModSecurity")
-                foreach ($k in $Attrs.Keys) { $sec[$k].Value = $Attrs[$k] }
+                if (-not $sec) {
+                    throw "section system.webServer/ModSecurity not found in web config for site '$Site'"
+                }
+                foreach ($k in $Attrs.Keys) {
+                    # ConfigurationElement's string indexer does not bind
+                    # reliably from PowerShell (returns null -> cryptic
+                    # "property 'Value' cannot be found"), so go through the
+                    # explicit GetAttribute API.
+                    $attr = $sec.GetAttribute($k)
+                    if (-not $attr) {
+                        throw "attribute '$k' missing from the ModSecurity section schema"
+                    }
+                    $attr.Value = $Attrs[$k]
+                }
                 $sm.CommitChanges()
             } finally { $sm.Dispose() }
         }
