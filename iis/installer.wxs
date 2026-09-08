@@ -192,16 +192,15 @@
                   ExeCommand="&quot;[System64Folder]inetsrv\appcmd.exe&quot; uninstall module /module.name:&quot;ModSecurityIIS&quot;" />
 
     <InstallExecuteSequence>
-      <!-- Clearing any existing registration first keeps install idempotent on
-           a box where the module was registered by hand. -->
+      <!-- One entry only: an action may appear once per sequence table. Clears
+           any existing registration first (idempotent on a box where the module
+           was registered by hand) and also covers full uninstall. Unregistering
+           after RemoveFiles is harmless -- appcmd only edits configuration. -->
       <Custom Action="UnregisterModule" Before="RegisterModule">
-        <![CDATA[NOT Installed AND NOT REMOVE]]>
+        <![CDATA[NOT Installed OR REMOVE="ALL"]]>
       </Custom>
       <Custom Action="RegisterModule" After="InstallFiles">
         <![CDATA[NOT Installed AND NOT REMOVE]]>
-      </Custom>
-      <Custom Action="UnregisterModule" Before="RemoveFiles">
-        <![CDATA[Installed AND REMOVE="ALL"]]>
       </Custom>
     </InstallExecuteSequence>
   </Product>
