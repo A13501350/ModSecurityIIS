@@ -46,7 +46,6 @@
     <!-- Real administrator detection: per-machine install must not silently
          continue with a filtered token. -->
     <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
-    <Property Id="ARPNOMODIFY" Value="yes" Secure="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\iis\license.rtf" />
     <UIRef Id="WixUI_InstallDir" />
