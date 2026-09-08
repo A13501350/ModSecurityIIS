@@ -27,22 +27,36 @@ Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
 
 $testFile = Join-Path $PSScriptRoot "..\tests\iis\smoke.Tests.ps1"
 if (-not (Test-Path $testFile)) { throw "smoke test not found: $testFile" }
+# Resolve the '..' so Pester's file discovery can locate the .Tests.ps1.
+# (An un-normalized path with '..' makes Pester report "No test files were found".)
+$testFile = (Resolve-Path $testFile).Path
 
-$result = Invoke-Pester -Script @{
-    Path = $testFile
-    Parameters = @{
-        Msi       = $Msi
-        SiteRoot  = $SiteRoot
-        ConfRoot  = $ConfRoot
-        Port      = $Port
-        SiteName  = $SiteName
-        PoolName  = $PoolName
-    }
-} -PassThru -Output Detailed
+try {
+    $result = Invoke-Pester -Script @{
+        Path = $testFile
+        Parameters = @{
+            Msi       = $Msi
+            SiteRoot  = $SiteRoot
+            ConfRoot  = $ConfRoot
+            Port      = $Port
+            SiteName  = $SiteName
+            PoolName  = $PoolName
+        }
+    } -PassThru -Output Detailed
+} catch {
+    Write-Host "Invoke-Pester failed: $_"
+    exit 1
+}
 
+# Guard against the "0 tests found" trap: a non-terminating Pester error can
+# otherwise slip through and report PASSED while BeforeAll (site creation) never ran.
+if (-not $result -or $result.TotalCount -eq 0) {
+    Write-Host "SMOKE TEST FAILED: Pester ran 0 tests (check the test path / discovery)."
+    exit 1
+}
 if ($result.FailedCount -gt 0) {
     Write-Host "SMOKE TEST FAILED ($($result.FailedCount) failed)."
     exit 1
 }
-Write-Host "SMOKE TEST PASSED."
+Write-Host "SMOKE TEST PASSED ($($result.TotalCount) tests)."
 exit 0
