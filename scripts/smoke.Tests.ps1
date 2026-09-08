@@ -220,7 +220,10 @@ SecRule REQUEST_BODY "@rx bodyprobe" "id:1010,phase:2,pass,t:none,log,msg:'probe
             $pool = $sm.ApplicationPools.Add($PoolName)
             $pool.ProcessModel.LoadUserProfile = $false
 
-            $site = $sm.Sites.Add($SiteName, "*:$($Port):", $SiteRoot)
+            # Use the (siteName, port, physicalPath, protocol) overload: the
+            # string-bindingInformation overload is ambiguous for PowerShell's
+            # binder (it tries to convert the path to int port).
+            $site = $sm.Sites.Add($SiteName, $Port, $SiteRoot, "http")
             $site.Applications["/"].ApplicationPoolName = $PoolName
             $sm.CommitChanges()
         } finally { $sm.Dispose() }
