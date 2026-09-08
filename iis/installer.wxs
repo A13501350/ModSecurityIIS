@@ -48,7 +48,7 @@
     <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
     <Property Id="ARPNOMODIFY" Value="yes" Secure="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)iis\license.rtf" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\iis\license.rtf" />
     <UIRef Id="WixUI_InstallDir" />
 
     <!-- IIS presence: the registry value is a DWORD, which AppSearch reports
@@ -101,14 +101,14 @@
     <DirectoryRef Id="SCHEMAFOLDER">
       <Component Id="CmpSchema" Guid="{FAA29D97-4FD0-4C4B-833D-6BDC040A6056}" Win64="yes">
         <File Id="FileSchema" Name="ModSecurity.xml"
-              Source="$(var.RepoRoot)ModSecurity.xml" KeyPath="yes" />
+              Source="$(var.RepoRoot)\ModSecurity.xml" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="CmpConfig" Guid="{D7D1C8F9-C639-4B62-9CEB-F5F2DC640A93}" Win64="yes">
         <File Id="FileModsecurityConf" Name="modsecurity.conf"
-              Source="$(var.RepoRoot)iis\modsecurity.conf" KeyPath="yes" />
+              Source="$(var.RepoRoot)\iis\modsecurity.conf" KeyPath="yes" />
 
         <!-- Declare <section name="ModSecurity"> so the section is usable,
              then point it at the configuration we just installed. Removed in
@@ -163,15 +163,22 @@
 
       <Component Id="CmpSupport" Guid="{3BE0C17E-B82C-4475-B9A4-19AEA08E1C09}" Win64="yes">
         <File Id="FileUnicodeMapping" Name="unicode.mapping"
-              Source="$(var.RepoRoot)libmodsecurity\unicode.mapping" KeyPath="yes" />
+              Source="$(var.RepoRoot)\libmodsecurity\unicode.mapping" KeyPath="yes" />
         <File Id="FileLicense" Name="LICENSE"
-              Source="$(var.RepoRoot)LICENSE" />
+              Source="$(var.RepoRoot)\LICENSE" />
       </Component>
     </DirectoryRef>
 
-    <!-- Built DLLs (modsecurityiis.dll, libModSecurity.dll, ...) harvested by
-         heat into this component group in build_msi.bat. -->
-    <ComponentGroupRef Id="ModSecDlls" />
+    <Feature Id="MainFeature" Title="ModSecurityIIS" Level="1"
+             ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentRef Id="CmpEventSource" />
+      <ComponentRef Id="CmpSchema" />
+      <ComponentRef Id="CmpConfig" />
+      <ComponentRef Id="CmpSupport" />
+      <!-- Built DLLs (modsecurityiis.dll, libModSecurity.dll, ...) harvested
+           by heat into this component group in build_msi.bat. -->
+      <ComponentGroupRef Id="ModSecDlls" />
+    </Feature>
 
     <!-- appcmd is the only IIS management tool guaranteed to be present.
          Unregister first when removing so the module is not left pointing at a

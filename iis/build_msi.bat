@@ -20,6 +20,10 @@ if "%VERSION%"=="" set "VERSION=1.0.0"
 set "OUT=%~3"
 if "%OUT%"=="" set "OUT=%REPO%\build\msi"
 
+rem A trailing backslash inside a quoted -d value escapes the closing quote,
+rem which makes the preprocessor swallow every argument after it.
+if "%DLLDIR:~-1%"=="\" set "DLLDIR=%DLLDIR:~0,-1%"
+
 if not exist "%DLLDIR%\modsecurityiis.dll" goto :NoDll
 
 where heat.exe >nul 2>nul
@@ -35,7 +39,7 @@ heat.exe dir "%DLLDIR%" -cg ModSecDlls -dr INETSRV -gg -sreg -srd ^
 if errorlevel 1 exit /b 1
 
 candle.exe -nologo -arch x64 -dVersion=%VERSION% -dDllDir="%DLLDIR%" ^
-    -dRepoRoot="%REPO%\" -ext WixUtilExtension -ext WixUIExtension ^
+    -dRepoRoot="%REPO%" -ext WixUtilExtension -ext WixUIExtension ^
     -out "%OUT%\" "%REPO%\iis\installer.wxs" "%OUT%\dlls.wxs"
 if errorlevel 1 exit /b 1
 
