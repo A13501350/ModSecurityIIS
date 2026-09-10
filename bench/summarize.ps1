@@ -8,21 +8,35 @@
     median. Normalising per repetition is what cancels machine drift between
     the interleaved arms; the median (not the mean) keeps one bad run from
     moving the headline number.
+
+    -1 is the CSV's "the harness could not read this" sentinel (it comes from
+    Get-Number finding none of the candidate JSON keys) and is shown as n/a
+    rather than being averaged in as a real zero.
 #>
 [CmdletBinding()]
 param(
-    [string]$Csv   = "bench-raw.csv",
-    [string]$Out   = "bench-report.md"
+    [string]$Csv     = "bench-raw.csv",
+    # Not $Out: PowerShell variable names are case-insensitive, so a $Out
+    # parameter collides with a $out buffer in the body and the type constraint
+    # corrupts the buffer.
+    [string]$OutFile = "bench-report.md"
 )
 
 $rows = @(Import-Csv $Csv)
 if ($rows.Count -eq 0) { throw "no rows in $Csv" }
 
-function Get-Median([double[]]$Values) {
-    $sorted = $Values | Where-Object { $_ -ne $null } | Sort-Object
+function Get-Median {
+    param([double[]]$Values)
+    $sorted = @($Values | Where-Object { $null -ne $_ -and $_ -ge 0 } | Sort-Object)
     if ($sorted.Count -eq 0) { return $null }
-    if ($sorted.Count % 2) { return [double]$sorted[($sorted.Count - 1) / 2] }
+    if ($sorted.Count % 2) { return [double]$sorted[[int](($sorted.Count - 1) / 2)] }
     return ([double]$sorted[$sorted.Count / 2 - 1] + [double]$sorted[$sorted.Count / 2]) / 2
+}
+
+function Format-Num {
+    param($Value, [string]$Suffix)
+    if ($null -eq $Value) { return "n/a" }
+    return ("{0:N1}{1}" -f $Value, $Suffix)
 }
 
 # Keyed by ruleset|scenario|concurrency|rep -> baseline row.
@@ -36,63 +50,71 @@ foreach ($r in $rows) {
 $groups = $rows | Where-Object { $_.Arm -ne "baseline" } |
           Group-Object Ruleset, Scenario, Concurrency, Arm
 
-$out = @()
-$out += "# IIS connector benchmark: v2 vs v3"
-$out += ""
-$out += "Generated from ``$Csv`` ($($rows.Count) measurements)."
-$out += ""
-$out += "Columns are **medians across repetitions** of per-repetition values that"
-$out += "were first normalised against that repetition's baseline (no WAF module)."
-$out += ""
-$out += "| ruleset | scenario | conc | arm | rps | vs base | p50 ms | vs base | cpu ms/req | peak MB |"
-$out += "|---|---|---|---|---:|---:|---:|---:|---:|---:|"
+$lines = @()
+$lines += "# IIS connector benchmark: v2 vs v3"
+$lines += ""
+$lines += "Generated from ``$Csv`` ($($rows.Count) measurements)."
+$lines += ""
+$lines += "Columns are **medians across repetitions** of per-repetition values that"
+$lines += "were first normalised against that repetition's baseline (no WAF module)."
+$lines += "Lower is better for every *vs base* column."
+$lines += ""
+$lines += "| ruleset | scenario | conc | arm | rps | vs base rps | p50 ms | vs base p50 | cpu ms/req | ws MB |"
+$lines += "|---|---|---|---|---:|---:|---:|---:|---:|---:|"
 
 foreach ($g in ($groups | Sort-Object Name)) {
     $parts = $g.Name -split ", "
-    $ruleset, $scenario, $conc, $arm = $parts[0], $parts[1], $parts[2], $parts[3]
+    $ruleset = $parts[0]; $scenario = $parts[1]; $conc = $parts[2]; $arm = $parts[3]
 
-    $rpsRatio = @(); $latRatio = @(); $rps = @(); $p50 = @(); $cpu = @(); $mem = @()
+    $rps = @(); $p50 = @(); $cpu = @(); $ws = @()
+    $rpsRatio = @(); $latRatio = @()
+
     foreach ($r in $g.Group) {
+        $rps += [double]$r.RPS
+        $cpu += [double]$r.CpuMsPerReq
+        $ws  += [double]$r.WsMB
+        if ([double]$r.P50ms -ge 0) { $p50 += [double]$r.P50ms }
+
         $b = $baseline["$ruleset|$scenario|$conc|$($r.Rep)"]
-        $rps  += [double]$r.RPS
-        $p50  += [double]$r.P50ms
-        $cpu  += [double]$r.CpuMsPerReq
-        $mem  += [double]$r.PeakPrivateMB
-        if ($b -and [double]$b.RPS -gt 0) {
-            $rpsRatio += ([double]$b.RPS - [double]$r.RPS) / [double]$b.RPS * 100
-        }
-        if ($b -and [double]$b.P50ms -gt 0) {
-            $latRatio += ([double]$r.P50ms - [double]$b.P50ms) / [double]$b.P50ms * 100
+        if ($b) {
+            if ([double]$b.RPS -gt 0 -and [double]$r.RPS -ge 0) {
+                $rpsRatio += ([double]$b.RPS - [double]$r.RPS) / [double]$b.RPS * 100
+            }
+            if ([double]$b.P50ms -gt 0 -and [double]$r.P50ms -ge 0) {
+                $latRatio += ([double]$r.P50ms - [double]$b.P50ms) / [double]$b.P50ms * 100
+            }
         }
     }
 
-    $fmt = {
-        param($v, [string]$suffix)
-        if ($v -eq $null) { return "n/a" }
-        return ("{0:N1}{1}" -f $v, $suffix)
-    }
-
-    $out += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} |" -f `
+    $lines += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} |" -f `
         $ruleset, $scenario, $conc, $arm,
-        (& $fmt (Get-Median $rps) ""),
-        (& $fmt (Get-Median $rpsRatio) "%"),
-        (& $fmt (Get-Median $p50) ""),
-        (& $fmt (Get-Median $latRatio) "%"),
-        (& $fmt (Get-Median $cpu) ""),
-        (& $fmt (Get-Median $mem) ""))
+        (Format-Num (Get-Median $rps) ""),
+        (Format-Num (Get-Median $rpsRatio) "%"),
+        (Format-Num (Get-Median $p50) ""),
+        (Format-Num (Get-Median $latRatio) "%"),
+        (Format-Num (Get-Median $cpu) ""),
+        (Format-Num (Get-Median $ws) ""))
 }
 
-$out += ""
-$out += "## How to read this"
-$out += ""
-$out += "* **vs base (rps)** -- throughput lost to the WAF. Lower is better."
-$out += "* **vs base (p50)** -- added median latency. Lower is better."
-$out += "* **cpu ms/req** -- worker-process CPU milliseconds per request"
-$out += "  (``cores busy / rps * 1000``). The cleanest single cost number, because"
-$out += "  it is independent of how busy the shared runner happened to be."
-$out += "* Absolute numbers are only comparable **within one run**. GitHub-hosted"
-$out += "  runners are virtualised and shared-tenant; compare the normalised"
-$out += "  columns across runs, not raw rps."
+$lines += ""
+$lines += "## How to read this"
+$lines += ""
+$lines += "* **vs base rps** -- throughput lost to the WAF. Negative means the WAF arm"
+$lines += "  was *faster* than no WAF, which means the run was noise-dominated:"
+$lines += "  raise ``-Repeats`` and ``-Duration`` before believing the number."
+$lines += "* **vs base p50** -- added median latency."
+$lines += "* **cpu ms/req** -- worker-process CPU milliseconds per request, from the"
+$lines += "  exact ``TotalProcessorTime`` delta around each run. This is the cleanest"
+$lines += "  single cost figure: it does not depend on how busy the shared runner was."
+$lines += "* **ws MB** -- worker-process working set after the run."
+$lines += "* Absolute numbers are only comparable **within one run**. GitHub-hosted"
+$lines += "  runners are virtualised and shared-tenant; compare the normalised columns"
+$lines += "  across runs, not raw rps."
+$lines += "* A ``n/a`` means the value could not be read -- check ``bench-json/``"
+$lines += "  in the artifacts for the raw bombardier output."
 
-Set-Content $Out -Value ($out -join "`n") -Encoding UTF8
-Write-Host "Wrote $Out"
+# .NET rather than Set-Content: no provider/encoding ambiguity.
+[System.IO.File]::WriteAllLines(
+    (Join-Path $PWD $OutFile), [string[]]$lines, [System.Text.UTF8Encoding]::new($false))
+
+Write-Host "Wrote $OutFile ($($lines.Count) lines)"

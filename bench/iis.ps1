@@ -193,37 +193,39 @@ function Install-Arm {
 
 # ---------------------------------------------------------------------------
 # Measurement helpers
+#
+# CPU is ACCOUNTED, not sampled. Install-Arm runs iisreset on every arm switch,
+# so w3wp is a fresh process per arm; summing TotalProcessorTime before and
+# after a load run therefore yields exactly the CPU that run consumed, with no
+# sampling error and no background job.
+#
+# This replaced a Start-Job + Get-Counter sampler that returned all zeros in CI:
+# with -ErrorAction SilentlyContinue the collector's failure was invisible and
+# the harness happily reported 0 CPU for every arm.
 # ---------------------------------------------------------------------------
 
-# Samples w3wp CPU/private-bytes once a second for the duration of a run.
-function Start-CounterJob {
-    param([int]$Seconds)
-    Start-Job -ScriptBlock {
-        param($secs)
-        Get-Counter -Counter '\Process(w3wp*)\% Processor Time','\Process(w3wp*)\Private Bytes' `
-            -SampleInterval 1 -MaxSamples $secs -ErrorAction SilentlyContinue
-    } -ArgumentList $Seconds
-}
+# Reads the current worker-process state. CpuSeconds is cumulative for the
+# process, so callers take a delta around a run.
+function Get-WorkerSnapshot {
+    $procs = @(Get-Process -Name w3wp -ErrorAction SilentlyContinue)
 
-# Returns @{ CpuCores = average cores busy; PeakPrivateMB = peak working set }
-function Stop-CounterJob {
-    param($Job)
-    $samples = @(Receive-Job $Job -Wait -ErrorAction SilentlyContinue)
-    Remove-Job $Job -Force -ErrorAction SilentlyContinue
-
-    if ($samples.Count -eq 0) { return @{ CpuCores = 0; PeakPrivateMB = 0 } }
-
-    $perSample = $samples | ForEach-Object {
-        ($_.CounterSamples | Where-Object { $_.Path -like '*% Processor Time*' } |
-            Measure-Object -Property CookedValue -Sum).Sum
+    $cpu  = 0.0
+    $ws   = 0
+    $peak = 0
+    foreach ($p in $procs) {
+        $cpu += $p.TotalProcessorTime.TotalSeconds
+        if ($p.WorkingSet64    -gt $ws)   { $ws   = $p.WorkingSet64 }
+        if ($p.PeakWorkingSet64 -gt $peak) { $peak = $p.PeakWorkingSet64 }
     }
-    $bytes = $samples | ForEach-Object {
-        ($_.CounterSamples | Where-Object { $_.Path -like '*Private Bytes*' } |
-            Measure-Object -Property CookedValue -Maximum).Maximum
-    }
+
     @{
-        # "% Processor Time" is 100 per busy core, so /100 is cores.
-        CpuCores      = (($perSample | Measure-Object -Average).Average) / 100.0
-        PeakPrivateMB = [math]::Round((($bytes | Measure-Object -Maximum).Maximum) / 1MB, 1)
+        # Cumulative CPU seconds across all worker processes.
+        CpuSeconds = $cpu
+        # Working set right now, and the high-water mark since the process
+        # started (which is since the arm was installed, because iisreset
+        # recycled it). The peak is therefore per-arm, not per-run.
+        WsMB       = [math]::Round($ws   / 1MB, 1)
+        PeakWsMB   = [math]::Round($peak / 1MB, 1)
+        Processes  = $procs.Count
     }
 }

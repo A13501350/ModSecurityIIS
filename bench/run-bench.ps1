@@ -15,6 +15,11 @@
     * v2 and v3 both ship modsecurityiis.dll and both read
       system.webServer/ModSecurity, so they can never be loaded together --
       every switch is a full uninstall/install plus iisreset.
+    * CPU is accounted from the worker process's TotalProcessorTime delta, not
+      sampled. Install-Arm recycles the process, so each arm starts clean.
+    * The raw bombardier JSON for every run is written to bench-json/ and
+      uploaded, because a wrong guess about its schema shows up only as a
+      silent zero.
 
 .PARAMETER V2DllDir   Directory containing the v2 modsecurityiis.dll (+ deps).
 .PARAMETER V3DllDir   Directory containing the v3 modsecurityiis.dll + libModSecurity.dll.
@@ -37,11 +42,11 @@ param(
     [string]$Duration   = "20s",
     [ValidateSet("throughput", "latency")][string]$Mode = "throughput",
     [int]$Rate          = 500,
-    [string]$OutFile    = "bench-raw.csv"
+    [string]$OutFile    = "bench-raw.csv",
+    [string]$JsonDir    = "bench-json"
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "iis.ps1")
 
 # ---------------------------------------------------------------------------
@@ -104,8 +109,20 @@ function New-BodyFile {
     return $path
 }
 
+# bombardier's JSON keys are read through a candidate list and a -1 sentinel,
+# so a schema mismatch is loudly wrong instead of quietly zero.
+function Get-Number {
+    param($Bag, [string[]]$Names)
+    if ($null -eq $Bag) { return $null }
+    foreach ($n in $Names) {
+        $v = $Bag.$n
+        if ($null -ne $v) { return [double]$v }
+    }
+    return $null
+}
+
 function Invoke-LoadRun {
-    param($Scenario, [int]$Conc, [string]$Duration)
+    param($Scenario, [int]$Conc, [string]$Duration, [string]$Tag)
 
     $url = "http://127.0.0.1" + $Scenario.Path
     # NOTE: not $args -- that is a PowerShell automatic variable.
@@ -128,19 +145,38 @@ function Invoke-LoadRun {
     # The JSON block starts at the first brace; anything before it is the
     # progress line bombardier writes to stderr.
     $start = $raw.IndexOf("{")
-    if ($start -lt 0) { throw "no JSON from bombardier:`n$raw" }
-    $json = $raw.Substring($start) | ConvertFrom-Json
+    if ($start -lt 0) { throw "no JSON from bombardier for ${Tag}:`n$raw" }
+    $jsonText = $raw.Substring($start)
 
-    $lat = $json.result.latencies
+    New-Item -ItemType Directory -Force -Path $JsonDir | Out-Null
+    # ${Tag} not $Tag: expandable strings support property access, so "$Tag.json"
+    # reads the property `json` off $Tag (a string) and yields nothing.
+    Set-Content (Join-Path $JsonDir "${Tag}.json") -Value $jsonText -Encoding Ascii
+
+    $json = $jsonText | ConvertFrom-Json
+    $res  = $json.result
+    $lat  = $res.latencies
+
+    $reqs = 0
+    foreach ($k in 'req1xx','req2xx','req3xx','req4xx','req5xx','reqFailed','others') {
+        $v = Get-Number $res @($k)
+        if ($null -ne $v) { $reqs += [int]$v }
+    }
+
+    $p50 = Get-Number $lat @('50th','p50','median')
+    $p95 = Get-Number $lat @('95th','p95')
+    $p99 = Get-Number $lat @('99th','p99')
+
     return [pscustomobject]@{
-        RPS      = [math]::Round($json.result.rps.mean, 1)
-        P50ms    = [math]::Round($lat.'50th' / 1e6, 2)
-        P95ms    = [math]::Round($lat.'95th' / 1e6, 2)
-        P99ms    = [math]::Round($lat.'99th' / 1e6, 2)
-        Req2xx   = [int]$json.result.req2xx
-        Req4xx   = [int]$json.result.req4xx
-        Req5xx   = [int]$json.result.req5xx
-        Failed   = [int]$json.result.reqFailed + [int]$json.result.others
+        RPS      = Get-Number $res.rps @('mean')
+        P50ms    = if ($null -ne $p50) { [math]::Round($p50 / 1e6, 2) } else { -1 }
+        P95ms    = if ($null -ne $p95) { [math]::Round($p95 / 1e6, 2) } else { -1 }
+        P99ms    = if ($null -ne $p99) { [math]::Round($p99 / 1e6, 2) } else { -1 }
+        ReqCount = $reqs
+        Req4xx   = [int](Get-Number $res @('req4xx'))
+        Req5xx   = [int](Get-Number $res @('req5xx'))
+        Failed   = [int](Get-Number $res @('reqFailed'))
+        Raw      = $jsonText
     }
 }
 
@@ -165,42 +201,60 @@ try {
                 Write-Host "== rep $rep/$Repeats  arm=$arm  ruleset=$ruleset"
                 Install-Arm -Arm $arm -DllDir $dllDir -ConfigFile $config
 
+                # Warm up ARR, the origin's connection pool and the connector's
+                # rules load. Not recorded, and taken before the first CPU
+                # snapshot so its cost is not charged to the first scenario.
+                $warm = $ScenarioDefs | Where-Object { $_.Id -eq "S1" } | Select-Object -First 1
+                if ($warm) {
+                    try {
+                        $null = Invoke-LoadRun -Scenario $warm -Conc $Concurrency[0] `
+                                    -Duration "5s" -Tag "warmup-$arm"
+                    } catch {
+                        Write-Host "  warmup failed (ignored): $_"
+                    }
+                }
+
                 foreach ($scenario in $ScenarioDefs) {
                     if (-not ($Scenarios -contains $scenario.Id)) { continue }
                     if ($scenario.NeedsBlock -and $ruleset -eq "R0") { continue }
 
                     foreach ($conc in $Concurrency) {
-                        # Sample slightly longer than the load run so bombardier's
-                        # startup is always covered by at least one sample.
-                        $counter = Start-CounterJob -Seconds ($durationSec + 8)
+                        $before = Get-WorkerSnapshot
                         $sw = [Diagnostics.Stopwatch]::StartNew()
-                        $res = Invoke-LoadRun -Scenario $scenario -Conc $conc -Duration $Duration
+                        $tag = "r${rep}-${arm}-${ruleset}-$($scenario.Id)-c${conc}"
+                        $res = Invoke-LoadRun -Scenario $scenario -Conc $conc `
+                                   -Duration $Duration -Tag $tag
                         $sw.Stop()
-                        $counters = Stop-CounterJob -Job $counter
+                        $after = Get-WorkerSnapshot
+
+                        $cpuSec = $after.CpuSeconds - $before.CpuSeconds
+                        $cpuMs  = if ($res.ReqCount -gt 0) {
+                            [math]::Round($cpuSec * 1000 / $res.ReqCount, 3)
+                        } else { -1 }
 
                         $rows += [pscustomobject]@{
-                            Rep          = $rep
-                            Arm          = $arm
-                            Ruleset      = $ruleset
-                            Scenario     = $scenario.Id
-                            Concurrency  = $conc
-                            WallSec      = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-                            RPS          = $res.RPS
-                            P50ms        = $res.P50ms
-                            P95ms        = $res.P95ms
-                            P99ms        = $res.P99ms
-                            Req2xx       = $res.Req2xx
-                            Req4xx       = $res.Req4xx
-                            Req5xx       = $res.Req5xx
-                            Failed       = $res.Failed
-                            CpuCores     = [math]::Round($counters.CpuCores, 3)
-                            CpuMsPerReq  = if ($res.RPS -gt 0) {
-                                [math]::Round($counters.CpuCores * 1000 / $res.RPS, 3)
-                            } else { 0 }
-                            PeakPrivateMB = $counters.PeakPrivateMB
+                            Rep         = $rep
+                            Arm         = $arm
+                            Ruleset     = $ruleset
+                            Scenario    = $scenario.Id
+                            Concurrency = $conc
+                            WallSec     = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                            RPS         = if ($null -ne $res.RPS) { [math]::Round($res.RPS, 1) } else { -1 }
+                            P50ms       = $res.P50ms
+                            P95ms       = $res.P95ms
+                            P99ms       = $res.P99ms
+                            ReqCount    = $res.ReqCount
+                            Req4xx      = $res.Req4xx
+                            Req5xx      = $res.Req5xx
+                            Failed      = $res.Failed
+                            CpuSec      = [math]::Round($cpuSec, 3)
+                            CpuMsPerReq = $cpuMs
+                            WsMB        = $after.WsMB
+                            PeakWsMB    = $after.PeakWsMB
+                            Workers     = $after.Processes
                         }
-                        Write-Host ("   {0} c={1,-3} rps={2,-9} p50={3,-7} cpu/req={4}ms" -f `
-                            $scenario.Id, $conc, $res.RPS, $res.P50ms, $rows[-1].CpuMsPerReq)
+                        Write-Host ("   {0} c={1,-3} rps={2,-9} p50={3,-7} cpu/req={4}ms ws={5}MB" -f `
+                            $scenario.Id, $conc, $rows[-1].RPS, $res.P50ms, $cpuMs, $after.WsMB)
                     }
                 }
             }

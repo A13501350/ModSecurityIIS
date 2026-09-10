@@ -350,7 +350,7 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path bench-raw.csv) {
-              ./bench/summarize.ps1 -Csv bench-raw.csv -Out bench-report.md
+              ./bench/summarize.ps1 -Csv bench-raw.csv -OutFile bench-report.md
           } else {
               Write-Host "bench-raw.csv missing -- the benchmark did not complete."
           }
@@ -371,3 +371,7 @@ jobs:
           path: |
             bench-raw.csv
             bench-report.md
+            # Raw bombardier payloads: the ground truth for the JSON schema the
+            # parser has to match, so a key rename is diagnosable from the
+            # artifact instead of another CI round-trip.
+            bench-json/
