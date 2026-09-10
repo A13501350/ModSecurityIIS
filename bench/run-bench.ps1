@@ -284,6 +284,11 @@ try {
                             RpsP99      = if ($null -ne $res.RpsP99) { [math]::Round($res.RpsP99, 1) } else { -1 }
                             LittleLaw   = $res.LittleLaw
                             ReqCount    = $res.ReqCount
+                            # A stalled run serves about one request per client
+                            # and burns no time doing it. Marked explicitly so
+                            # the report can exclude it instead of computing a
+                            # ratio against a baseline that actually ran.
+                            Hung        = ($res.RPS -lt 1 -and $res.ReqCount -le $conc)
                             Req4xx      = $res.Req4xx
                             Req5xx      = $res.Req5xx
                             Failed      = $res.Failed

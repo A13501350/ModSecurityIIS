@@ -71,8 +71,12 @@ foreach ($g in ($groups | Sort-Object Name)) {
 
     $rps = @(); $lat = @(); $cpu = @(); $ws = @()
     $rpsRatio = @(); $latRatio = @()
+    $hungCount = 0
 
     foreach ($r in $g.Group) {
+        # A stalled row carries no information and would otherwise poison the
+        # ratios (it produced "vs base lat 4,155,318%" in an earlier report).
+        if ("$($r.Hung)" -eq "True") { $hungCount++; continue }
         $rps += [double]$r.RPS
         $cpu += [double]$r.CpuMsPerReq
         $ws  += [double]$r.WsMB
@@ -87,6 +91,12 @@ foreach ($g in ($groups | Sort-Object Name)) {
                 $latRatio += ([double]$r.LatMeanMs - [double]$b.LatMeanMs) / [double]$b.LatMeanMs * 100
             }
         }
+    }
+
+    if ($rps.Count -eq 0 -and $hungCount -gt 0) {
+        $lines += ("| {0} | {1} | {2} | {3} | **HUNG** | - | - | - | - | - |" -f `
+            $ruleset, $scenario, $conc, $arm)
+        continue
     }
 
     $lines += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} |" -f `
@@ -105,6 +115,9 @@ $lines += ""
 $lines += "* **vs base rps** -- throughput lost to the WAF. Negative means the WAF arm"
 $lines += "  was *faster* than no WAF, which means the run was noise-dominated:"
 $lines += "  raise ``-Repeats`` and ``-Duration`` before believing the number."
+$lines += "* **HUNG** -- the arm served about one request per client and then"
+$lines += "  stalled (no throughput, no CPU), so the row carries no measurement and"
+$lines += "  is excluded from the ratios rather than reported as a huge percentage."
 $lines += "* **vs base lat** -- added latency, computed from bombardier's"
 $lines += "  ``latency.mean``. bombardier publishes **no latency percentiles**, so tail"
 $lines += "  behaviour is invisible here and a mean can hide it. Switch to k6 (or add"

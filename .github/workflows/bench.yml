@@ -103,17 +103,11 @@ jobs:
       # ModSecurityIIS itself and CMake would fail with "does not appear to
       # contain CMakeLists.txt" under v2/iis.
       #
-      # TEMPORARY: the defaults point at the fork's iis-fix-chunked-te branch to
-      # test whether that one commit (a WriteBodyCallback fix for a request that
-      # carried both Transfer-Encoding: chunked and Content-Length) is what
-      # makes v2/master hang on every request with a body. The branch is just
-      # v2/master + that commit, so it is a clean single-variable comparison.
-      # Revert to owasp-modsecurity/ModSecurity @ v2/master once answered.
       - name: Checkout ModSecurity v2
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.v2_repo || 'A13501350/ModSecurity' }}
-          ref: ${{ inputs.v2_ref || 'iis-fix-chunked-te' }}
+          repository: ${{ inputs.v2_repo || 'owasp-modsecurity/ModSecurity' }}
+          ref: ${{ inputs.v2_ref || 'v2/master' }}
           path: v2
           submodules: recursive
           fetch-depth: 0
@@ -379,6 +373,15 @@ jobs:
           if (Test-Path bench-report.md) { Get-Content bench-report.md }
           else { Write-Host "no report" }
 
+      # Everything the modules said, plus the IIS access log. A stalled module
+      # is far easier to read from its own trace than to infer from timings.
+      - name: Collect diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          . ./bench/iis.ps1
+          Save-Diagnostics -Dir diag
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -392,3 +395,5 @@ jobs:
             # parser has to match, so a key rename is diagnosable from the
             # artifact instead of another CI round-trip.
             bench-json/
+            # Event log, module debug log, IIS access log.
+            diag/

@@ -227,6 +227,34 @@ function Install-Arm {
     Assert-True (-not $bad) "module loaded cleanly ($Arm)"
 }
 
+# Dumps everything the modules might have said into diag/ for the artifact.
+# The connectors log through a host hook -- on IIS that is the Windows Event
+# Log under source "ModSecurity" -- and the harness installed the event source
+# but never collected what it received. When a module stalls, its own trace is
+# the first thing to read rather than inferring from the outside.
+function Save-Diagnostics {
+    param([string]$Dir = "diag")
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+    Get-EventLog -LogName Application -Newest 500 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -match 'ModSecurity|W3SVC|WAS|IIS' } |
+        Select-Object TimeGenerated, Source, EntryType, EventID, Message |
+        Format-List | Out-File (Join-Path $Dir "eventlog.txt") -Width 400
+
+    # The modules' own trace, one file per arm (see common-*.conf).
+    foreach ($p in "C:\bench\modsec-debug-v2.log", "C:\bench\modsec-debug-v3.log",
+                   "C:\bench\error.log") {
+        if (Test-Path $p) { Copy-Item $p (Join-Path $Dir (Split-Path $p -Leaf)) -Force }
+    }
+
+    Get-ChildItem "C:\inetpub\logs\LogFiles\W3SVC*" -Filter *.log -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } |
+        Copy-Item -Destination $Dir -Force
+
+    Get-ChildItem $Dir -ErrorAction SilentlyContinue |
+        Format-Table Name, Length | Out-String | Write-Host
+}
+
 # ---------------------------------------------------------------------------
 # Measurement helpers
 #
