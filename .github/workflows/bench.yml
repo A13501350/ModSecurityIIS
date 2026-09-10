@@ -228,15 +228,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Same approach as scripts/smoke.Tests.ps1:83-91 -- Get-WindowsFeature /
+      # Install-WindowsFeature with the Web-* names, and only for what is
+      # missing. A single Enable-WindowsOptionalFeature call listing several
+      # features fails with "One or several parent features are disabled".
+      # The feature list is an array rather than a backtick continuation: a
+      # backtick followed by a stray trailing space silently stops continuing.
       - name: Enable IIS
         shell: pwsh
         run: |
-          Enable-WindowsOptionalFeature -Online -NoRestart -FeatureName `
-            IIS-WebServerRole, IIS-WebServer, IIS-CommonHttpFeatures, `
-            IIS-StaticContent, IIS-DefaultDocument, IIS-HttpErrors, `
-            IIS-HttpLogging, IIS-RequestFiltering, IIS-ManagementConsole, `
-            IIS-ManagementScriptingTools | Out-Null
-          Start-Service W3SVC -ErrorAction SilentlyContinue
+          $names = @('Web-Static-Content','Web-Default-Doc','Web-Http-Errors','Web-Filtering')
+          $features = Get-WindowsFeature $names -ErrorAction SilentlyContinue
+          if ($features | Where-Object { -not $_.Installed }) {
+              Write-Host "Installing missing IIS features..."
+              Install-WindowsFeature $names | Out-Null
+          }
+          if ((Get-Service W3SVC).Status -ne "Running") { Start-Service W3SVC }
+          Get-Service W3SVC | Format-List Name, Status
 
       - uses: actions/setup-go@v7
         with:
@@ -304,15 +312,24 @@ jobs:
             -Rate $env:BENCH_RATE `
             -OutFile bench-raw.csv
 
+      # Guarded on the CSV: these are bookkeeping steps, and when the benchmark
+      # itself fails they should not add two more red steps on top.
       - name: Summarize
         if: always()
         shell: pwsh
-        run: ./bench/summarize.ps1 -Csv bench-raw.csv -Out bench-report.md
+        run: |
+          if (Test-Path bench-raw.csv) {
+              ./bench/summarize.ps1 -Csv bench-raw.csv -Out bench-report.md
+          } else {
+              Write-Host "bench-raw.csv missing -- the benchmark did not complete."
+          }
 
       - name: Show report
         if: always()
         shell: pwsh
-        run: Get-Content bench-report.md
+        run: |
+          if (Test-Path bench-report.md) { Get-Content bench-report.md }
+          else { Write-Host "no report" }
 
       - name: Upload results
         if: always()
