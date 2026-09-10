@@ -326,7 +326,7 @@ jobs:
           # "Known defects" in bench/README.md; run them explicitly with
           # -f scenarios=S1,S2,S3,S7 to reproduce.
           BENCH_RULESETS:    ${{ inputs.rulesets    || 'R0,R1'      }}
-          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1,S2,S6'   }}
+          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1,S2,S6,S9'}}
           BENCH_CONCURRENCY: ${{ inputs.concurrency || '1,16'       }}
           BENCH_REPEATS:     ${{ inputs.repeats     || '3'          }}
           BENCH_DURATION:    ${{ inputs.duration    || '20s'        }}

@@ -66,6 +66,9 @@ $ScenarioDefs = @(
     # fault; a hang only on S3/S4 means the RESPONSE-body path is.
     @{ Id = "S7"; Path = "/bench/discard"; Method = "POST"; BodyKB = 1;   FillHeaders = 0; NeedsBlock = $false }
     @{ Id = "S8"; Path = "/bench/discard"; Method = "POST"; BodyKB = 100; FillHeaders = 0; NeedsBlock = $false }
+    # S9 leaves the URI alone and trips a header-keyed deny instead, so it
+    # separates "the URI did not match" from "the interception did not act".
+    @{ Id = "S9"; Path = "/bench/small"; Method = "GET";  BodyKB = 0;   FillHeaders = 0; NeedsBlock = $true; ProbeHeader = $true }
 )
 
 function Start-Backend {
@@ -148,6 +151,9 @@ function Invoke-LoadRun {
 
     if ($Mode -eq "latency") { $bargs += @("-r", "$Rate") }
 
+    if ($Scenario.ProbeHeader) {
+        $bargs += @("-H", "X-Bench-Probe: yes")
+    }
     for ($i = 0; $i -lt $Scenario.FillHeaders; $i++) {
         # ${i} not $i: in a double-quoted string "$i:" is parsed as a scoped
         # variable reference (the same shape as $env:PATH) and is a parse

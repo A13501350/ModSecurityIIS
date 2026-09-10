@@ -27,7 +27,12 @@ if ($rows.Count -eq 0) { throw "no rows in $Csv" }
 
 function Get-Median {
     param([double[]]$Values)
-    $sorted = @($Values | Where-Object { $null -ne $_ -and $_ -ge 0 } | Sort-Object)
+    # Only $null is dropped here. Filtering on -ge 0 as well would silently
+    # discard legitimate NEGATIVE ratios -- a WAF arm that beats the baseline is
+    # a real (if not always meaningful) result, and it was being shown as n/a.
+    # The -1 "could not read" sentinel is filtered by each caller instead, where
+    # it is known which columns can carry it.
+    $sorted = @($Values | Where-Object { $null -ne $_ } | Sort-Object)
     if ($sorted.Count -eq 0) { return $null }
     if ($sorted.Count % 2) { return [double]$sorted[[int](($sorted.Count - 1) / 2)] }
     return ([double]$sorted[$sorted.Count / 2 - 1] + [double]$sorted[$sorted.Count / 2]) / 2
@@ -78,9 +83,10 @@ foreach ($g in ($groups | Sort-Object Name)) {
         # ratios (it produced "vs base lat 4,155,318%" in an earlier report).
         if ("$($r.Hung)" -eq "True") { $hungCount++; continue }
         $rps += [double]$r.RPS
-        $cpu += [double]$r.CpuMsPerReq
         $ws  += [double]$r.WsMB
-        if ([double]$r.LatMeanMs -ge 0) { $lat += [double]$r.LatMeanMs }
+        # -1 is the sentinel for "the harness could not read this column".
+        if ([double]$r.CpuMsPerReq -ge 0) { $cpu += [double]$r.CpuMsPerReq }
+        if ([double]$r.LatMeanMs   -ge 0) { $lat += [double]$r.LatMeanMs }
 
         $b = $baseline["$ruleset|$scenario|$conc|$($r.Rep)"]
         if ($b) {

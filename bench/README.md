@@ -46,6 +46,11 @@ logging I/O.
 | S6 | GET `/bench/block` | intervention path; needs `R1` (skipped for `R0`) |
 | S7 | POST 1 KiB → `/bench/discard` | as S3 but the origin discards the body, so the response is tiny |
 | S8 | POST 100 KiB → `/bench/discard` | as S4 but the origin discards the body |
+| S9 | GET `/bench/small` + `X-Bench-Probe: yes` | trips rule 9003, a deny keyed on a header instead of the URI; see "Known defects" |
+
+S6 and S9 are a pair. S6's deny is keyed on `REQUEST_URI`, S9's on a request
+header; v2 served S6 as 200 while v3 returned 403 for every request, so the two
+together say whether the URI failed to match or the interception failed to act.
 
 S7/S8 exist to separate the two directions: a POST that hangs on `/bench/echo`
 *and* on `/bench/discard` points at the request-body path, while one that hangs
