@@ -1,9 +1,20 @@
 name: Bench v2 vs v3
 
-# Manual-only on purpose: this is a measurement tool, not a gate. The numbers
-# are only meaningful when everything runs on ONE machine in ONE job, so there
-# is no matrix over arms -- see bench/run-bench.ps1 for the reasoning.
+# This is a measurement tool, not a gate: the numbers are only meaningful when
+# everything runs on ONE machine in ONE job, so there is no matrix over arms --
+# see bench/run-bench.ps1 for the reasoning.
+#
+# The push trigger exists for a GitHub limitation, not for CI: the dispatch API
+# requires the workflow file to be present on the DEFAULT branch, so while this
+# file only lives on a bench/* branch `gh workflow run` answers
+# "workflow not found on the default branch". Pushing to bench/** therefore
+# also starts a run -- with a minimal, smoke-level parameter set (see the
+# Resolve inputs step), so a push checks that the harness still works without
+# burning the full ~25 minutes. Real measurements go through workflow_dispatch.
 on:
+  push:
+    branches:
+      - 'bench/**'
   workflow_dispatch:
     inputs:
       v2_repo:
@@ -235,14 +246,32 @@ jobs:
           name: v3-dll
           path: artifacts/v3
 
+      # Resolves the parameters for both entry points. A push event carries no
+      # inputs, so each one falls back to a smoke-level value: enough to prove
+      # the harness (build artifacts, arm install, backend, bombardier) works,
+      # small enough to finish quickly.
+      - name: Resolve inputs
+        shell: pwsh
+        env:
+          BENCH_RULESETS:    ${{ inputs.rulesets    || 'R1'         }}
+          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1'         }}
+          BENCH_CONCURRENCY: ${{ inputs.concurrency || '1'          }}
+          BENCH_REPEATS:     ${{ inputs.repeats     || '1'          }}
+          BENCH_DURATION:    ${{ inputs.duration    || '10s'        }}
+          BENCH_MODE:        ${{ inputs.mode        || 'throughput' }}
+          BENCH_RATE:        ${{ inputs.rate        || '500'        }}
+        run: |
+          foreach ($k in 'BENCH_RULESETS','BENCH_SCENARIOS','BENCH_CONCURRENCY',
+                         'BENCH_REPEATS','BENCH_DURATION','BENCH_MODE','BENCH_RATE') {
+            $v = [Environment]::GetEnvironmentVariable($k)
+            Add-Content $env:GITHUB_ENV "$k=$v"
+            Write-Host "$k=$v"
+          }
+
       # List inputs travel as env vars and are split in PowerShell: keeps the
       # quoting out of the YAML, where nested quotes bite immediately.
       - name: Run benchmark
         shell: pwsh
-        env:
-          BENCH_RULESETS: ${{ inputs.rulesets }}
-          BENCH_SCENARIOS: ${{ inputs.scenarios }}
-          BENCH_CONCURRENCY: ${{ inputs.concurrency }}
         run: |
           ./bench/run-bench.ps1 `
             -V2DllDir artifacts/v2 `
@@ -250,10 +279,10 @@ jobs:
             -Rulesets ($env:BENCH_RULESETS -split ',' | ForEach-Object { $_.Trim() }) `
             -Scenarios ($env:BENCH_SCENARIOS -split ',' | ForEach-Object { $_.Trim() }) `
             -Concurrency ($env:BENCH_CONCURRENCY -split ',' | ForEach-Object { [int]$_.Trim() }) `
-            -Repeats ${{ inputs.repeats }} `
-            -Duration '${{ inputs.duration }}' `
-            -Mode '${{ inputs.mode }}' `
-            -Rate ${{ inputs.rate }} `
+            -Repeats $env:BENCH_REPEATS `
+            -Duration $env:BENCH_DURATION `
+            -Mode $env:BENCH_MODE `
+            -Rate $env:BENCH_RATE `
             -OutFile bench-raw.csv
 
       - name: Summarize
