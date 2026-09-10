@@ -22,7 +22,7 @@ public:
     GetHttpModule(
         OUT CHttpModule            **ppModule,
         IN IModuleAllocator        *
-    )
+    ) override
     {
         HRESULT                    hr = S_OK;
 
@@ -58,7 +58,7 @@ public:
 
     virtual
     void
-    Terminate()
+    Terminate() override
     {
         if ( m_pModule != NULL )
         {

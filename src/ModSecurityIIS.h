@@ -93,19 +93,19 @@ public:
     OnBeginRequest(
         IN IHttpContext * pHttpContext,
         IN IHttpEventProvider * pProvider
-    );
+    ) override;
 
     REQUEST_NOTIFICATION_STATUS
     OnSendResponse(
         IN IHttpContext * pHttpContext,
         IN ISendResponseProvider * pProvider
-    );
+    ) override;
 
     REQUEST_NOTIFICATION_STATUS
     OnPostEndRequest(
         IN IHttpContext * pHttpContext,
         IN IHttpEventProvider * pProvider
-    );
+    ) override;
 
     // Called by IIS when an async operation from OnBeginRequest completes.
     // Only handles RQ_BEGIN_REQUEST completions with a read of ours in flight.
@@ -116,12 +116,12 @@ public:
         IN BOOL           fPostNotification,
         IN IHttpEventProvider * pProvider,
         IN IHttpCompletionInfo * pCompletionInfo
-    );
+    ) override;
 
     CMyHttpModule();
     ~CMyHttpModule();
 
-    void Dispose();
+    void Dispose() override;
 
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
