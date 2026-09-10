@@ -58,6 +58,16 @@ func main() {
 		write(w, small)
 	})
 
+	// S7/S8: read the request body, discard it, and answer with the same
+	// tiny body as /bench/small. Compared against /bench/echo this separates
+	// a request-body problem from a response-body one: if a POST hangs here
+	// too, the request side is at fault; if it only hangs on /bench/echo, the
+	// response side is.
+	mux.HandleFunc("/bench/discard", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		write(w, small)
+	})
+
 	srv := &http.Server{
 		Addr:    *addr,
 		Handler: mux,

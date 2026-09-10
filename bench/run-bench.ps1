@@ -61,6 +61,11 @@ $ScenarioDefs = @(
     @{ Id = "S4"; Path = "/bench/echo";  Method = "POST"; BodyKB = 100; FillHeaders = 0;  NeedsBlock = $false }
     @{ Id = "S5"; Path = "/bench/big";   Method = "GET";  BodyKB = 0;   FillHeaders = 0;  NeedsBlock = $false }
     @{ Id = "S6"; Path = "/bench/block"; Method = "GET";  BodyKB = 0;   FillHeaders = 0;  NeedsBlock = $true  }
+    # S7/S8 mirror S3/S4 but the origin discards the body instead of echoing it,
+    # so the response is tiny. A hang here means the REQUEST-body path is at
+    # fault; a hang only on S3/S4 means the RESPONSE-body path is.
+    @{ Id = "S7"; Path = "/bench/discard"; Method = "POST"; BodyKB = 1;   FillHeaders = 0; NeedsBlock = $false }
+    @{ Id = "S8"; Path = "/bench/discard"; Method = "POST"; BodyKB = 100; FillHeaders = 0; NeedsBlock = $false }
 )
 
 function Start-Backend {

@@ -44,6 +44,12 @@ logging I/O.
 | S4 | POST 100 KiB | body transport (v2 forced streaming + rewrite vs v3 async drain + single `InsertEntityBody`) |
 | S5 | GET 64 KiB response | phase 3/4 (v2 inspects the first chunk, v3 buffers everything) |
 | S6 | GET `/bench/block` | intervention path; needs `R1` (skipped for `R0`) |
+| S7 | POST 1 KiB → `/bench/discard` | as S3 but the origin discards the body, so the response is tiny |
+| S8 | POST 100 KiB → `/bench/discard` | as S4 but the origin discards the body |
+
+S7/S8 exist to separate the two directions: a POST that hangs on `/bench/echo`
+*and* on `/bench/discard` points at the request-body path, while one that hangs
+only on `/bench/echo` points at the response-body path.
 
 ## Methodology — and why it is shaped like this
 
