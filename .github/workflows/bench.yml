@@ -102,6 +102,16 @@ jobs:
 
       - uses: ammaraskar/msvc-problem-matcher@1ebcb382869bfdc2cc645e8a2a43b6d319ea1cc0
 
+      # WITH_YAJL is NOT optional. iis/CMakeLists.txt:159-167 sets it in the
+      # unconditional target_compile_definitions block, so msc_logging.c and
+      # msc_json.c always emit yajl calls; the `option(WITH_YAJL)` at :176 only
+      # controls whether yajl gets LINKED. Leaving it off fails the link with 19
+      # unresolved externals. WITH_LUA is genuinely optional (guarded, :172) but
+      # is enabled to match the upstream workflow. WITH_SSDEEP is also optional
+      # (guarded by #ifdef in re_operators.c) and is left off deliberately -- it
+      # would drag in MSYS2 and a hand-generated fuzzy.lib for no measurement
+      # benefit. This is the only remaining delta from test-ci-windows.yml
+      # besides collapsing its arch/config matrix.
       - name: Configure
         shell: pwsh
         env:
@@ -111,6 +121,7 @@ jobs:
         run: |
           cmake -DAPACHE_ROOT="$env:APACHE_ROOT" `
                 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+                -DWITH_LUA=ON -DWITH_YAJL=ON `
                 -A x64 -S v2/iis -B v2/iis/build
 
       - name: Build
@@ -118,8 +129,11 @@ jobs:
         run: cmake --build v2/iis/build --config Release
 
       # w3wp resolves the DLL's imports from its own directory, so everything
-      # the connector needs at runtime has to travel together: the module, the
-      # VC/Apache runtime DLLs the build already staged, and the vcpkg ones.
+      # the connector needs at runtime has to travel together. The build only
+      # copies the Apache DLLs (POST_BUILD at iis/CMakeLists.txt:298-310) --
+      # the vcpkg ones (yajl, lua, pcre2, libxml2, curl) are NOT staged, and
+      # without them LoadLibrary fails outright because Windows resolves every
+      # import up front. So sweep both the output dir and the vcpkg bin dirs.
       - name: Collect runtime DLLs
         shell: pwsh
         run: |
