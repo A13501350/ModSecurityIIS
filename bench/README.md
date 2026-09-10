@@ -90,6 +90,63 @@ only on `/bench/echo` points at the response-body path.
 Raw payloads for every run are in `bench-json/` in the artifact — the ground
 truth for the schema above.
 
+## Known defects found by this harness
+
+Both were found on 2026-09-10 and are reproducible; neither is a harness bug.
+
+### v2: every request with a body returns no response
+
+With `SecRequestBodyAccess On` (the normal WAF configuration), the v2
+connector built from `owasp-modsecurity/ModSecurity@v2/master` reads the
+request body, finishes phase 2, installs its input forwarding filter, and then
+the request never produces a response. The body is never handed downstream, so
+the proxied origin waits for it forever; phase 5 only appears in a batch when
+the client's timeout tears the connections down.
+
+Evidence (run 34480703201, `SecDebugLogLevel 4`):
+
+```
+REQUEST_HEADERS 5231   RESPONSE_HEADERS 5163     -> 68 short
+REQUEST_BODY    5231   RESPONSE_BODY    5163
+body log lines: "Reading request body" x68 = 1024B x34 + 102400B x34
+```
+
+68 is exactly the number of POSTs the harness sends (S3+S7 and S4+S8 at c=1 and
+c=16), so every POST had its body read and none produced a response. A single
+POST's trace ends at:
+
+```
+Input filter: Completed receiving request body (length 1024).
+Starting phase REQUEST_BODY.
+Hook insert_filter: Adding input forwarding filter (r ...).
+Hook insert_filter: Adding output filter (r ...).
+<nothing>
+```
+
+Independent of rules (reproduces under R0), of body size (1 KiB already stalls),
+of the limit directives (aligning them with the proven
+`scripts/ci-crs.ps1:67-81` values changes nothing), and of the fork's
+`iis-fix-chunked-te` commit (building v2 from it makes no difference).
+
+`SecRequestBodyAccess Off` makes all four POST scenarios healthy again
+(run 34484364411), which scopes it to the request-body path and is also the
+only known workaround -- at the cost of not inspecting bodies at all.
+
+Upstream CI misses it because its three functional assertions are all GET
+(`test-ci-windows.yml:273-277`) and its go-ftw step never checks the exit code
+(line 332).
+
+### v3: 100 KiB request bodies stall
+
+The v3 connector handles 1 KiB POSTs normally but stalls on 100 KiB ones, and
+this is **unaffected** by `SecRequestBodyAccess` because its async drain
+(`DriveBodyRead`) runs unconditionally from `OnBeginRequest`. A different
+defect from the v2 one. c=16 partially works around it, which suggests a
+per-connection block rather than a hard failure.
+
+Consequence for the benchmark: only the header path (S1, S2, S6) is comparable
+today, which is why it is the default scenario set.
+
 ## Known limitations
 
 * **No latency percentiles.** bombardier's JSON exposes only

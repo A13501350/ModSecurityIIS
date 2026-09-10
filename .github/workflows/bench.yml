@@ -318,15 +318,18 @@ jobs:
       - name: Resolve inputs
         shell: pwsh
         env:
-          # TEMPORARY diagnostic defaults while the POST hang is being
-          # narrowed down (the first full run showed the v2 arm hanging on any
-          # request with a body, and the v3 arm on a 100 KiB one). Once the
-          # cause is explained these go back to R0,R1 / S1,S3,S4 / 1,16 / 3x20s.
-          BENCH_RULESETS:    ${{ inputs.rulesets    || 'R0'         }}
-          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S3,S4,S7,S8'}}
+          # Header-path scenarios only. S3/S4/S7/S8 (anything with a request
+          # body) cannot be compared today: the v2 connector returns no
+          # response at all with SecRequestBodyAccess On, and the v3 connector
+          # stalls on 100 KiB bodies regardless of that switch. Including them
+          # would just spend a third of the runtime producing HUNG rows. See
+          # "Known defects" in bench/README.md; run them explicitly with
+          # -f scenarios=S1,S2,S3,S7 to reproduce.
+          BENCH_RULESETS:    ${{ inputs.rulesets    || 'R0,R1'      }}
+          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1,S2,S6'   }}
           BENCH_CONCURRENCY: ${{ inputs.concurrency || '1,16'       }}
-          BENCH_REPEATS:     ${{ inputs.repeats     || '1'          }}
-          BENCH_DURATION:    ${{ inputs.duration    || '10s'        }}
+          BENCH_REPEATS:     ${{ inputs.repeats     || '3'          }}
+          BENCH_DURATION:    ${{ inputs.duration    || '20s'        }}
           BENCH_MODE:        ${{ inputs.mode        || 'throughput' }}
           BENCH_RATE:        ${{ inputs.rate        || '500'        }}
         run: |
