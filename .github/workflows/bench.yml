@@ -1,0 +1,277 @@
+name: Bench v2 vs v3
+
+# Manual-only on purpose: this is a measurement tool, not a gate. The numbers
+# are only meaningful when everything runs on ONE machine in ONE job, so there
+# is no matrix over arms -- see bench/run-bench.ps1 for the reasoning.
+on:
+  workflow_dispatch:
+    inputs:
+      v2_repo:
+        description: 'Repo holding ModSecurity v2 (owner/repo)'
+        required: false
+        default: 'owasp-modsecurity/ModSecurity'
+      v2_ref:
+        description: 'Ref of ModSecurity v2 to build'
+        required: false
+        default: 'v2/master'
+      rulesets:
+        description: 'R0 = engine on, no rules. R1 = 20 inspection rules + block probe'
+        required: false
+        default: 'R1'
+      scenarios:
+        description: 'S1 tiny GET | S2 GET+40 headers | S3 POST 1K | S4 POST 100K | S5 64K response | S6 blocked'
+        required: false
+        default: 'S1,S3,S4'
+      concurrency:
+        description: 'Client concurrency levels'
+        required: false
+        default: '1,16'
+      repeats:
+        description: 'Repetitions per combination (drift control)'
+        required: false
+        default: '3'
+      duration:
+        description: 'Duration of one load run'
+        required: false
+        default: '20s'
+      mode:
+        description: 'throughput = full tilt | latency = fixed arrival rate'
+        required: false
+        default: 'throughput'
+        type: choice
+        options: [throughput, latency]
+      rate:
+        description: 'Requests/sec when mode = latency'
+        required: false
+        default: '500'
+
+jobs:
+  # ---------------------------------------------------------------------
+  # v2 connector: ModSecurityIIS.dll from the v2 tree (engine compiled in).
+  # Mirrors the build job of ModSecurity/.github/workflows/test-ci-windows.yml,
+  # narrowed to x64/Release and without ssdeep/Lua/YAJL: those only add
+  # failure modes and are irrelevant to the rulesets we measure.
+  # ---------------------------------------------------------------------
+  build-v2:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout ModSecurity v2
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.v2_repo }}
+          ref: ${{ inputs.v2_ref }}
+          path: v2
+          submodules: recursive
+          fetch-depth: 0
+
+      # The v2 IIS build compiles apache2/*.c, so it needs the Apache headers
+      # and import libs (libhttpd.lib, libapr*.lib). windows-latest ships
+      # Apache at C:\tools\Apache24.
+      - name: Set Apache root
+        shell: pwsh
+        run: |
+          $root = "C:\tools\Apache24"
+          if (-not (Test-Path "$root\lib\libhttpd.lib")) {
+            choco install apache-httpd -y --no-progress -r --params="'/installLocation:C:\tools /noService'"
+          }
+          if (-not (Test-Path "$root\lib\libhttpd.lib")) { throw "Apache dev libs not found under $root" }
+          "APACHE_ROOT=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore vcpkg cache
+        id: vcpkg-cache
+        uses: TAServers/vcpkg-cache@e848939f754daf406a06006be2e05eb5b17cc481
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prefix: vcpkg-bench-v2/
+
+      - uses: ammaraskar/msvc-problem-matcher@1ebcb382869bfdc2cc645e8a2a43b6d319ea1cc0
+
+      - name: Configure
+        shell: pwsh
+        env:
+          VCPKG_FEATURE_FLAGS: "binarycaching"
+          VCPKG_BINARY_SOURCES: "clear;files,${{ steps.vcpkg-cache.outputs.path }},readwrite"
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        run: |
+          cmake -DAPACHE_ROOT="$env:APACHE_ROOT" `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+                -A x64 -S v2/iis -B v2/iis/build
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build v2/iis/build --config Release
+
+      # w3wp resolves the DLL's imports from its own directory, so everything
+      # the connector needs at runtime has to travel together: the module, the
+      # VC/Apache runtime DLLs the build already staged, and the vcpkg ones.
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force v2-runtime | Out-Null
+          Get-ChildItem v2/iis/build/Release -Filter *.dll -Recurse -ErrorAction SilentlyContinue |
+            Copy-Item -Destination v2-runtime -Force
+          Get-ChildItem v2 -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'vcpkg_installed.*[\\/]bin[\\/]' } |
+            Copy-Item -Destination v2-runtime -Force
+          Copy-Item v2/iis/ModSecurity.xml v2-runtime/ -Force -ErrorAction SilentlyContinue
+          Get-ChildItem v2-runtime | Format-Table Name, Length
+
+      - name: Upload v2 connector
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-dll
+          if-no-files-found: error
+          path: v2-runtime/
+
+  # ---------------------------------------------------------------------
+  # v3 connector: modsecurityiis.dll + libModSecurity.dll. Same steps as the
+  # build job in build.yml (Conan -> engine -> connector).
+  # ---------------------------------------------------------------------
+  build-v3:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install Conan 2.x + Ninja
+        run: pip install "conan>=2" ninja
+
+      - name: Cache Conan packages + engine build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.conan2/p
+            build/libmodsecurity_build
+          key: lmengine-${{ runner.os }}-${{ hashFiles('libmodsecurity/build/win32/conanfile.txt') }}-${{ hashFiles('cmake/build_libmodsecurity.cmake') }}
+          restore-keys: |
+            lmengine-${{ runner.os }}-
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure sccache env
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_ENV "SCCACHE_GHA_ENABLED=true"
+          Add-Content $env:GITHUB_ENV "SCCACHE_IDLE_TIMEOUT=0"
+          Add-Content $env:GITHUB_PATH (Split-Path $env:SCCACHE_PATH)
+
+      - name: Set up MSVC toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force v3-runtime | Out-Null
+          Get-ChildItem build -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'modsecurityiis|libModSecurity' } |
+            Copy-Item -Destination v3-runtime -Force
+          Copy-Item ModSecurity.xml v3-runtime/ -Force
+          Get-ChildItem v3-runtime | Format-Table Name, Length
+
+      - name: Upload v3 connector
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3-dll
+          if-no-files-found: error
+          path: v3-runtime/
+
+  # ---------------------------------------------------------------------
+  # Single runner, single job: every arm is measured here, interleaved.
+  # ---------------------------------------------------------------------
+  bench:
+    needs: [build-v2, build-v3]
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable IIS
+        shell: pwsh
+        run: |
+          Enable-WindowsOptionalFeature -Online -NoRestart -FeatureName `
+            IIS-WebServerRole, IIS-WebServer, IIS-CommonHttpFeatures, `
+            IIS-StaticContent, IIS-DefaultDocument, IIS-HttpErrors, `
+            IIS-HttpLogging, IIS-RequestFiltering, IIS-ManagementConsole, `
+            IIS-ManagementScriptingTools | Out-Null
+          Start-Service W3SVC -ErrorAction SilentlyContinue
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install bombardier
+        run: go install github.com/codesenberg/bombardier@latest
+
+      - name: Export GOPATH/bin
+        shell: pwsh
+        run: |
+          $gp = Join-Path (go env GOPATH) "bin"
+          Add-Content $env:GITHUB_PATH $gp
+          Add-Content $env:GITHUB_ENV "GOPATH=$(go env GOPATH)"
+
+      - name: Download v2 connector
+        uses: actions/download-artifact@v4
+        with:
+          name: v2-dll
+          path: artifacts/v2
+
+      - name: Download v3 connector
+        uses: actions/download-artifact@v4
+        with:
+          name: v3-dll
+          path: artifacts/v3
+
+      # List inputs travel as env vars and are split in PowerShell: keeps the
+      # quoting out of the YAML, where nested quotes bite immediately.
+      - name: Run benchmark
+        shell: pwsh
+        env:
+          BENCH_RULESETS: ${{ inputs.rulesets }}
+          BENCH_SCENARIOS: ${{ inputs.scenarios }}
+          BENCH_CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          ./bench/run-bench.ps1 `
+            -V2DllDir artifacts/v2 `
+            -V3DllDir artifacts/v3 `
+            -Rulesets ($env:BENCH_RULESETS -split ',' | ForEach-Object { $_.Trim() }) `
+            -Scenarios ($env:BENCH_SCENARIOS -split ',' | ForEach-Object { $_.Trim() }) `
+            -Concurrency ($env:BENCH_CONCURRENCY -split ',' | ForEach-Object { [int]$_.Trim() }) `
+            -Repeats ${{ inputs.repeats }} `
+            -Duration '${{ inputs.duration }}' `
+            -Mode '${{ inputs.mode }}' `
+            -Rate ${{ inputs.rate }} `
+            -OutFile bench-raw.csv
+
+      - name: Summarize
+        if: always()
+        shell: pwsh
+        run: ./bench/summarize.ps1 -Csv bench-raw.csv -Out bench-report.md
+
+      - name: Show report
+        if: always()
+        shell: pwsh
+        run: Get-Content bench-report.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          if-no-files-found: warn
+          path: |
+            bench-raw.csv
+            bench-report.md
