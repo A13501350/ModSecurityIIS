@@ -66,11 +66,16 @@ jobs:
   build-v2:
     runs-on: windows-latest
     steps:
+      # The fallbacks are load-bearing on the push trigger: a push event carries
+      # NO inputs, and an empty `repository:`/`ref:` makes actions/checkout fall
+      # back to the current repo + triggering ref -- i.e. it would check out
+      # ModSecurityIIS itself and CMake would fail with "does not appear to
+      # contain CMakeLists.txt" under v2/iis.
       - name: Checkout ModSecurity v2
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.v2_repo }}
-          ref: ${{ inputs.v2_ref }}
+          repository: ${{ inputs.v2_repo || 'owasp-modsecurity/ModSecurity' }}
+          ref: ${{ inputs.v2_ref || 'v2/master' }}
           path: v2
           submodules: recursive
           fetch-depth: 0
