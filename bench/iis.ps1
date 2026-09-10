@@ -72,6 +72,10 @@ function Initialize-BenchSite {
 "@ | Set-Content $webConfig -Encoding Ascii
 
     Restart-IIS
+
+    # Declare the config section once, here, with IIS stopped. Per-arm switches
+    # must not touch applicationHost.config (see Initialize-ModSecuritySection).
+    Initialize-ModSecuritySection
 }
 
 function Restart-IIS {
@@ -80,37 +84,63 @@ function Restart-IIS {
 }
 
 # ---------------------------------------------------------------------------
-# applicationHost.config section plumbing
+# applicationHost.config section declaration -- ONCE, and only with IIS stopped
 #
-# The schema file alone is not enough: the section has to be *declared* before
-# appcmd will let us set it. Both connectors read system.webServer/ModSecurity,
-# so this is shared.
+# The schema file alone is not enough: appcmd refuses to set a section that is
+# not declared. Both connectors read system.webServer/ModSecurity, so the
+# declaration is arm-independent and is made exactly once.
+#
+# It used to be added and removed on every arm switch, which raced IIS:
+# applicationHost.config is owned by the configuration system, and rewriting it
+# directly while WAS holds it fails with "The process cannot access the file
+# ... because it is being used by another process". That is what killed the run
+# right after the v2 arm (baseline and v2 happened to get away with it). Every
+# per-arm change now goes through appcmd / AHADMIN, which serialises access
+# properly, so the hand-written file edit happens at most once per job.
 # ---------------------------------------------------------------------------
 
-function Add-ModSecuritySection {
-    [xml]$xml = Get-Content $script:AhConfig
-    $group = $xml.configuration.configSections.sectionGroup |
-             Where-Object { $_.name -eq "system.webServer" } |
-             Select-Object -First 1
-    if (-not $group) { throw "system.webServer sectionGroup not found" }
-
-    if (-not ($group.section | Where-Object { $_.name -eq "ModSecurity" })) {
-        $sec = $xml.CreateElement("section")
-        $sec.SetAttribute("name", "ModSecurity")
-        $sec.SetAttribute("overrideModeDefault", "Allow")
-        $sec.SetAttribute("allowDefinition", "Everywhere")
-        [void]$group.AppendChild($sec)
-        $xml.Save($script:AhConfig)
-        Write-Host "  declared system.webServer/ModSecurity"
+function Initialize-ModSecuritySection {
+    & iisreset /stop | Out-Null
+    for ($i = 0; $i -lt 30; $i++) {
+        if ((Get-Service W3SVC -ErrorAction SilentlyContinue).Status -eq "Stopped") { break }
+        Start-Sleep -Seconds 1
     }
-}
 
-function Remove-ModSecuritySection {
-    if (Test-Path $script:AhConfig) {
-        $raw = Get-Content $script:AhConfig -Raw
-        $raw = $raw -replace '\s*<section name="ModSecurity"[^>]*/>', ''
-        Set-Content $script:AhConfig -Value $raw -Encoding UTF8 -NoNewline
+    $declared = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            [xml]$xml = Get-Content $script:AhConfig
+            $group = $xml.configuration.configSections.sectionGroup |
+                     Where-Object { $_.name -eq "system.webServer" } |
+                     Select-Object -First 1
+            if (-not $group) { throw "system.webServer sectionGroup not found" }
+
+            if ($group.section | Where-Object { $_.name -eq "ModSecurity" }) {
+                Write-Host "  system.webServer/ModSecurity already declared"
+            } else {
+                $sec = $xml.CreateElement("section")
+                $sec.SetAttribute("name", "ModSecurity")
+                $sec.SetAttribute("overrideModeDefault", "Allow")
+                $sec.SetAttribute("allowDefinition", "Everywhere")
+                [void]$group.AppendChild($sec)
+                $xml.Save($script:AhConfig)
+                Write-Host "  declared system.webServer/ModSecurity"
+            }
+            $declared = $true
+            break
+        } catch {
+            Write-Host "  declaration attempt $attempt failed: $_"
+            Start-Sleep -Seconds 2
+        }
     }
+
+    & iisreset /start | Out-Null
+    for ($i = 0; $i -lt 60; $i++) {
+        if ((Get-Service W3SVC -ErrorAction SilentlyContinue).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $declared) { throw "could not declare the system.webServer/ModSecurity section" }
 }
 
 # ---------------------------------------------------------------------------
@@ -118,12 +148,20 @@ function Remove-ModSecuritySection {
 # ---------------------------------------------------------------------------
 
 function Uninstall-Arm {
+    # Disable through appcmd (AHADMIN), then unregister the module and drop the
+    # binaries. The section DECLARATION is permanent for the job, so nothing
+    # here writes applicationHost.config -- see Initialize-ModSecuritySection.
+    # All appcmd work happens before the services are stopped, because appcmd
+    # talks to WAS.
+    & $script:AppCmd set config -section:system.webServer/ModSecurity `
+        /enabled:false /commit:apphost 2>$null | Out-Null
+    & $script:AppCmd uninstall module "ModSecurityIIS" 2>$null | Out-Null
+
     Stop-Service W3SVC -Force -ErrorAction SilentlyContinue
     Stop-Service WAS   -Force -ErrorAction SilentlyContinue
-    & $script:AppCmd uninstall module "ModSecurityIIS" 2>$null | Out-Null
+
     Remove-Item "$script:Inetsrv\modsecurityiis.dll" -Force -ErrorAction SilentlyContinue
     Remove-Item "$script:Inetsrv\libModSecurity.dll" -Force -ErrorAction SilentlyContinue
-    Remove-ModSecuritySection
     Remove-Item "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\ModSecurity" `
         -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -141,7 +179,6 @@ function Install-Arm {
     Uninstall-Arm
 
     if ($Arm -eq "baseline") {
-        Add-ModSecuritySection
         Restart-IIS
         Write-Host "== arm 'baseline': no WAF module installed"
         return
@@ -170,7 +207,6 @@ function Install-Arm {
     New-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\ModSecurity" `
         -Name TypesSupported -Value 7 -PropertyType DWord -Force | Out-Null
 
-    Add-ModSecuritySection
     & $script:AppCmd install module /name:ModSecurityIIS `
         /image:"$script:Inetsrv\modsecurityiis.dll" /add:true | Out-Null
 

@@ -153,9 +153,15 @@ function Invoke-LoadRun {
     # reads the property `json` off $Tag (a string) and yields nothing.
     Set-Content (Join-Path $JsonDir "${Tag}.json") -Value $jsonText -Encoding Ascii
 
+    # Schema verified against a real payload (run 34465384571), not guessed:
+    #   result.latency = { mean, stddev, max }   <- MICROSECONDS, no percentiles
+    #   result.rps     = { mean, stddev, max, percentiles = { 50, 75, 90, 95, 99 } }
+    # So bombardier gives NO latency percentiles: the percentile block lives
+    # under rps and describes throughput. Columns called "p50/p95/p99 latency"
+    # would have been invented numbers.
     $json = $jsonText | ConvertFrom-Json
     $res  = $json.result
-    $lat  = $res.latencies
+    $lat  = $res.latency
 
     $reqs = 0
     foreach ($k in 'req1xx','req2xx','req3xx','req4xx','req5xx','reqFailed','others') {
@@ -163,20 +169,30 @@ function Invoke-LoadRun {
         if ($null -ne $v) { $reqs += [int]$v }
     }
 
-    $p50 = Get-Number $lat @('50th','p50','median')
-    $p95 = Get-Number $lat @('95th','p95')
-    $p99 = Get-Number $lat @('99th','p99')
+    $rpsMean   = Get-Number $res.rps @('mean')
+    $latMeanUs = Get-Number $lat @('mean')
+    $latMaxUs  = Get-Number $lat @('max')
+    $pct       = $res.rps.percentiles
+
+    # Unit self-check via Little's law: rps.mean * latency.mean should be about
+    # the client concurrency. If it is off by 1000x the microsecond assumption
+    # is wrong, and every latency number is wrong with it.
+    $little = if ($null -ne $latMeanUs -and $null -ne $rpsMean -and $Conc -gt 0) {
+        [math]::Round(($rpsMean * $latMeanUs / 1e6) / $Conc, 2)
+    } else { -1 }
 
     return [pscustomobject]@{
-        RPS      = Get-Number $res.rps @('mean')
-        P50ms    = if ($null -ne $p50) { [math]::Round($p50 / 1e6, 2) } else { -1 }
-        P95ms    = if ($null -ne $p95) { [math]::Round($p95 / 1e6, 2) } else { -1 }
-        P99ms    = if ($null -ne $p99) { [math]::Round($p99 / 1e6, 2) } else { -1 }
-        ReqCount = $reqs
-        Req4xx   = [int](Get-Number $res @('req4xx'))
-        Req5xx   = [int](Get-Number $res @('req5xx'))
-        Failed   = [int](Get-Number $res @('reqFailed'))
-        Raw      = $jsonText
+        RPS       = $rpsMean
+        LatMeanMs = if ($null -ne $latMeanUs) { [math]::Round($latMeanUs / 1000, 3) } else { -1 }
+        LatMaxMs  = if ($null -ne $latMaxUs)  { [math]::Round($latMaxUs  / 1000, 2) }  else { -1 }
+        RpsP50    = Get-Number $pct @('50')
+        RpsP95    = Get-Number $pct @('95')
+        RpsP99    = Get-Number $pct @('99')
+        LittleLaw = $little
+        ReqCount  = $reqs
+        Req4xx    = [int](Get-Number $res @('req4xx'))
+        Req5xx    = [int](Get-Number $res @('req5xx'))
+        Failed    = [int](Get-Number $res @('reqFailed'))
     }
 }
 
@@ -240,9 +256,12 @@ try {
                             Concurrency = $conc
                             WallSec     = [math]::Round($sw.Elapsed.TotalSeconds, 1)
                             RPS         = if ($null -ne $res.RPS) { [math]::Round($res.RPS, 1) } else { -1 }
-                            P50ms       = $res.P50ms
-                            P95ms       = $res.P95ms
-                            P99ms       = $res.P99ms
+                            LatMeanMs   = $res.LatMeanMs
+                            LatMaxMs    = $res.LatMaxMs
+                            RpsP50      = if ($null -ne $res.RpsP50) { [math]::Round($res.RpsP50, 1) } else { -1 }
+                            RpsP95      = if ($null -ne $res.RpsP95) { [math]::Round($res.RpsP95, 1) } else { -1 }
+                            RpsP99      = if ($null -ne $res.RpsP99) { [math]::Round($res.RpsP99, 1) } else { -1 }
+                            LittleLaw   = $res.LittleLaw
                             ReqCount    = $res.ReqCount
                             Req4xx      = $res.Req4xx
                             Req5xx      = $res.Req5xx
@@ -253,8 +272,16 @@ try {
                             PeakWsMB    = $after.PeakWsMB
                             Workers     = $after.Processes
                         }
-                        Write-Host ("   {0} c={1,-3} rps={2,-9} p50={3,-7} cpu/req={4}ms ws={5}MB" -f `
-                            $scenario.Id, $conc, $rows[-1].RPS, $res.P50ms, $cpuMs, $after.WsMB)
+                        Write-Host ("   {0} c={1,-3} rps={2,-9} lat={3}ms cpu/req={4}ms ws={5}MB" -f `
+                            $scenario.Id, $conc, $rows[-1].RPS, $res.LatMeanMs, $cpuMs, $after.WsMB)
+
+                        # rps * latency / concurrency should be ~1. Far off means
+                        # the latency unit is not microseconds and the column is
+                        # quietly wrong, so say so loudly.
+                        if ($res.LittleLaw -ge 0 -and ($res.LittleLaw -lt 0.5 -or $res.LittleLaw -gt 2.0)) {
+                            Write-Warning ("Little's law check failed for {0} c={1}: rps*latency/concurrency = {2} (expected ~1)" -f `
+                                $scenario.Id, $conc, $res.LittleLaw)
+                        }
                     }
                 }
             }

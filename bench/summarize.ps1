@@ -59,29 +59,32 @@ $lines += "Columns are **medians across repetitions** of per-repetition values t
 $lines += "were first normalised against that repetition's baseline (no WAF module)."
 $lines += "Lower is better for every *vs base* column."
 $lines += ""
-$lines += "| ruleset | scenario | conc | arm | rps | vs base rps | p50 ms | vs base p50 | cpu ms/req | ws MB |"
+# Latency is bombardier's `latency.mean` -- it publishes no latency
+# percentiles at all, so there is no p95/p99 column to show. The label says
+# "mean" so nobody reads it as a median.
+$lines += "| ruleset | scenario | conc | arm | rps | vs base rps | lat mean ms | vs base lat | cpu ms/req | ws MB |"
 $lines += "|---|---|---|---|---:|---:|---:|---:|---:|---:|"
 
 foreach ($g in ($groups | Sort-Object Name)) {
     $parts = $g.Name -split ", "
     $ruleset = $parts[0]; $scenario = $parts[1]; $conc = $parts[2]; $arm = $parts[3]
 
-    $rps = @(); $p50 = @(); $cpu = @(); $ws = @()
+    $rps = @(); $lat = @(); $cpu = @(); $ws = @()
     $rpsRatio = @(); $latRatio = @()
 
     foreach ($r in $g.Group) {
         $rps += [double]$r.RPS
         $cpu += [double]$r.CpuMsPerReq
         $ws  += [double]$r.WsMB
-        if ([double]$r.P50ms -ge 0) { $p50 += [double]$r.P50ms }
+        if ([double]$r.LatMeanMs -ge 0) { $lat += [double]$r.LatMeanMs }
 
         $b = $baseline["$ruleset|$scenario|$conc|$($r.Rep)"]
         if ($b) {
             if ([double]$b.RPS -gt 0 -and [double]$r.RPS -ge 0) {
                 $rpsRatio += ([double]$b.RPS - [double]$r.RPS) / [double]$b.RPS * 100
             }
-            if ([double]$b.P50ms -gt 0 -and [double]$r.P50ms -ge 0) {
-                $latRatio += ([double]$r.P50ms - [double]$b.P50ms) / [double]$b.P50ms * 100
+            if ([double]$b.LatMeanMs -gt 0 -and [double]$r.LatMeanMs -ge 0) {
+                $latRatio += ([double]$r.LatMeanMs - [double]$b.LatMeanMs) / [double]$b.LatMeanMs * 100
             }
         }
     }
@@ -90,7 +93,7 @@ foreach ($g in ($groups | Sort-Object Name)) {
         $ruleset, $scenario, $conc, $arm,
         (Format-Num (Get-Median $rps) ""),
         (Format-Num (Get-Median $rpsRatio) "%"),
-        (Format-Num (Get-Median $p50) ""),
+        (Format-Num (Get-Median $lat) ""),
         (Format-Num (Get-Median $latRatio) "%"),
         (Format-Num (Get-Median $cpu) ""),
         (Format-Num (Get-Median $ws) ""))
@@ -102,7 +105,13 @@ $lines += ""
 $lines += "* **vs base rps** -- throughput lost to the WAF. Negative means the WAF arm"
 $lines += "  was *faster* than no WAF, which means the run was noise-dominated:"
 $lines += "  raise ``-Repeats`` and ``-Duration`` before believing the number."
-$lines += "* **vs base p50** -- added median latency."
+$lines += "* **vs base lat** -- added latency, computed from bombardier's"
+$lines += "  ``latency.mean``. bombardier publishes **no latency percentiles**, so tail"
+$lines += "  behaviour is invisible here and a mean can hide it. Switch to k6 (or add"
+$lines += "  a second load generator) if p95/p99 latency is the thing you care about."
+$lines += "* The CSV also carries ``LittleLaw`` (``rps * latency / concurrency``,"
+$lines += "  expected ~1.0). A value far from 1 means the latency unit assumption is"
+$lines += "  wrong and the latency columns should not be trusted."
 $lines += "* **cpu ms/req** -- worker-process CPU milliseconds per request, from the"
 $lines += "  exact ``TotalProcessorTime`` delta around each run. This is the cleanest"
 $lines += "  single cost figure: it does not depend on how busy the shared runner was."

@@ -69,10 +69,30 @@ logging I/O.
   `scripts/ci-crs.ps1` uses with albedo. The IIS static handler cannot be used:
   it answers 405 to POST, so S3/S4 would never exercise a body.
 
+## What the CSV columns mean
+
+| column | source |
+|---|---|
+| `RPS` | `result.rps.mean` |
+| `LatMeanMs` / `LatMaxMs` | `result.latency.mean` / `.max` — **microseconds** in the payload, converted to ms |
+| `RpsP50` / `RpsP95` / `RpsP99` | `result.rps.percentiles` — a **throughput** distribution, not latency |
+| `LittleLaw` | `rps * latency / concurrency`, expected ≈ 1.0. A self-check on the microsecond assumption; far from 1 means the latency columns are wrong |
+| `CpuSec` / `CpuMsPerReq` | `w3wp`'s `TotalProcessorTime` delta around the run ÷ requests |
+| `WsMB` / `PeakWsMB` | working set after the run, and its high-water mark since the arm was installed |
+| `ReqCount` / `Req4xx` / `Req5xx` | status buckets, summed from `result.req*` |
+
+Raw payloads for every run are in `bench-json/` in the artifact — the ground
+truth for the schema above.
+
 ## Known limitations
 
-* **Untested.** This is a first cut; expect the first CI run to shake out
-  install/quoting bugs.
+* **No latency percentiles.** bombardier's JSON exposes only
+  `latency.mean/stddev/max`; its `percentiles` block belongs to `rps`. If tail
+  latency (p95/p99) is what you need, add k6 as a second generator — the
+  harness is agnostic, only `Invoke-LoadRun` would change.
+* **Per-arm switching is not free.** Each arm switch is uninstall → install →
+  `iisreset` (the two connectors cannot coexist), so keep the scenario set
+  small enough that setup does not dominate wall-clock.
 * Stack comparison — see above.
 * `windows-latest` is 4 vCPU / 16 GB, virtualised and shared. Noisy.
 * The load generator runs on the same box as `w3wp`, so at high concurrency the
