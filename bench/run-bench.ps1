@@ -114,7 +114,10 @@ function Invoke-LoadRun {
     if ($Mode -eq "latency") { $bargs += @("-r", "$Rate") }
 
     for ($i = 0; $i -lt $Scenario.FillHeaders; $i++) {
-        $bargs += @("-H", "X-Bench-Fill$i: filler-value-$i")
+        # ${i} not $i: in a double-quoted string "$i:" is parsed as a scoped
+        # variable reference (the same shape as $env:PATH) and is a parse
+        # error, which kills the whole script before it runs a single line.
+        $bargs += @("-H", "X-Bench-Fill${i}: filler-value-$i")
     }
     if ($Scenario.BodyKB -gt 0) {
         $bargs += @("-m", "POST", "-f", (New-BodyFile $Scenario.BodyKB),

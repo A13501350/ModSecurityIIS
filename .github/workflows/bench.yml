@@ -57,6 +57,37 @@ on:
         default: '500'
 
 jobs:
+  # Cheap parse gate, with no dependencies so it runs in parallel with the
+  # ~15-minute builds and fails in seconds. Two harness failures so far were
+  # PowerShell parse errors (a backtick continuation with a trailing space, and
+  # "$i:" being read as a scoped variable reference) that only surfaced AFTER
+  # the build and the artifact download. A parse error kills a script before
+  # its first line, so nothing else in this workflow can catch it earlier.
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Parse-check PowerShell
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem bench, scripts -Recurse -Filter *.ps1 | ForEach-Object {
+              $errs = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]$null, [ref]$errs)
+              if ($errs.Count -gt 0) {
+                  $failed = $true
+                  Write-Host "::error file=$($_.FullName)::$($errs.Count) parse error(s)"
+                  $errs | ForEach-Object {
+                      Write-Host "    line $($_.Extent.StartLineNumber): $($_.Message)"
+                  }
+              } else {
+                  Write-Host "ok: $($_.FullName.Substring($PWD.Path.Length + 1))"
+              }
+          }
+          if ($failed) { exit 1 }
+
   # ---------------------------------------------------------------------
   # v2 connector: ModSecurityIIS.dll from the v2 tree (engine compiled in).
   # Mirrors the build job of ModSecurity/.github/workflows/test-ci-windows.yml,
@@ -222,7 +253,7 @@ jobs:
   # Single runner, single job: every arm is measured here, interleaved.
   # ---------------------------------------------------------------------
   bench:
-    needs: [build-v2, build-v3]
+    needs: [lint, build-v2, build-v3]
     runs-on: windows-latest
 
     steps:
