@@ -305,17 +305,23 @@ jobs:
           path: artifacts/v3
 
       # Resolves the parameters for both entry points. A push event carries no
-      # inputs, so each one falls back to a smoke-level value: enough to prove
-      # the harness (build artifacts, arm install, backend, bombardier) works,
-      # small enough to finish quickly.
+      # inputs, so each one falls back to a default. Those defaults are the
+      # measurement set, not a smoke set: the harness is verified, and a push
+      # is currently the only way to start a run (workflow_dispatch needs the
+      # file on the default branch). Expect ~45 minutes.
+      #
+      # R0 = engine on with zero rules (connector overhead only)
+      # R1 = 20 inspection rules + block probe
+      # c=1 shows pure per-request cost, c=16 is where the v2 connector's
+      # global critical section should start to show.
       - name: Resolve inputs
         shell: pwsh
         env:
-          BENCH_RULESETS:    ${{ inputs.rulesets    || 'R1'         }}
-          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1'         }}
-          BENCH_CONCURRENCY: ${{ inputs.concurrency || '1'          }}
-          BENCH_REPEATS:     ${{ inputs.repeats     || '1'          }}
-          BENCH_DURATION:    ${{ inputs.duration    || '10s'        }}
+          BENCH_RULESETS:    ${{ inputs.rulesets    || 'R0,R1'      }}
+          BENCH_SCENARIOS:   ${{ inputs.scenarios   || 'S1,S3,S4'   }}
+          BENCH_CONCURRENCY: ${{ inputs.concurrency || '1,16'       }}
+          BENCH_REPEATS:     ${{ inputs.repeats     || '3'          }}
+          BENCH_DURATION:    ${{ inputs.duration    || '20s'        }}
           BENCH_MODE:        ${{ inputs.mode        || 'throughput' }}
           BENCH_RATE:        ${{ inputs.rate        || '500'        }}
         run: |

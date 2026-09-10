@@ -121,6 +121,19 @@ function Get-Number {
     return $null
 }
 
+# Rows are flushed to disk as they are produced. A full measurement set runs
+# for the better part of an hour; writing the CSV only at the end means one
+# late failure throws away every measurement before it.
+function Add-Row {
+    param($Row)
+    if (Test-Path $OutFile) {
+        $Row | Export-Csv $OutFile -NoTypeInformation -Encoding UTF8 -Append
+    } else {
+        $Row | Export-Csv $OutFile -NoTypeInformation -Encoding UTF8
+    }
+    $script:rowCount++
+}
+
 function Invoke-LoadRun {
     param($Scenario, [int]$Conc, [string]$Duration, [string]$Tag)
 
@@ -202,8 +215,11 @@ function Invoke-LoadRun {
 $backend = Start-Backend
 Initialize-BenchSite
 
-$rows = @()
+$script:rowCount = 0
 $durationSec = [int]($Duration -replace "[a-zA-Z]", "")
+
+# Start from a clean CSV so an append never mixes with a previous run's rows.
+if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
 
 try {
     foreach ($ruleset in $Rulesets) {
@@ -248,7 +264,7 @@ try {
                             [math]::Round($cpuSec * 1000 / $res.ReqCount, 3)
                         } else { -1 }
 
-                        $rows += [pscustomobject]@{
+                        $row = [pscustomobject]@{
                             Rep         = $rep
                             Arm         = $arm
                             Ruleset     = $ruleset
@@ -272,8 +288,9 @@ try {
                             PeakWsMB    = $after.PeakWsMB
                             Workers     = $after.Processes
                         }
+                        Add-Row $row
                         Write-Host ("   {0} c={1,-3} rps={2,-9} lat={3}ms cpu/req={4}ms ws={5}MB" -f `
-                            $scenario.Id, $conc, $rows[-1].RPS, $res.LatMeanMs, $cpuMs, $after.WsMB)
+                            $scenario.Id, $conc, $row.RPS, $res.LatMeanMs, $cpuMs, $after.WsMB)
 
                         # rps * latency / concurrency should be ~1. Far off means
                         # the latency unit is not microseconds and the column is
@@ -293,5 +310,5 @@ finally {
     if ($backend -and -not $backend.HasExited) { Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue }
 }
 
-$rows | Export-Csv $OutFile -NoTypeInformation -Encoding UTF8
-Write-Host "`nWrote $($rows.Count) rows to $OutFile"
+# Rows were flushed as they were produced; nothing to write here.
+Write-Host "`nWrote $script:rowCount rows to $OutFile"
