@@ -102,11 +102,18 @@ jobs:
       # back to the current repo + triggering ref -- i.e. it would check out
       # ModSecurityIIS itself and CMake would fail with "does not appear to
       # contain CMakeLists.txt" under v2/iis.
+      #
+      # TEMPORARY: the defaults point at the fork's iis-fix-chunked-te branch to
+      # test whether that one commit (a WriteBodyCallback fix for a request that
+      # carried both Transfer-Encoding: chunked and Content-Length) is what
+      # makes v2/master hang on every request with a body. The branch is just
+      # v2/master + that commit, so it is a clean single-variable comparison.
+      # Revert to owasp-modsecurity/ModSecurity @ v2/master once answered.
       - name: Checkout ModSecurity v2
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.v2_repo || 'owasp-modsecurity/ModSecurity' }}
-          ref: ${{ inputs.v2_ref || 'v2/master' }}
+          repository: ${{ inputs.v2_repo || 'A13501350/ModSecurity' }}
+          ref: ${{ inputs.v2_ref || 'iis-fix-chunked-te' }}
           path: v2
           submodules: recursive
           fetch-depth: 0
