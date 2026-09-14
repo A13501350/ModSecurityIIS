@@ -405,10 +405,15 @@ $probeUrl = "http://127.0.0.1:$Port/echo"
 # run. If the site is down after the FREB enable, revert the tracing config and
 # restart so the probes still measure the real connector/ARR behavior.
 if ($frebOn) {
+    # NOTE: use /healthz, NOT /hello.txt. The site's rewrite rule matches url=".*"
+    # and forwards EVERYTHING to the echo backend, so /hello.txt is answered by
+    # the backend with 404 (v9: that 404 made this gate misfire, revert a
+    # perfectly good FREB config, and the 10 captured 404 traces were the gate's
+    # own retries). /healthz goes through the same rewrite path and returns 200.
     $sane = $false
     foreach ($i in 1..10) {
         try {
-            $r = Invoke-WebRequest "http://127.0.0.1:$Port/hello.txt" -UseBasicParsing `
+            $r = Invoke-WebRequest "http://127.0.0.1:$Port/healthz" -UseBasicParsing `
                      -SkipHttpErrorCheck -TimeoutSec 5
             if ($r.StatusCode -eq 200) { $sane = $true; break }
         } catch { Start-Sleep -Seconds 2 }
