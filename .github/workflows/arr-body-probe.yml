@@ -32,8 +32,9 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches: [ 'diag/**' ]
+  # No push trigger on purpose: pushing a commit to diag/** would spawn a full
+  # ~13-min build for no reason. This is a diagnostic probe -- drive it by
+  # workflow_dispatch only, reusing an existing build via build_run_id.
 
 jobs:
   build:

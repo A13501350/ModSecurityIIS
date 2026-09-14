@@ -100,8 +100,7 @@ function Enable-Freb {
     # The worker process writes the trace files; grant it write on the dir.
     try { icacls "$Dir" /grant "IIS_IUSRS:(OI)(CI)F" | Out-Null } catch { }
 
-    # 1) Windows feature (IIS-HttpTracing). -NoRestart: W3SVC reloads it on the
-    #    restart we perform after all site config is committed (see step 5).
+    # 1) Windows feature (IIS-HttpTracing).
     try {
         Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
             -NoRestart -ErrorAction Stop | Out-Null
@@ -111,13 +110,25 @@ function Enable-Freb {
         & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host
     }
 
-    # 2) Unlock the (delegation-locked) tracing section for THIS site so a
-    #    per-site commit is allowed. Without this, every per-site write fails.
+    # 2) RESTART W3SVC+WAS BEFORE touching tracing config. The freshly enabled
+    #    feature must register its module and (crucially) the tracing section
+    #    schema with the config system; appcmd issued ~1s after the feature
+    #    install fails with exit 2/1413 because the schema is not loaded yet.
+    & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 3
+    & iisreset /start 2>&1 | Out-Null
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+    Start-Sleep -Seconds 3
+
+    # 3) Unlock the (delegation-locked) tracing section for THIS site so a
+    #    per-site commit is allowed.
     & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing 2>&1 | Out-Null
     & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing/traceFailedRequestsLogging 2>&1 | Out-Null
     & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing/traceFailedRequests 2>&1 | Out-Null
 
-    # 3) Turn on trace-failed-request logging for THIS site only (/commit:site).
+    # 4) Turn on trace-failed-request logging for THIS site only (/commit:site).
     & $Appcmd set config "$SiteName" `
         /section:system.webServer/tracing/traceFailedRequestsLogging `
         /enabled:true /directory:"$Dir" /maxLogFiles:50 /commit:site 2>&1 | Out-Null
@@ -125,7 +136,7 @@ function Enable-Freb {
         Write-Warning ("[FREB] traceFailedRequestsLogging set failed (exit {0})" -f $LASTEXITCODE)
     }
 
-    # 4) Per-site trace rule. WWW Server provider, Verbose. Capture stalls
+    # 5) Per-site trace rule. WWW Server provider, Verbose. Capture stalls
     #    (timeTaken >= 25s -- our curl stall is 30s) and every 2xx-5xx so a
     #    truncated 200 is caught too. statusCodes=200-599 traces all completions.
     $areas = "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting"
@@ -139,10 +150,13 @@ function Enable-Freb {
         Write-Host "[FREB] per-site trace rule added (statusCodes=200-599, timeTaken>=25s)."
     }
 
-    # 5) Verify the config is present (will warn if the section did not take).
-    & $Appcmd list config "$SiteName" /section:system.webServer/tracing 2>&1 | Out-Null
+    # 6) Verify the config reads back; print it so the log shows what is active.
+    $rb = & $Appcmd list config "$SiteName" /section:system.webServer/tracing 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "[FREB] could not read back tracing config for the site (rule may not be active)."
+    } else {
+        Write-Host "[FREB] active tracing config for site:"
+        $rb | ForEach-Object { Write-Host "  $_" }
     }
 }
 
@@ -155,9 +169,16 @@ function Enable-FrebGlobal {
     & $Appcmd set config `
         /section:system.webServer/tracing/traceFailedRequestsLogging `
         /enabled:true /directory:"$Dir" /maxLogFiles:50 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("[FREB] global traceFailedRequestsLogging set failed (exit {0})" -f $LASTEXITCODE)
+    }
     $rule = "[path='*',traceAreas='{WWW Server&$Areas}',verbosity='Verbose',failureDefinitions='{statusCodes=200-599,timeTaken=00:00:25}']"
     & $Appcmd set config /section:system.webServer/tracing/traceFailedRequests /+$rule 2>&1 | Out-Null
-    Write-Host "[FREB] server-global trace rule added (traces all sites on the box)."
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("[FREB] global trace rule add failed (exit {0})" -f $LASTEXITCODE)
+    } else {
+        Write-Host "[FREB] server-global trace rule added (traces all sites on the box)."
+    }
 }
 
 # Parse captured FREB XML files and surface, for each traced request, the URL
