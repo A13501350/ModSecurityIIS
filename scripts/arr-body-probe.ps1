@@ -83,16 +83,22 @@ function Write-Verdict {
 # ---------------------------------------------------------------------------
 # FREB (IIS Failed Request Tracing) -- correct, per-site enabling.
 #
-# Unlike the prior global applicationHost.config hand-edit (scripts/ci-crs.ps1
-# 7a) that wrote the trace rule server-wide (tracing every site and wedging the
-# box into a servicing-pending state after iisreset), this scopes the rule to
-# the probe site only via appcmd /commit:site (=> <location path="SiteName">).
-# It is also enabled BEFORE the probes run, so the stalls are actually captured.
+# The tracing section is LOCKED for delegation by default (overrideModeDefault
+# Deny in applicationHost.config), so writing it at site/<location> level fails
+# (appcmd exit 2/1413) and hand-editing a <location> tracing node yields a
+# "Configuration error" that breaks the whole site (every request -> HTTP 000).
+# The fix is to UNLOCK the tracing section for the site first, then set it
+# per-site via appcmd /commit:site. If that still fails we fall back to a
+# SERVER-GLOBAL rule (valid at server level), which traces every site but does
+# not corrupt the config. FREB is enabled BEFORE the probes so stalls are
+# captured.
 # ---------------------------------------------------------------------------
 function Enable-Freb {
     param([string]$SiteName, [string]$Dir, [string]$Appcmd)
     Write-Host "[FREB] enabling IIS Failed Request Tracing (per-site, before probes)"
     New-Item -ItemType Directory -Force $Dir -ErrorAction SilentlyContinue | Out-Null
+    # The worker process writes the trace files; grant it write on the dir.
+    try { icacls "$Dir" /grant "IIS_IUSRS:(OI)(CI)F" | Out-Null } catch { }
 
     # 1) Windows feature (IIS-HttpTracing). -NoRestart: W3SVC reloads it on the
     #    restart we perform after all site config is committed (see step 5).
@@ -105,71 +111,53 @@ function Enable-Freb {
         & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host
     }
 
-    # 2) Turn on trace-failed-request logging for THIS site only (/commit:site).
-    & $Appcmd set config $SiteName `
+    # 2) Unlock the (delegation-locked) tracing section for THIS site so a
+    #    per-site commit is allowed. Without this, every per-site write fails.
+    & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing 2>&1 | Out-Null
+    & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing/traceFailedRequestsLogging 2>&1 | Out-Null
+    & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing/traceFailedRequests 2>&1 | Out-Null
+
+    # 3) Turn on trace-failed-request logging for THIS site only (/commit:site).
+    & $Appcmd set config "$SiteName" `
         /section:system.webServer/tracing/traceFailedRequestsLogging `
         /enabled:true /directory:"$Dir" /maxLogFiles:50 /commit:site 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("[FREB] traceFailedRequestsLogging set failed (exit {0})" -f $LASTEXITCODE)
     }
 
-    # 3) Per-site trace rule. WWW Server provider, Verbose. Capture stalls
+    # 4) Per-site trace rule. WWW Server provider, Verbose. Capture stalls
     #    (timeTaken >= 25s -- our curl stall is 30s) and every 2xx-5xx so a
-    #    truncated 200 is caught too. Healthy fast 200s that finish < 25s would
-    #    still be traced (200-599 covers all completions); that is intentional
-    #    for a debug run so no symptom is missed.
+    #    truncated 200 is caught too. statusCodes=200-599 traces all completions.
     $areas = "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting"
     $rule  = "[path='*',traceAreas='{WWW Server&$areas}',verbosity='Verbose',failureDefinitions='{statusCodes=200-599,timeTaken=00:00:25}']"
-    & $Appcmd set config $SiteName `
+    & $Appcmd set config "$SiteName" `
         /section:system.webServer/tracing/traceFailedRequests /+$rule /commit:site 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("[FREB] appcmd rule add failed (exit {0}); falling back to <location> XML edit" -f $LASTEXITCODE)
-        Set-FrebRuleViaXml -SiteName $SiteName -Dir $Dir -Areas $areas
+        Write-Warning ("[FREB] per-site rule add failed (exit {0}); falling back to server-global tracing" -f $LASTEXITCODE)
+        Enable-FrebGlobal -Dir $Dir -Areas $areas -Appcmd $Appcmd
     } else {
         Write-Host "[FREB] per-site trace rule added (statusCodes=200-599, timeTaken>=25s)."
     }
+
+    # 5) Verify the config is present (will warn if the section did not take).
+    & $Appcmd list config "$SiteName" /section:system.webServer/tracing 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "[FREB] could not read back tracing config for the site (rule may not be active)."
+    }
 }
 
-# Fallback: write the per-site rule under <location path="SiteName"> in
-# applicationHost.config (NOT the global <system.webServer>/<tracing> node).
-function Set-FrebRuleViaXml {
-    param([string]$SiteName, [string]$Dir, [string]$Areas)
-    $ah = "$env:windir\System32\inetsrv\config\applicationHost.config"
-    [xml]$doc = Get-Content $ah
-    $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
-    if (-not $loc) {
-        $loc = $doc.configuration.AppendChild($doc.CreateElement("location"))
-        $loc.SetAttribute("path", $SiteName)
-    }
-    $sws = $loc."system.webServer"
-    if (-not $sws) { $sws = $loc.AppendChild($doc.CreateElement("system.webServer")) }
-    $tracing = $sws.tracing
-    if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
-
-    $tfrl = $tracing.traceFailedRequestsLogging
-    if (-not $tfrl) { $tfrl = $tracing.AppendChild($doc.CreateElement("traceFailedRequestsLogging")) }
-    $tfrl.SetAttribute("enabled", "true")
-    $tfrl.SetAttribute("directory", $Dir)
-    $tfrl.SetAttribute("maxLogFiles", "50")
-
-    $tfr = $tracing.traceFailedRequests
-    if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
-    $tfr.RemoveAll()
-    $add = $doc.CreateElement("add"); $add.SetAttribute("path", "*")
-    $ta = $doc.CreateElement("traceAreas")
-    $prov = $doc.CreateElement("add")
-    $prov.SetAttribute("provider", "WWW Server")
-    $prov.SetAttribute("areas", $Areas)
-    $prov.SetAttribute("verbosity", "Verbose")
-    [void]$ta.AppendChild($prov)
-    [void]$add.AppendChild($ta)
-    $fd = $doc.CreateElement("failureDefinitions")
-    $fd.SetAttribute("statusCodes", "200-599")
-    $fd.SetAttribute("timeTaken", "00:00:25")
-    [void]$add.AppendChild($fd)
-    [void]$tfr.AppendChild($add)
-    $doc.Save($ah)
-    Write-Host "[FREB] per-site trace rule written via applicationHost.config <location> fallback."
+# Valid fallback: write the rule at SERVER level (global <system.webServer>/<tracing>).
+# The tracing section IS allowed at server level even when locked for delegation,
+# so this never corrupts the config. Traces every site (acceptable for a debug
+# probe), unlike the old <location> hand-edit which raised a Configuration error.
+function Enable-FrebGlobal {
+    param([string]$Dir, [string]$Areas, [string]$Appcmd)
+    & $Appcmd set config `
+        /section:system.webServer/tracing/traceFailedRequestsLogging `
+        /enabled:true /directory:"$Dir" /maxLogFiles:50 2>&1 | Out-Null
+    $rule = "[path='*',traceAreas='{WWW Server&$Areas}',verbosity='Verbose',failureDefinitions='{statusCodes=200-599,timeTaken=00:00:25}']"
+    & $Appcmd set config /section:system.webServer/tracing/traceFailedRequests /+$rule 2>&1 | Out-Null
+    Write-Host "[FREB] server-global trace rule added (traces all sites on the box)."
 }
 
 # Parse captured FREB XML files and surface, for each traced request, the URL
@@ -484,6 +472,18 @@ $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "a
 # 6b) FREB trace summary (opt-in) -- pinpoint the blocking stage for stalls
 # ---------------------------------------------------------------------------
 if ($frebOn) {
+    # A stalled request that curl aborts at $TimeoutSec keeps running server-side
+    # until ARR's proxy timeout (~120s) before completing, and FREB only FLUSHES
+    # its XML when the request completes. So traces for the stalls do not exist
+    # yet. Wait for the server-side requests to finish so FREB writes them, then
+    # summarize. (Healthy 200s flush immediately, so we stop early once we have
+    # traces and >=60s have elapsed to let the late stalls land.)
+    $deadline = [DateTime]::Now.AddSeconds(150)
+    while ([DateTime]::Now -lt $deadline) {
+        $fc = @(Get-ChildItem $frebDir -Recurse -Filter fr*.xml -ErrorAction SilentlyContinue)
+        if ($fc.Count -gt 0 -and ([DateTime]::Now -ge $deadline.AddSeconds(-60))) { break }
+        Start-Sleep -Seconds 10
+    }
     Get-FrebSummary -Dir $frebDir
 }
 
