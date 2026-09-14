@@ -63,6 +63,13 @@ $ErrorActionPreference = "Stop"
 $frebOn  = $Freb -or ($env:MODSEC_IIS_FREB -eq '1') -or ($env:MODSEC_IIS_FREB -ieq 'true')
 $frebDir = Join-Path $ConfRoot "freb"
 
+# Guard: a parameter-binding mistake (e.g. positional array splat) could land a
+# file path (the MSI) in $ConfRoot. Keep it a real config root.
+if ($ConfRoot -and ($ConfRoot -like '*.msi' -or (Test-Path $ConfRoot -PathType Leaf))) {
+    Write-Warning ("[guard] ConfRoot '{0}' is not a directory; resetting to C:\inetpub\modsec-arr" -f $ConfRoot)
+    $ConfRoot = "C:\inetpub\modsec-arr"
+}
+
 $appcmd = "$env:windir\System32\inetsrv\appcmd.exe"
 $curl   = "$env:windir\System32\curl.exe"
 

@@ -170,11 +170,15 @@ jobs:
       - name: Run ARR body-forward probe
         shell: pwsh
         run: |
+          # Use a HASHTABLE splat (not an array): array splatting binds
+          # positionally, so "-Msi" would become the value of $Msi and the real
+          # path would leak into $ConfRoot. Hashtable splat does named binding.
+          $ht = @{}
           $msi = (Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1).FullName
+          if ($msi) { $ht['Msi'] = $msi }
           $freb = [System.Convert]::ToBoolean("${{ inputs.freb }}")
-          $args = @("-Msi", $msi)
-          if ($freb) { $args += "-Freb" }
-          ./scripts/arr-body-probe.ps1 @args
+          if ($freb) { $ht['Freb'] = $true }
+          ./scripts/arr-body-probe.ps1 @ht
 
       - name: Upload probe diagnostics
         if: always()
