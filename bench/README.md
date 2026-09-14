@@ -137,17 +137,36 @@ of the limit directives (aligning them with the proven
 (run 34484364411), which scopes it to the request-body path and is also the
 only known workaround -- at the cost of not inspecting bodies at all.
 
-Upstream CI misses it because its three functional assertions are all GET
-(`test-ci-windows.yml:273-277`) and its go-ftw step never checks the exit code
-(line 332).
+This fork's CI (`build.yml`) builds and tests **only the v3 connector**; v2 is
+absent from CI here entirely, so no body-carrying v2 request is ever run. (The
+upstream v2 repo's own CI is out of scope of this fork and was not inspected.)
 
-### v3: 100 KiB request bodies stall
+### v3: 100 KiB request bodies stall *through ARR*
 
-The v3 connector handles 1 KiB POSTs normally but stalls on 100 KiB ones, and
-this is **unaffected** by `SecRequestBodyAccess` because its async drain
-(`DriveBodyRead`) runs unconditionally from `OnBeginRequest`. A different
-defect from the v2 one. c=16 partially works around it, which suggests a
-per-connection block rather than a hard failure.
+The v3 connector handles 1 KiB POSTs normally but a ~100 KiB POST stalls **when
+the connector site reverse-proxies the request to a backend via ARR** — which is
+exactly the topology the harness uses (`bench/iis.ps1` installs `iis-arr` and
+rewrites every request to `http://127.0.0.1:8080`, mirroring
+`scripts/ci-crs.ps1`).
+
+This is **unaffected** by `SecRequestBodyAccess`: v3's async drain
+(`DriveBodyRead`, `src/ModSecurityIIS.cpp:635`) runs unconditionally from
+`OnBeginRequest` (`:1070`), so turning the switch off does nothing.
+
+c=16 partially works around it, which suggests a per-connection block rather
+than a hard failure in the body-forwarding-to-backend path.
+
+**Why existing tests miss it** — the integration test *does* cover bodies,
+including a ~100 KB one. `scripts/smoke.Tests.ps1` test `6b` (lines 233-262)
+POSTs `bodyprobe=1&pad=` + 100000 `Z`s and asserts the body reaches the audit
+log intact. But that test posts **directly to the connector's IIS site** — there
+is no ARR and no backend in it (a POST to `/` is handled locally; test `D`
+asserts the 405 from the static handler). So it exercises local body handling,
+not the ARR forward path, and passes. `ci-crs.ps1` *does* use ARR, but the CRS
+suite only ever sends small bodies, so it never reaches 100 KiB either.
+
+Net: the stall is in the **connector → ARR → backend body hand-off at ~100 KiB**,
+a path no shipped test exercises.
 
 Consequence for the benchmark: only the header path (S1, S2, S6) is comparable
 today, which is why it is the default scenario set.
