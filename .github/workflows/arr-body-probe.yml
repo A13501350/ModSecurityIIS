@@ -27,6 +27,11 @@ on:
         required: false
         default: ''
         type: string
+      freb:
+        description: 'Capture IIS Failed Request Tracing (FREB) to pinpoint the stall stage (connector body-read vs ARR forward)'
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [ 'diag/**' ]
 
@@ -166,7 +171,10 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
-          ./scripts/arr-body-probe.ps1 -Msi $msi
+          $freb = [System.Convert]::ToBoolean("${{ inputs.freb }}")
+          $args = @("-Msi", $msi)
+          if ($freb) { $args += "-Freb" }
+          ./scripts/arr-body-probe.ps1 @args
 
       - name: Upload probe diagnostics
         if: always()

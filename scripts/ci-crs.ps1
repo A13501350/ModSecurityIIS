@@ -434,10 +434,17 @@ if ($frebOn) {
             /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
         $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
         [xml]$doc = Get-Content $ahConfig
-        $sws = $doc.configuration."system.webServer"
-        if (-not $sws) {
-            $sws = $doc.configuration.AppendChild($doc.CreateElement("system.webServer"))
+        # Scope the rule to the CRS site (<location path="SiteName">), NOT the
+        # global <system.webServer>/<tracing> node. A global rule traces every
+        # site on the box and is what wedged the server into servicing-pending
+        # after iisreset. Per-site keeps tracing isolated to this site.
+        $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
+        if (-not $loc) {
+            $loc = $doc.configuration.AppendChild($doc.CreateElement("location"))
+            $loc.SetAttribute("path", $SiteName)
         }
+        $sws = $loc."system.webServer"
+        if (-not $sws) { $sws = $loc.AppendChild($doc.CreateElement("system.webServer")) }
         $tracing = $sws.tracing
         if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
         $tfr = $tracing.traceFailedRequests
@@ -454,10 +461,11 @@ if ($frebOn) {
         [void]$add.AppendChild($ta)
         $fd = $doc.CreateElement("failureDefinitions")
         $fd.SetAttribute("statusCodes", "200-999")
+        $fd.SetAttribute("timeTaken", "00:00:25")
         [void]$add.AppendChild($fd)
         [void]$tfr.AppendChild($add)
         $doc.Save($ahConfig)
-        Write-Host "[7a/8] FREB rule added (all status codes, RequestNotifications)."
+        Write-Host "[7a/8] FREB rule added (per-site <location>, all status codes + timeTaken>=25s)."
     } catch {
         Write-Host "[7a/8] WARN: FREB config failed: $($_.Exception.Message)"
     }
