@@ -32,6 +32,16 @@ on:
         required: false
         default: false
         type: boolean
+      load_clients:
+        description: 'Concurrency-phase client count (default 16). NOTE: FREB tracing can mask the race -- prefer no-FREB runs with higher load.'
+        required: false
+        default: ''
+        type: string
+      load_reps:
+        description: 'Concurrency-phase repetitions per client (default 4)'
+        required: false
+        default: ''
+        type: string
   # No push trigger on purpose: pushing a commit to diag/** would spawn a full
   # ~13-min build for no reason. This is a diagnostic probe -- drive it by
   # workflow_dispatch only, reusing an existing build via build_run_id.
@@ -181,6 +191,8 @@ jobs:
           $frebRaw = "${{ inputs.freb }}"
           $freb = ($frebRaw -ieq 'true') -or ($frebRaw -eq '1')
           if ($freb) { $ht['Freb'] = $true }
+          if ("${{ inputs.load_clients }}" -ne '') { $ht['LoadClients'] = "${{ inputs.load_clients }}" }
+          if ("${{ inputs.load_reps }}" -ne '')    { $ht['LoadReps']    = "${{ inputs.load_reps }}" }
           ./scripts/arr-body-probe.ps1 @ht
 
       - name: Upload probe diagnostics

@@ -185,43 +185,51 @@ function Get-FrebSummary {
         return
     }
     Write-Host ("[FREB] {0} trace file(s) captured." -f $files.Count)
+    # Event structure (verified against a real trace): each <Event> carries
+    # <EventData><Data Name="ModuleName">...</Data></EventData> and a friendly
+    # event name in <RenderingInfo><Opcode>NAME</Opcode></RenderingInfo>.
+    # Notification/ModuleName are NOT attributes. For stalls the interesting
+    # value is the last NOTIFY_MODULE_START's module (the module that was
+    # entered and never completed).
     $rows = foreach ($f in $files) {
         try { [xml]$x = Get-Content $f.FullName } catch { continue }
         $fr = $x.failedRequest
-        $url    = if ($fr.url) { $fr.url } else { "?" }
-        $status = if ($fr.statusCode) { $fr.statusCode } else { $fr.Event.statusCode }
-        $tt     = if ($fr.timeTaken) { $fr.timeTaken } else { $fr.Event.timeTaken }
-        $trig   = $fr.triggeredByNotification
         $events = @($fr.Event)
-        $last   = $events | Select-Object -Last 1
+        $lastOp = ""; $lastMod = ""; $lastModStart = ""
+        foreach ($e in $events) {
+            $op = $e.RenderingInfo.Opcode
+            if ($op) { $lastOp = $op }
+            $m = @($e.EventData.Data) | Where-Object { $_.Name -eq 'ModuleName' } |
+                     Select-Object -First 1
+            if ($m -and $m.InnerText) {
+                $lastMod = $m.InnerText
+                if ($op -eq 'NOTIFY_MODULE_START') { $lastModStart = $m.InnerText }
+            }
+        }
         [pscustomobject]@{
-            File              = $f.Name
-            Url               = $url
-            Status            = $status
-            TimeTaken         = $tt
-            TriggeredBy       = $trig
-            LastNotification  = if ($last) { $last.Notification } else { "?" }
-            LastModule        = if ($last) { $last.ModuleName } else { "?" }
-            Reason            = if ($last) { $last.Reason } else { "" }
-            ErrorCode         = if ($last) { $last.ErrorCode } else { "" }
+            File           = $f.Name
+            Url            = if ($fr.url) { $fr.url } else { "?" }
+            Status         = if ($fr.statusCode) { $fr.statusCode } else { "?" }
+            TimeTakenMs    = if ($fr.timeTaken) { [long]$fr.timeTaken } else { 0 }
+            FailureReason  = if ($fr.failureReason) { $fr.failureReason } else { "" }
+            LastEvent      = $lastOp
+            LastModule     = $lastMod
+            LastModStart   = $lastModStart
         }
     }
-    $rows = $rows | Sort-Object {
-        try { [TimeSpan]::Parse($_.TimeTaken) } catch { [TimeSpan]::Zero }
-    } -Descending
+    $rows = $rows | Sort-Object TimeTakenMs -Descending
     foreach ($r in $rows) {
         $tag = ""
         if ($r.Url -match '/echo') { $tag += " [ECHO-BODY]" }
-        if ("$r.Status" -match '^5') { $tag += " [5xx]" }
-        Write-Host ("[FREB] {0,-22} status={1,-4} tt={2,-14} last={3}/{4}{5}" -f `
-            $r.File, $r.Status, $r.TimeTaken, $r.LastNotification, $r.LastModule, $tag)
-        if ($r.TriggeredBy) { Write-Host ("        triggeredBy: {0}" -f $r.TriggeredBy) }
-        if ($r.Reason)      { Write-Host ("        reason     : {0}" -f $r.Reason) }
-        if ($r.ErrorCode)   { Write-Host ("        errorCode  : {0}" -f $r.ErrorCode) }
+        if ("$($r.Status)" -match '^5') { $tag += " [5xx]" }
+        Write-Host ("[FREB] {0,-14} status={1,-4} tt={2,-8} last={3}/{4}{5}" -f `
+            $r.File, $r.Status, $r.TimeTakenMs, $r.LastEvent, $r.LastModule, $tag)
+        if ($r.LastModStart)  { Write-Host ("        lastModuleEntered: {0}" -f $r.LastModStart) }
+        if ($r.FailureReason) { Write-Host ("        failureReason    : {0}" -f $r.FailureReason) }
     }
     Write-Host "[FREB] interpretation:"
-    Write-Host "[FREB]   last=RQ_BEGIN_REQUEST / ModSecurityIIS  => connector body-read blocked (DriveBodyRead/InsertEntityBody)."
-    Write-Host "[FREB]   last=ApplicationRequestRouting / routing notification => ARR forward to backend blocked."
+    Write-Host "[FREB]   lastModuleEntered=ModSecurityIIS (no NOTIFY_MODULE_END) => connector body-read blocked."
+    Write-Host "[FREB]   trailing ARR/rewrite events without response entity  => ARR forward to backend blocked."
     Write-Host "[FREB]   markers in URL: arrctl (1KiB control), arrbodyprobe (100KiB), arrload=16 (concurrency)."
 }
 
@@ -419,7 +427,7 @@ if ($frebOn) {
         } catch { Start-Sleep -Seconds 2 }
     }
     if ($sane) {
-        Write-Host "[FREB] post-enable sanity: site serving (hello.txt 200)."
+        Write-Host "[FREB] post-enable sanity: site serving (/healthz 200)."
     } else {
         Write-Warning "[FREB] site NOT serving after FREB enable -- reverting tracing config (self-heal)."
         try {
@@ -530,21 +538,28 @@ $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "a
 # ---------------------------------------------------------------------------
 try {
     Import-Module WebAdministration -ErrorAction Stop
-    $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
-    if ($inflight.Count -eq 0) {
-        $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
-    }
-    Write-Host ("[INFLIGHT] {0} request(s) still executing (pool {1}):" -f $inflight.Count, $PoolName)
-    $shown = 0
-    foreach ($r in $inflight) {
-        if ($shown -ge 20) { Write-Host "[INFLIGHT] ... (truncated)"; break }
-        Write-Host ("[INFLIGHT] {0} {1} elapsed={2}ms state={3}" -f `
-            $r.verb, $r.url, $r.timeElapsed, $r.state)
-        $shown++
-    }
-    if ($inflight.Count -gt 0) {
-        Write-Host "[INFLIGHT] full record of the first in-flight request:"
-        $inflight[0] | Format-List * | Out-String | ForEach-Object { Write-Host $_ }
+    # A stalled request persists server-side until ARR's proxy timeout (~120s),
+    # so poll a few times: round 1 immediately, then two more if empty.
+    for ($round = 1; $round -le 3; $round++) {
+        $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
+        if ($inflight.Count -eq 0) {
+            $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
+        }
+        Write-Host ("[INFLIGHT] round {0}: {1} request(s) still executing (pool {2}):" -f `
+            $round, $inflight.Count, $PoolName)
+        $shown = 0
+        foreach ($r in $inflight) {
+            if ($shown -ge 20) { Write-Host "[INFLIGHT] ... (truncated)"; break }
+            Write-Host ("[INFLIGHT] {0} {1} elapsed={2}ms state={3}" -f `
+                $r.verb, $r.url, $r.timeElapsed, $r.state)
+            $shown++
+        }
+        if ($inflight.Count -gt 0) {
+            Write-Host "[INFLIGHT] full record of the first in-flight request:"
+            $inflight[0] | Format-List * | Out-String | ForEach-Object { Write-Host $_ }
+            break
+        }
+        if ($round -lt 3) { Start-Sleep -Seconds 3 }
     }
 } catch {
     Write-Warning ("[INFLIGHT] snapshot failed: {0}" -f $_.Exception.Message)
