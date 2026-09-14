@@ -320,11 +320,17 @@ choco install urlrewrite iis-arr -y --no-progress | Out-Null
 & $appcmd set config /section:system.webServer/proxy /enabled:true
 if ($LASTEXITCODE -ne 0) { throw "Failed to enable ARR proxy." }
 
-# Start the echo backend.
+# Start the echo backend. Its stderr (the ECHO diagnostic log lines) is
+# captured to a file -- the arrival/read-complete/respond records are the
+# bisect data for the stall (did the request reach the backend at all?).
 $backendUrl = "http://127.0.0.1:$BackendPort"
 $goArgs = @("run", $backendSrc, "-addr", "127.0.0.1:$BackendPort")
+$backendLog  = Join-Path $ConfRoot "backend.log"
+$backendOut  = Join-Path $ConfRoot "backend-stdout.log"
 $beProc = Start-Process -FilePath $BackendExe -ArgumentList $goArgs `
-                        -WindowStyle Hidden -PassThru
+                        -WindowStyle Hidden -PassThru `
+                        -RedirectStandardError $backendLog `
+                        -RedirectStandardOutput $backendOut
 Write-Host "== echo backend started (pid $($beProc.Id)) =="
 $ready = $false
 foreach ($i in 1..30) {
@@ -561,6 +567,36 @@ $c1  = Invoke-ConcurrencyProbe "load-c1"  1          $LoadReps $TargetBytes "arr
 $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "arrload=16&pad="
 
 # ---------------------------------------------------------------------------
+# 6b) backend bisect -- did the stalled requests reach the echo backend at all?
+#     Correlates the backend's ECHO log lines (arrival / read-complete /
+#     responded / read-error) with the probe's stall count:
+#       arrivals ~ total sent            => stall is on the RESPONSE path back
+#       arrivals < total sent            => stall is BEFORE the backend
+#                                           (connector body-read or ARR forward)
+#       ECHO-ERR read-failed mid-body    => the ARR re-read of the
+#                                           InsertEntityBody stream stalled
+# Give late ECHO-ERRs (aborted clients) a few seconds to land first.
+# ---------------------------------------------------------------------------
+Start-Sleep -Seconds 5
+$arrivals  = @(Select-String -Path $backendLog -Pattern 'ECHO arrived'  -ErrorAction SilentlyContinue)
+$responded = @(Select-String -Path $backendLog -Pattern 'ECHO responded' -ErrorAction SilentlyContinue)
+$readerrs  = @(Select-String -Path $backendLog -Pattern 'ECHO-ERR'      -ErrorAction SilentlyContinue)
+$totalSent = $c1.Total + $c16.Total + 2   # + control + target
+Write-Host ("[BACKEND] arrivals={0} responded={1} read-errors={2} (probe sent {3} body requests)" -f `
+    $arrivals.Count, $responded.Count, $readerrs.Count, $totalSent)
+if ($readerrs.Count -gt 0) {
+    Write-Host "[BACKEND] read-error lines (ARR re-read of the re-inserted body stalled mid-transfer):"
+    $readerrs | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_.Line) }
+}
+$missing = $totalSent - $arrivals.Count
+if ($missing -gt 0) {
+    Write-Host ("[BACKEND] {0} request(s) NEVER reached the backend => stall is pre-forward " -f $missing)
+    Write-Host "[BACKEND] (connector DriveBodyRead/InsertEntityBody or ARR before forwarding)."
+} else {
+    Write-Host "[BACKEND] all requests reached the backend => stall is on the response path back to the client."
+}
+
+# ---------------------------------------------------------------------------
 # 6a) final in-flight check. The PRIMARY in-flight diagnostic now lives INSIDE
 #     Invoke-ConcurrencyProbe (snapshots taken WHILE the load is running): v11
 #     proved that a stalled request is torn down the instant its client
@@ -569,7 +605,11 @@ $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "a
 # ---------------------------------------------------------------------------
 try {
     Import-Module WebAdministration -ErrorAction Stop
-    $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
+    # Do NOT suppress errors here: v12 showed this API returns nothing at all on
+    # the runner's minimal IIS (no management tools), and the swallowed error
+    # made every request look invisible. Let a failure land in the catch so the
+    # real cause is printed.
+    $inflight = @(Get-WebRequest -ApplicationPool $PoolName)
     if ($inflight.Count -eq 0) {
         $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
     }
@@ -609,6 +649,12 @@ if ($frebOn) {
 # ---------------------------------------------------------------------------
 # 7) cleanup + verdict
 # ---------------------------------------------------------------------------
+# Stop IIS FIRST: that flushes the buffered W3C access logs (they can lag up to
+# 60s otherwise) so they can be collected into the diagnostics artifact. The
+# W3C time-taken field gives the server-side view of every request without FREB.
+& iisreset /stop 2>&1 | Out-Null
+Copy-Item "C:\inetpub\logs\LogFiles" (Join-Path $ConfRoot "iis-logs") `
+    -Recurse -Force -ErrorAction SilentlyContinue
 if (-not $beProc.HasExited) { $beProc.Kill() }
 & $appcmd delete site $SiteName 2>$null | Out-Null
 & $appcmd delete apppool $PoolName 2>$null | Out-Null
@@ -629,6 +675,6 @@ if ($allOk) {
     Write-Host ""
     Write-Host "Any STALL/TRUNC under load reproduces the bench-harness defect"
     Write-Host "(bench/README.md: 'v3: 100 KiB request bodies stall through ARR')."
-    Write-Host "Diagnostics: $ConfRoot (body-*.bin, resp-*.bin, code-*.txt)"
+    Write-Host "Diagnostics: $ConfRoot (backend.log, inflight-snapshots.log, iis-logs\, body-*.bin, resp-*.bin, code-*.txt)"
     exit 1
 }
