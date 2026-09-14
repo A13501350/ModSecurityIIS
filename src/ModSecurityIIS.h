@@ -12,7 +12,7 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false), m_BodyReadActive(false),
+          m_ResponseHeadersFed(false),
           m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false)
     { }
 
@@ -79,8 +79,6 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // IIS with a SINGLE InsertEntityBody() once the body is complete.
     std::vector<char>         m_Body;
     char                      m_ReadBuf[65536];
-    // True while an async ReadEntityBody() is in flight.
-    bool                      m_BodyReadActive;
 };
 
 
@@ -107,17 +105,9 @@ public:
         IN IHttpEventProvider * pProvider
     ) override;
 
-    // Entity-body async completions are delivered DIRECTLY to this per-
-    // operation callback (IHttpRequest3::ReadEntityBody binds it at issue
-    // time), not through the module-wide OnAsyncCompletion multicast -- a
-    // completion can no longer be lost or misrouted under load (the C2 wedge
-    // diagnosed on diag/arr-body-stall).
-    static REQUEST_NOTIFICATION_STATUS WINAPI
-    OnReadBodyCompletion(
-        IN IHttpContext3 * pHttpContext3,
-        IN IHttpCompletionInfo2 * pCompletionInfo,
-        IN VOID * pvCompletionContext
-    );
+    // Entity-body reads are SYNCHRONOUS (see DriveBodyRead): both async
+    // completion mechanisms lost completions under concurrent load, so there
+    // is no per-operation callback and no OnAsyncCompletion involvement.
 
     CMyHttpModule();
     ~CMyHttpModule();
@@ -127,14 +117,11 @@ public:
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
 private:
-    // Drains the request entity body with IHttpRequest3::ReadEntityBody()
-    // calls (asynchronous, bound to OnReadBodyCompletion), continuing through
-    // short reads (they do NOT mean end-of-body) and stopping on EOF / error /
-    // once the declared Content-Length is consumed. Read completions that land
-    // synchronously (fPending == FALSE) are processed inline in the loop;
-    // asynchronous ones resume in OnReadBodyCompletion. Both helpers are
-    // static: the per-operation completion callback is a plain WINAPI function
-    // and carries no CMyHttpModule*, so the whole read path is object-free.
+    // Drains the request entity body with SYNCHRONOUS ReadEntityBody() calls,
+    // continuing through short reads (they do NOT mean end-of-body) and
+    // stopping on EOF / error / once the declared Content-Length is consumed.
+    // Both helpers are static: the whole read path carries no CMyHttpModule*
+    // state (rsc already holds the IHttpContext).
     static REQUEST_NOTIFICATION_STATUS
     DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 
