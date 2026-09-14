@@ -42,6 +42,11 @@ on:
         required: false
         default: ''
         type: string
+      load_rounds:
+        description: 'Extra rounds of the c16 phase (default 1) to accumulate stall samples per run'
+        required: false
+        default: ''
+        type: string
   # No push trigger on purpose: pushing a commit to diag/** would spawn a full
   # ~13-min build for no reason. This is a diagnostic probe -- drive it by
   # workflow_dispatch only, reusing an existing build via build_run_id.
@@ -193,6 +198,7 @@ jobs:
           if ($freb) { $ht['Freb'] = $true }
           if ("${{ inputs.load_clients }}" -ne '') { $ht['LoadClients'] = "${{ inputs.load_clients }}" }
           if ("${{ inputs.load_reps }}" -ne '')    { $ht['LoadReps']    = "${{ inputs.load_reps }}" }
+          if ("${{ inputs.load_rounds }}" -ne '')  { $ht['LoadRounds']  = "${{ inputs.load_rounds }}" }
           ./scripts/arr-body-probe.ps1 @ht
 
       - name: Upload probe diagnostics
