@@ -132,13 +132,17 @@ function Enable-Freb {
     }
     Start-Sleep -Seconds 3
 
-    # 3) Verify the config system actually KNOWS the tracing section now
-    #    ("Unknown config section" here means the feature registration did not
-    #    land -- everything after this would fail, so bail loudly).
-    $null = & $Appcmd list config /section:system.webServer/tracing 2>&1
+    # 3) Verify the config system knows the REAL section. NOTE:
+    #    "system.webServer/tracing" alone is a sectionGROUP and is unknown to
+    #    appcmd on EVERY IIS (verified locally) -- the sections are
+    #    tracing/traceFailedRequests and tracing/traceProviderDefinitions, and
+    #    traceFailedRequestsLogging is an ELEMENT of the site definition inside
+    #    system.applicationHost/sites (not a section at all).
+    $null = & $Appcmd list config /section:system.webServer/tracing/traceFailedRequests 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw ("[FREB] config system does not know section system.webServer/tracing " +
-               "(exit {0}); feature registration did not land." -f $LASTEXITCODE)
+        throw ("[FREB] config system does not know section " +
+               "system.webServer/tracing/traceFailedRequests (exit {0}); " +
+               "feature registration did not land." -f $LASTEXITCODE)
     }
     Write-Host "[FREB] tracing section is known to the config system."
 
@@ -146,15 +150,20 @@ function Enable-Freb {
     #    Enable-WebRequestTracing): enables request tracing for the site AND
     #    creates the trace rule in one shot. -StatusCodes "200-599" traces every
     #    completion (a truncated 200 is caught; stalls land via their eventual
-    #    ARR 502 or long timeTaken). This replaces the hand-rolled appcmd/XML
-    #    surgery, which never produced a valid per-site config.
-    Import-Module WebAdministration -ErrorAction Stop
-    Enable-WebRequestTracing -Name $SiteName -Directory $Dir -MaxLogFiles 50 `
-        -StatusCodes "200-599"
-    Write-Host "[FREB] Enable-WebRequestTracing applied."
+    #    ARR 502 or long timeTaken). Non-fatal: if the cmdlet path fails we warn
+    #    and continue -- the probes themselves must always run.
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        Enable-WebRequestTracing -Name $SiteName -Directory $Dir -MaxLogFiles 50 `
+            -StatusCodes "200-599"
+        Write-Host "[FREB] Enable-WebRequestTracing applied."
+    } catch {
+        Write-Warning ("[FREB] Enable-WebRequestTracing failed: {0}" -f $_.Exception.Message)
+        return
+    }
 
-    # 4) Read the config back so the log shows what the config system sees.
-    $rb = & $Appcmd list config "$SiteName" /section:system.webServer/tracing 2>&1
+    # 5) Read the config back so the log shows what the config system sees.
+    $rb = & $Appcmd list config "$SiteName" /section:system.webServer/tracing/traceFailedRequests 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("[FREB] could not read back tracing config (exit {0})." -f $LASTEXITCODE)
     } else {
@@ -504,6 +513,37 @@ $target  = Invoke-BodyProbe "target-100KiB" $TargetBytes "arrbodyprobe=1&pad="
 Write-Host "--- concurrency phase (load generator) ---"
 $c1  = Invoke-ConcurrencyProbe "load-c1"  1          $LoadReps $TargetBytes "arrload=1&pad="
 $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "arrload=16&pad="
+
+# ---------------------------------------------------------------------------
+# 6a) in-flight request snapshot -- FREB only flushes its XML when a request
+#     COMPLETES, but the stalled requests are still executing server-side right
+#     now (their client gave up at $TimeoutSec; the server-side request runs on
+#     until ARR's proxy timeout). Get-WebRequest (WebAdministration) lists the
+#     requests currently being run and shows what each is doing -- state, time
+#     elapsed, pipeline state -- which pinpoints the blocking stage without
+#     needing FREB at all. Runs on every probe (not only with -Freb).
+# ---------------------------------------------------------------------------
+try {
+    Import-Module WebAdministration -ErrorAction Stop
+    $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
+    if ($inflight.Count -eq 0) {
+        $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
+    }
+    Write-Host ("[INFLIGHT] {0} request(s) still executing (pool {1}):" -f $inflight.Count, $PoolName)
+    $shown = 0
+    foreach ($r in $inflight) {
+        if ($shown -ge 20) { Write-Host "[INFLIGHT] ... (truncated)"; break }
+        Write-Host ("[INFLIGHT] {0} {1} elapsed={2}ms state={3}" -f `
+            $r.verb, $r.url, $r.timeElapsed, $r.state)
+        $shown++
+    }
+    if ($inflight.Count -gt 0) {
+        Write-Host "[INFLIGHT] full record of the first in-flight request:"
+        $inflight[0] | Format-List * | Out-String | ForEach-Object { Write-Host $_ }
+    }
+} catch {
+    Write-Warning ("[INFLIGHT] snapshot failed: {0}" -f $_.Exception.Message)
+}
 
 # ---------------------------------------------------------------------------
 # 6b) FREB trace summary (opt-in) -- pinpoint the blocking stage for stalls
