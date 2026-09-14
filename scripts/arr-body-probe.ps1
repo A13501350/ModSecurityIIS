@@ -100,14 +100,26 @@ function Enable-Freb {
     # The worker process writes the trace files; grant it write on the dir.
     try { icacls "$Dir" /grant "IIS_IUSRS:(OI)(CI)F" | Out-Null } catch { }
 
-    # 1) Windows feature (IIS-HttpTracing).
-    try {
-        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
-            -NoRestart -ErrorAction Stop | Out-Null
-        Write-Host "[FREB] IIS-HttpTracing feature enabled."
-    } catch {
-        Write-Warning ("[FREB] feature via cmdlet failed: {0}; trying dism" -f $_.Exception.Message)
-        & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host
+    # 1) Windows feature. Use the Server-Manager path (Install-WindowsFeature
+    #    Web-Http-Tracing) FIRST: it registers the tracing section with the
+    #    config system reliably. The DISM feature name (IIS-HttpTracing) can
+    #    leave the box servicing-pending with "Unknown config section
+    #    system.webServer/tracing" (v7 evidence) even after a W3SVC restart.
+    $tracingFeat = Get-WindowsFeature Web-Http-Tracing -ErrorAction SilentlyContinue
+    if ($tracingFeat -and -not $tracingFeat.Installed) {
+        Install-WindowsFeature Web-Http-Tracing | Out-Null
+        Write-Host "[FREB] Web-Http-Tracing feature installed."
+    } elseif ($tracingFeat -and $tracingFeat.Installed) {
+        Write-Host "[FREB] Web-Http-Tracing already installed."
+    } else {
+        try {
+            Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All `
+                -NoRestart -ErrorAction Stop | Out-Null
+            Write-Host "[FREB] IIS-HttpTracing feature enabled (DISM path)."
+        } catch {
+            Write-Warning ("[FREB] feature via cmdlet failed: {0}; trying dism" -f $_.Exception.Message)
+            & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host
+        }
     }
 
     # 2) Restart W3SVC+WAS so the freshly enabled feature's module is loaded
@@ -120,86 +132,34 @@ function Enable-Freb {
     }
     Start-Sleep -Seconds 3
 
-    # 3) Unlock the tracing section for this site. NOTE: tracing is ONE section
-    #    (system.webServer/tracing) whose schema holds traceFailedRequestsLogging
-    #    and traceFailedRequests as child ELEMENTS -- the earlier
-    #    "/section:system.webServer/tracing/traceFailedRequestsLogging" paths were
-    #    invalid (appcmd exit 2). Its overrideModeDefault is Deny, which is why a
-    #    site-level definition without unlocking raises a Configuration error
-    #    (the v3 outage that 000'd every request).
-    & $Appcmd unlock config "$SiteName" /section:system.webServer/tracing 2>&1 |
-        ForEach-Object { Write-Host "[FREB] unlock: $_" }
+    # 3) Verify the config system actually KNOWS the tracing section now
+    #    ("Unknown config section" here means the feature registration did not
+    #    land -- everything after this would fail, so bail loudly).
+    $null = & $Appcmd list config /section:system.webServer/tracing 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("[FREB] unlock failed (exit {0}) -- per-site write may be rejected." -f $LASTEXITCODE)
+        throw ("[FREB] config system does not know section system.webServer/tracing " +
+               "(exit {0}); feature registration did not land." -f $LASTEXITCODE)
     }
+    Write-Host "[FREB] tracing section is known to the config system."
 
-    # 4) Write the per-site <tracing> block under <location path="Site"> (valid
-    #    now that the section is unlocked). Capture stalls (timeTaken >= 25s --
-    #    our curl stall is 30s) and every 2xx-5xx so a truncated 200 is caught.
-    $areas = "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting"
-    Set-FrebPerSiteXml -SiteName $SiteName -Dir $Dir -Areas $areas
+    # 4) OFFICIAL cmdlet (learn.microsoft.com, WebAdministration/
+    #    Enable-WebRequestTracing): enables request tracing for the site AND
+    #    creates the trace rule in one shot. -StatusCodes "200-599" traces every
+    #    completion (a truncated 200 is caught; stalls land via their eventual
+    #    ARR 502 or long timeTaken). This replaces the hand-rolled appcmd/XML
+    #    surgery, which never produced a valid per-site config.
+    Import-Module WebAdministration -ErrorAction Stop
+    Enable-WebRequestTracing -Name $SiteName -Directory $Dir -MaxLogFiles 50 `
+        -StatusCodes "200-599"
+    Write-Host "[FREB] Enable-WebRequestTracing applied."
 
-    # 5) Read the config back so the log shows what the config system sees.
+    # 4) Read the config back so the log shows what the config system sees.
     $rb = & $Appcmd list config "$SiteName" /section:system.webServer/tracing 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("[FREB] could not read back tracing config (exit {0})." -f $LASTEXITCODE)
     } else {
         Write-Host "[FREB] tracing config read-back:"
         $rb | ForEach-Object { Write-Host "  $_" }
-    }
-}
-
-# Write (or replace) the per-site <tracing> block under
-# <location path="SiteName"> in applicationHost.config. Requires the section to
-# be unlocked first (see Enable-Freb) or the config system rejects the file.
-function Set-FrebPerSiteXml {
-    param([string]$SiteName, [string]$Dir, [string]$Areas)
-    $ah = "$env:windir\System32\inetsrv\config\applicationHost.config"
-    [xml]$doc = Get-Content $ah
-    $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
-    if (-not $loc) {
-        $loc = $doc.configuration.AppendChild($doc.CreateElement("location"))
-        $loc.SetAttribute("path", $SiteName)
-    }
-    $sws = $loc."system.webServer"
-    if (-not $sws) { $sws = $loc.AppendChild($doc.CreateElement("system.webServer")) }
-    # Idempotent: drop any previous tracing element first.
-    if ($sws.tracing) { [void]$sws.RemoveChild($sws.tracing) }
-    $tracing = $sws.AppendChild($doc.CreateElement("tracing"))
-
-    $tfrl = $tracing.AppendChild($doc.CreateElement("traceFailedRequestsLogging"))
-    $tfrl.SetAttribute("enabled", "true")
-    $tfrl.SetAttribute("directory", $Dir)
-    $tfrl.SetAttribute("maxLogFiles", "50")
-
-    $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests"))
-    $add = $doc.CreateElement("add"); $add.SetAttribute("path", "*")
-    $ta = $doc.CreateElement("traceAreas")
-    $prov = $doc.CreateElement("add")
-    $prov.SetAttribute("provider", "WWW Server")
-    $prov.SetAttribute("areas", $Areas)
-    $prov.SetAttribute("verbosity", "Verbose")
-    [void]$ta.AppendChild($prov)
-    [void]$add.AppendChild($ta)
-    $fd = $doc.CreateElement("failureDefinitions")
-    $fd.SetAttribute("statusCodes", "200-599")
-    $fd.SetAttribute("timeTaken", "00:00:25")
-    [void]$add.AppendChild($fd)
-    [void]$tfr.AppendChild($add)
-    $doc.Save($ah)
-    Write-Host "[FREB] per-site tracing written to applicationHost.config <location>."
-}
-
-# Remove the per-site <tracing> block again (self-heal if it broke the site).
-function Remove-FrebPerSiteXml {
-    param([string]$SiteName)
-    $ah = "$env:windir\System32\inetsrv\config\applicationHost.config"
-    [xml]$doc = Get-Content $ah
-    $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
-    if ($loc -and $loc."system.webServer" -and $loc."system.webServer".tracing) {
-        [void]$loc."system.webServer".RemoveChild($loc."system.webServer".tracing)
-        $doc.Save($ah)
-        Write-Host "[FREB] per-site tracing config removed (self-heal)."
     }
 }
 
@@ -448,7 +408,12 @@ if ($frebOn) {
         Write-Host "[FREB] post-enable sanity: site serving (hello.txt 200)."
     } else {
         Write-Warning "[FREB] site NOT serving after FREB enable -- reverting tracing config (self-heal)."
-        Remove-FrebPerSiteXml -SiteName $SiteName
+        try {
+            Import-Module WebAdministration -ErrorAction Stop
+            Disable-WebRequestTracing -Name $SiteName -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning ("[FREB] Disable-WebRequestTracing failed: {0}" -f $_.Exception.Message)
+        }
         & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
         & iisreset /start 2>&1 | Out-Null
         foreach ($i in 1..30) {
