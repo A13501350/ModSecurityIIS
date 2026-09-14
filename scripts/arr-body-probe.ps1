@@ -44,7 +44,12 @@ param(
     [string]$BackendExe = "go",
     [int]   $ControlBytes = 1024,
     [int]   $TargetBytes  = 102400,   # 100 KiB
-    [int]   $TimeoutSec   = 30
+    [int]   $TimeoutSec   = 30,
+    # Concurrency phase (mirrors the bench harness's load generator). The
+    # reported stall is load/concurrency dependent ("c=16 partially works
+    # around it"), so a single-request probe is not enough to reproduce it.
+    [int]   $LoadClients    = 16,
+    [int]   $LoadReps       = 4
 )
 
 $ErrorActionPreference = "Stop"
@@ -252,8 +257,47 @@ function Invoke-BodyProbe([string]$Name, [int]$Bytes, [string]$Marker) {
     return @{ Name = $Name; Ok = $true; Status = "PASS" }
 }
 
+# Fires $Clients concurrent clients, each sending $Reps sequential 100 KiB
+# POSTs through the ARR proxy. Mirrors the bench harness's load generator.
+# The reported stall is concurrency/load dependent, so this is the phase that
+# actually reproduces it (a single request is healthy -- see the probes above).
+function Invoke-ConcurrencyProbe([string]$Name, [int]$Clients, [int]$Reps, [int]$Bytes, [string]$Marker) {
+    $f = New-BodyFile $Bytes $Marker
+    $jobs = @()
+    for ($i = 0; $i -lt $Clients; $i++) {
+        $jobs += Start-ThreadJob -ScriptBlock {
+            param($curlExe, $url, $body, $timeout, $reps, $bytes)
+            $stall = 0; $trunc = 0; $pass = 0
+            for ($k = 0; $k -lt $reps; $k++) {
+                $resp = [System.IO.Path]::GetTempFileName()
+                & $curlExe -s --max-time $timeout -X POST `
+                    -H "Content-Type: application/octet-stream" `
+                    --data-binary "@$body" $url -o $resp -w "%{http_code}" 2>$null
+                $code = $LASTEXITCODE
+                $len  = if (Test-Path $resp) { (Get-Item $resp).Length } else { 0 }
+                if ($code -eq 28 -or $len -eq 0) { $stall++ }
+                elseif ($len -lt $bytes) { $trunc++ }
+                else { $pass++ }
+            }
+            return @{ stall = $stall; trunc = $trunc; pass = $pass }
+        } -ArgumentList $curl, $probeUrl, $f, $TimeoutSec, $Reps, $Bytes
+    }
+    $results = $jobs | Receive-Job -Wait -AutoRemoveJob
+    $stall = 0; $trunc = 0; $pass = 0
+    foreach ($r in $results) { $stall += $r.stall; $trunc += $r.trunc; $pass += $r.pass }
+    $total = $stall + $trunc + $pass
+    $status = if ($stall -eq 0 -and $trunc -eq 0) { "PASS" } else { "STALL/TRUNC" }
+    Write-Verdict $Name $status "pass=$pass stall=$stall truncated=$trunc of $total (clients=$Clients reps=$Reps)"
+    return @{ Name = $Name; Ok = ($stall -eq 0 -and $trunc -eq 0); Status = $status;
+              Pass = $pass; Stall = $stall; Trunc = $trunc; Total = $total }
+}
+
 $control = Invoke-BodyProbe "control-1KiB" $ControlBytes "arrctl=1&pad="
 $target  = Invoke-BodyProbe "target-100KiB" $TargetBytes "arrbodyprobe=1&pad="
+
+Write-Host "--- concurrency phase (load generator) ---"
+$c1  = Invoke-ConcurrencyProbe "load-c1"  1          $LoadReps $TargetBytes "arrload=1&pad="
+$c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "arrload=16&pad="
 
 # ---------------------------------------------------------------------------
 # 7) cleanup + verdict
@@ -262,17 +306,21 @@ if (-not $beProc.HasExited) { $beProc.Kill() }
 & $appcmd delete site $SiteName 2>$null | Out-Null
 & $appcmd delete apppool $PoolName 2>$null | Out-Null
 
-$allOk = $control.Ok -and $target.Ok
+$allOk = $control.Ok -and $target.Ok -and $c1.Ok -and $c16.Ok
 Write-Host "=============================================="
 if ($allOk) {
-    Write-Host "ARR body-forward VERIFICATION: PASS (control + 100KiB both intact)."
+    Write-Host "ARR body-forward VERIFICATION: PASS"
+    Write-Host "  single-request : control + 100KiB intact"
+    Write-Host "  concurrency     : c=1 and c=$LoadClients healthy (no stall/truncation under load)"
     exit 0
 } else {
     Write-Host "ARR body-forward VERIFICATION: FAIL"
     Write-Host "  control  : $($control.Status)"
     Write-Host "  target   : $($target.Status)"
+    Write-Host "  load-c1  : pass=$($c1.Pass) stall=$($c1.Stall) trunc=$($c1.Trunc) of $($c1.Total)"
+    Write-Host "  load-c16 : pass=$($c16.Pass) stall=$($c16.Stall) trunc=$($c16.Trunc) of $($c16.Total)"
     Write-Host ""
-    Write-Host "If target is STALL/TRUNCATED, this reproduces the bench-harness defect"
+    Write-Host "Any STALL/TRUNC under load reproduces the bench-harness defect"
     Write-Host "(bench/README.md: 'v3: 100 KiB request bodies stall through ARR')."
     Write-Host "Diagnostics: $ConfRoot (body-*.bin, resp-*.bin, code-*.txt)"
     exit 1
