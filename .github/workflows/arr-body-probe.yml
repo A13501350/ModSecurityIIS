@@ -176,7 +176,9 @@ jobs:
           $ht = @{}
           $msi = (Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1).FullName
           if ($msi) { $ht['Msi'] = $msi }
-          $freb = [System.Convert]::ToBoolean("${{ inputs.freb }}")
+          # inputs.freb is "" on push-triggered runs -- do not ToBoolean("") (throws).
+          $frebRaw = "${{ inputs.freb }}"
+          $freb = ($frebRaw -ieq 'true') -or ($frebRaw -eq '1')
           if ($freb) { $ht['Freb'] = $true }
           ./scripts/arr-body-probe.ps1 @ht
 
