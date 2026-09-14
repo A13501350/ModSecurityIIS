@@ -251,6 +251,16 @@ if (-not (Get-Command $BackendExe -ErrorAction SilentlyContinue)) {
 }
 
 # ---------------------------------------------------------------------------
+# 0b) body-trace (diag branch instrumentation). The connector (this branch)
+#     logs every entity-body state transition when MODSEC_IIS_BODY_TRACE=1 and
+#     MODSEC_IIS_TRACE_FILE are set in the w3wp environment. Set them at
+#     machine level before any iisreset so the worker processes inherit them.
+# ---------------------------------------------------------------------------
+[Environment]::SetEnvironmentVariable("MODSEC_IIS_BODY_TRACE", "1", "Machine")
+[Environment]::SetEnvironmentVariable("MODSEC_IIS_TRACE_FILE",
+    (Join-Path $ConfRoot "data\body-trace.log"), "Machine")
+
+# ---------------------------------------------------------------------------
 # 1) ensure IIS
 # ---------------------------------------------------------------------------
 $features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, `
@@ -594,6 +604,56 @@ if ($missing -gt 0) {
     Write-Host "[BACKEND] (connector DriveBodyRead/InsertEntityBody or ARR before forwarding)."
 } else {
     Write-Host "[BACKEND] all requests reached the backend => stall is on the response path back to the client."
+}
+
+# ---------------------------------------------------------------------------
+# 6c) body-trace verdict -- decide between the three stall hypotheses using the
+#     connector's entity-body trace (enabled via MODSEC_IIS_BODY_TRACE):
+#       FINISH size == declared  => full body WAS inserted; the entity pipe
+#                                   lost the "more data" signal toward ARR
+#                                   (IIS-side, hypothesis C1)
+#       FINISH size < declared   => the connector finished the read EARLY on a
+#                                   misjudged short-read/EOF (the reason=
+#                                   field names the exact stop condition;
+#                                   hypothesis: misjudged EOF)
+#       BEGIN without FINISH     => a completion the module never saw --
+#                                   the request wedged in BEGIN_REQUEST
+#                                   (hypothesis C2)
+#       INSERT hr != 0           => InsertEntityBody itself failed (C3)
+# ---------------------------------------------------------------------------
+$traceLog = Join-Path $ConfRoot "data\body-trace.log"
+if (-not (Test-Path $traceLog)) {
+    Write-Host "[BODYTRACE] no trace file at $traceLog (env var did not reach w3wp?)."
+} else {
+    $begins   = @(Select-String -Path $traceLog -Pattern 'BEGIN rsc=([0-9A-Fa-f]+)')
+    $finishes = @(Select-String -Path $traceLog -Pattern 'FINISH rsc=([0-9A-Fa-f]+) reason=(\S+) size=(\d+)')
+    $bRsc = $begins   | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+    $fRsc = $finishes | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+    $wedged = @($bRsc | Where-Object { $fRsc -notcontains $_ })
+    Write-Host ("[BODYTRACE] began={0} finished={1} wedged(no-FINISH)={2}" -f `
+        $bRsc.Count, $fRsc.Count, $wedged.Count)
+
+    $reasons = $finishes | ForEach-Object { $_.Matches[0].Groups[2].Value } |
+               Group-Object | Sort-Object Count -Descending
+    Write-Host ("[BODYTRACE] finish reasons: " +
+        (($reasons | ForEach-Object { "{0}={1}" -f $_.Name, $_.Count }) -join " "))
+
+    # Declared sizes seen in the trace (102400 = probe target, 1024 = control).
+    $short = @($finishes | Where-Object {
+        $s = [long]$_.Matches[0].Groups[3].Value
+        $s -ne 0 -and $s -ne 102400 -and $s -ne 1024
+    })
+    Write-Host ("[BODYTRACE] SHORT finishes (size not 0/1024/102400 -- misjudged-EOF evidence): {0}" -f `
+        $short.Count)
+    $short | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_.Line) }
+
+    $badInsert = @(Select-String -Path $traceLog -Pattern 'INSERT .*hr=0x(?!00000000)')
+    Write-Host ("[BODYTRACE] INSERT failures: {0}" -f $badInsert.Count)
+    $badInsert | Select-Object -First 5 | ForEach-Object { Write-Host ("  " + $_.Line) }
+
+    if ($wedged.Count -gt 0) {
+        Write-Host "[BODYTRACE] wedged rsc ids (first 5): $($wedged | Select-Object -First 5)"
+    }
 }
 
 # ---------------------------------------------------------------------------

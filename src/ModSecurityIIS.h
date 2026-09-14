@@ -135,7 +135,9 @@ private:
     DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 
     // Restores the drained entity body for the downstream handler, feeds it to
-    // the engine and applies any intervention.
+    // the engine and applies any intervention. `reason` names the stop
+    // condition (body-trace diagnostics only).
     REQUEST_NOTIFICATION_STATUS
-    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
+    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
+                   const char* reason);
 };
