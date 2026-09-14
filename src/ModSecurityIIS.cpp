@@ -1,7 +1,7 @@
 // ModSecurityIIS -- native IIS 7+ module built on libModSecurity v3.
 //
-// Flow: RegisterModule -> OnBeginRequest -> OnAsyncCompletion (async entity
-// body reads) -> OnSendResponse -> OnPostEndRequest
+// Flow: RegisterModule -> OnBeginRequest -> OnReadBodyCompletion (per-op async
+// entity body reads via IHttpRequest3) -> OnSendResponse -> OnPostEndRequest
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -735,6 +735,8 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         // async round-trip for the common bodyless request.
         return FinishBodyRead(rsc, pHttpContext, "no-body");
     }
+    // The declared length drives the stop condition in DriveBodyRead (both on
+    // the initial entry and on each re-entry from OnReadBodyCompletion).
     BodyTrace("BEGIN rsc=%p declared=%llu", (const void*)rsc,
               (unsigned long long)info.length);
 
@@ -752,18 +754,31 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         rsc->m_Body.reserve((size_t)want);
     }
 
+    // IHttpRequest3::ReadEntityBody binds OUR completion callback to each
+    // individual read at issue time. The legacy IHttpRequest::ReadEntityBody
+    // instead multicast async completions through the module-wide
+    // OnAsyncCompletion dispatch, where -- under concurrent load with ARR as
+    // the downstream consumer -- completions were observed to never arrive
+    // (the request then wedged in RQ_BEGIN_REQUEST: diag/arr-body-stall,
+    // v16 trace). A per-operation callback removes that dispatch from the
+    // picture entirely.
+    IHttpRequest3* pRequest3 = static_cast<IHttpRequest3*>(pRequest);
+
     for (;;)
     {
         DWORD read     = 0;
         BOOL  fPending = FALSE;
-        // fAsync = TRUE: never block the worker thread.
-        HRESULT hrr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                               (DWORD)sizeof(rsc->m_ReadBuf),
-                                               TRUE /* async */, &read, &fPending);
+        // fAsync = TRUE: never block the worker thread. The completion lands
+        // in OnReadBodyCompletion with pvCompletionContext == rsc.
+        HRESULT hrr = pRequest3->ReadEntityBody(rsc->m_ReadBuf,
+                                                (DWORD)sizeof(rsc->m_ReadBuf),
+                                                TRUE /* async */,
+                                                &CMyHttpModule::OnReadBodyCompletion,
+                                                rsc, &read, &fPending);
         if (fPending)
         {
-            // m_ReadBuf lives on the per-request context, so it stays valid until
-            // OnAsyncCompletion reports the completion.
+            // m_ReadBuf lives on the per-request context, so it stays valid
+            // until OnReadBodyCompletion reports the completion.
             rsc->m_BodyReadActive = true;
             return RQ_NOTIFICATION_PENDING;
         }
@@ -1210,62 +1225,39 @@ CMyHttpModule::OnBeginRequest(
 
 
 // ---------------------------------------------------------------------------
-// OnAsyncCompletion -- resumes an asynchronous entity-body read started from
-// OnBeginRequest.
+// OnReadBodyCompletion -- per-operation async completion for entity-body
+// reads. IHttpRequest3::ReadEntityBody binds THIS callback (with the request
+// context as pvCompletionContext) to each read at issue time, so completions
+// arrive here directly -- the module-wide OnAsyncCompletion multicast is not
+// involved, and a completion can no longer be lost or misrouted under load
+// (the C2 wedge diagnosed on diag/arr-body-stall).
 // ---------------------------------------------------------------------------
 
-REQUEST_NOTIFICATION_STATUS
-CMyHttpModule::OnAsyncCompletion(
-    IN IHttpContext * pHttpContext,
-    IN DWORD          dwNotification,
-    IN BOOL           fPostNotification,
-    IN IHttpEventProvider * pProvider,
-    IN IHttpCompletionInfo * pCompletionInfo
+REQUEST_NOTIFICATION_STATUS WINAPI
+CMyHttpModule::OnReadBodyCompletion(
+    IHttpContext3 * pHttpContext3,
+    IHttpCompletionInfo2 * pCompletionInfo,
+    VOID * pvCompletionContext
 )
 {
-    UNREFERENCED_PARAMETER(pProvider);
+    UNREFERENCED_PARAMETER(pHttpContext3);
 
-    // Only handle completions for entity-body reads we started from
-    // RQ_BEGIN_REQUEST. Do NOT call PostCompletion() -- that is for
-    // module-owned async work and would double-signal this IIS-tracked I/O.
-    if (pHttpContext == NULL || pCompletionInfo == NULL ||
-        !(dwNotification & RQ_BEGIN_REQUEST) || fPostNotification)
+    REQUEST_STORED_CONTEXT* rsc = (REQUEST_STORED_CONTEXT*)pvCompletionContext;
+    if (rsc == NULL || pCompletionInfo == NULL)
     {
         return RQ_NOTIFICATION_CONTINUE;
     }
-
-    REQUEST_STORED_CONTEXT* rsc = NULL;
-    IHttpModuleContextContainer* pContainer =
-        pHttpContext->GetModuleContextContainer();
-    if (pContainer != NULL)
-    {
-        rsc = (REQUEST_STORED_CONTEXT*)pContainer->GetModuleContext(
-                  g_pModuleContext);
-    }
+    IHttpContext* pHttpContext = rsc->m_pHttpContext;
 
     const DWORD   cb = pCompletionInfo->GetCompletionBytes();
     const HRESULT ch = pCompletionInfo->GetCompletionStatus();
 
-    // Log ONLY abnormal completions (rejected by the ownership filter, no read
-    // marked active, zero-byte, or failed). Accepted hot-path completions are
-    // silent: tracing every one perturbs the timing enough to mask the stall
-    // race (v14). A rejected completion for one of our requests is the prime
-    // suspect for requests that wedge in BEGIN_REQUEST and never reach ARR.
-    if (rsc != NULL)
+    // A completion for a read we no longer consider active must not happen --
+    // the callback is bound to exactly one read. Trace it loudly if it does.
+    if (!rsc->m_BodyReadActive)
     {
-        const bool ownershipOk = (rsc->m_pTx != NULL) && rsc->m_BodyReadActive;
-        if (!ownershipOk || cb == 0 || FAILED(ch))
-        {
-            BodyTrace("ASYNC-ABNORMAL rsc=%p notif=0x%08X post=%d cb=%lu ch=0x%08X active=%d tx=%d",
-                      (const void*)rsc, dwNotification, (int)fPostNotification,
-                      cb, (unsigned)ch, (int)rsc->m_BodyReadActive,
-                      (int)(rsc->m_pTx != NULL));
-        }
-    }
-
-    // No transaction, or no read of ours in flight: not ours either.
-    if (rsc == NULL || rsc->m_pTx == NULL || !rsc->m_BodyReadActive)
-    {
+        BodyTrace("CALLBACK-STALE rsc=%p cb=%lu ch=0x%08X active=0 have=%zu",
+                  (const void*)rsc, cb, (unsigned)ch, rsc->m_Body.size());
         return RQ_NOTIFICATION_CONTINUE;
     }
 
@@ -1299,26 +1291,27 @@ CMyHttpModule::OnAsyncCompletion(
         if (reason != nullptr)
         {
             // Body complete (or a read error): finish with what we have and
-            // return the status directly -- no PostCompletion().
+            // return the status directly.
             return FinishBodyRead(rsc, pHttpContext, reason);
         }
 
-        // More body expected: issue the next read. Returns PENDING if that read
-        // goes asynchronous again, otherwise the final status. The declared
-        // Content-Length stop condition is re-derived inside DriveBodyRead(), so
-        // it still applies across completions.
+        // More body expected: issue the next read. Returns PENDING if that
+        // read goes asynchronous again, otherwise the final status. The
+        // declared Content-Length stop condition still applies: it was stored
+        // in rsc->m_DeclaredBodyLen when the read chain started and is
+        // re-checked inside DriveBodyRead().
         return DriveBodyRead(rsc, pHttpContext);
     }
     catch (const std::exception& e)
     {
         // Fail-closed: finish the request rather than let an exception cross the
         // module boundary and kill w3wp.
-        ReportException("OnAsyncCompletion", e.what());
+        ReportException("OnReadBodyCompletion", e.what());
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     catch (...)
     {
-        ReportException("OnAsyncCompletion", NULL);
+        ReportException("OnReadBodyCompletion", NULL);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 }

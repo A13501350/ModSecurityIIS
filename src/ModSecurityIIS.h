@@ -107,16 +107,17 @@ public:
         IN IHttpEventProvider * pProvider
     ) override;
 
-    // Called by IIS when an async operation from OnBeginRequest completes.
-    // Only handles RQ_BEGIN_REQUEST completions with a read of ours in flight.
-    REQUEST_NOTIFICATION_STATUS
-    OnAsyncCompletion(
-        IN IHttpContext * pHttpContext,
-        IN DWORD          dwNotification,
-        IN BOOL           fPostNotification,
-        IN IHttpEventProvider * pProvider,
-        IN IHttpCompletionInfo * pCompletionInfo
-    ) override;
+    // Entity-body async completions are delivered DIRECTLY to this per-
+    // operation callback (IHttpRequest3::ReadEntityBody binds it at issue
+    // time), not through the module-wide OnAsyncCompletion multicast -- a
+    // completion can no longer be lost or misrouted under load (the C2 wedge
+    // diagnosed on diag/arr-body-stall).
+    static REQUEST_NOTIFICATION_STATUS WINAPI
+    OnReadBodyCompletion(
+        IN IHttpContext3 * pHttpContext3,
+        IN IHttpCompletionInfo2 * pCompletionInfo,
+        IN VOID * pvCompletionContext
+    );
 
     CMyHttpModule();
     ~CMyHttpModule();
@@ -126,18 +127,21 @@ public:
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
 private:
-    // Drains the request entity body with asynchronous ReadEntityBody() calls,
-    // continuing through short reads (they do NOT mean end-of-body) and stopping
-    // on EOF / error / once the declared Content-Length is consumed. Returns
-    // RQ_NOTIFICATION_PENDING while a read is in flight; resumes in
-    // OnAsyncCompletion.
-    REQUEST_NOTIFICATION_STATUS
+    // Drains the request entity body with IHttpRequest3::ReadEntityBody()
+    // calls (asynchronous, bound to OnReadBodyCompletion), continuing through
+    // short reads (they do NOT mean end-of-body) and stopping on EOF / error /
+    // once the declared Content-Length is consumed. Read completions that land
+    // synchronously (fPending == FALSE) are processed inline in the loop;
+    // asynchronous ones resume in OnReadBodyCompletion. Both helpers are
+    // static: the per-operation completion callback is a plain WINAPI function
+    // and carries no CMyHttpModule*, so the whole read path is object-free.
+    static REQUEST_NOTIFICATION_STATUS
     DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 
     // Restores the drained entity body for the downstream handler, feeds it to
     // the engine and applies any intervention. `reason` names the stop
     // condition (body-trace diagnostics only).
-    REQUEST_NOTIFICATION_STATUS
+    static REQUEST_NOTIFICATION_STATUS
     FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
                    const char* reason);
 };
