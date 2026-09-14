@@ -170,7 +170,7 @@ jobs:
       - name: Run ARR body-forward probe
         shell: pwsh
         run: |
-          $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
+          $msi = (Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1).FullName
           $freb = [System.Convert]::ToBoolean("${{ inputs.freb }}")
           $args = @("-Msi", $msi)
           if ($freb) { $args += "-Freb" }

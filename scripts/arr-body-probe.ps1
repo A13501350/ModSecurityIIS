@@ -250,6 +250,17 @@ if ((Get-Service W3SVC).Status -ne "Running") { Start-Service W3SVC }
 # ---------------------------------------------------------------------------
 # 2) install the MSI (optional)
 # ---------------------------------------------------------------------------
+# Auto-discover the MSI when -Msi is empty or does not resolve. In CI the
+# uploaded artifact lands nested (e.g. msi/msi-out/*.msi), so a non-recursive
+# lookup misses it and the probe would never run.
+if (-not $Msi -or -not (Test-Path $Msi)) {
+    $cand = @(Get-ChildItem -Path $repoRoot -Recurse -Filter *.msi -ErrorAction SilentlyContinue) +
+            @(Get-ChildItem -Path $ConfRoot -Recurse -Filter *.msi -ErrorAction SilentlyContinue)
+    if ($cand.Count -gt 0) {
+        $Msi = $cand[0].FullName
+        Write-Host ("[MSI] auto-discovered: {0}" -f $Msi)
+    }
+}
 if ($Msi) {
     if (-not (Test-Path $Msi)) { throw "MSI not found: $Msi" }
     $log = Join-Path (Get-Location).Path "arr-msi-install.log"
