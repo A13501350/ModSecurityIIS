@@ -44,20 +44,29 @@ HANDLE          g_hEventLog = NULL;
 // Body-trace (diagnostic, diag branch only). Enabled by setting BOTH
 //   MODSEC_IIS_BODY_TRACE=1
 //   MODSEC_IIS_TRACE_FILE=<path>
-// in the w3wp environment BEFORE the pool starts. Every entity-body state
-// transition is appended as one line:
-//   BEGIN / READ(sync) / READ(async-pending) / ASYNC(completion, incl.
-//   rejected ones) / FINISH(reason, accumulated size) / INSERT(hr)
+// in the w3wp environment BEFORE the pool starts. Appended lines:
+//   BEGIN declared=<len>        (has-body requests only)
+//   ASYNC cb/ch ...             (ONLY abnormal completions: rejected by the
+//                                ownership filter, zero-byte, or failed --
+//                                accepted completions are NOT logged so the
+//                                hot path stays unperturbed)
+//   FINISH reason= size=        (stop condition + accumulated size)
+//   INSERT hr=                  (InsertEntityBody result, checked)
 // correlated by the per-request context pointer. Purpose: decide whether a
 // load-dependent mid-body stall through ARR is (a) the connector finishing the
 // body read prematurely on a misjudged short-read/EOF (FINISH size < declared
 // Content-Length), (b) a completion the module never saw (BEGIN without
 // FINISH), or (c) the full body inserted but the IIS entity pipe losing the
 // "more data" signal toward ARR (FINISH size == declared, stall downstream).
+//
+// IMPORTANT: v14 showed that per-line fopen/fclose tracing (and FREB) PERTURBS
+// the timing enough to mask the race entirely (three 0-stall runs where the
+// untraced harness stalls 4-24/256). Hence: a persistent handle, no logging on
+// the accepted-completion hot path, and abnormal-only ASYNC lines.
 // ---------------------------------------------------------------------------
 namespace {
     std::atomic<int> g_bodyTraceState{ 0 };   // 0=uninit 1=off 2=on
-    char             g_tracePath[MAX_PATH] = { 0 };
+    FILE*            g_traceFile = nullptr;
     CRITICAL_SECTION g_traceLock;
 
     void BodyTraceInit()
@@ -69,13 +78,20 @@ namespace {
             g_bodyTraceState.store(1, std::memory_order_relaxed);
             return;
         }
-        n = GetEnvironmentVariableA("MODSEC_IIS_TRACE_FILE", g_tracePath, MAX_PATH);
+        char path[MAX_PATH] = { 0 };
+        n = GetEnvironmentVariableA("MODSEC_IIS_TRACE_FILE", path, MAX_PATH);
         if (n == 0 || n >= MAX_PATH)
         {
             g_bodyTraceState.store(1, std::memory_order_relaxed);
             return;
         }
         InitializeCriticalSection(&g_traceLock);
+        if (fopen_s(&g_traceFile, path, "a") != 0 || g_traceFile == nullptr)
+        {
+            DeleteCriticalSection(&g_traceLock);
+            g_bodyTraceState.store(1, std::memory_order_relaxed);
+            return;
+        }
         g_bodyTraceState.store(2, std::memory_order_relaxed);
     }
 }
@@ -100,14 +116,13 @@ static void BodyTrace(const char* fmt, ...)
     va_end(ap);
 
     EnterCriticalSection(&g_traceLock);
-    FILE* f = nullptr;
-    if (fopen_s(&f, g_tracePath, "a") == 0 && f != nullptr)
+    if (g_traceFile != nullptr)
     {
-        fprintf(f, "[pid=%lu tick=%llu] %s\n",
+        fprintf(g_traceFile, "[pid=%lu tick=%llu] %s\n",
                 (unsigned long)GetCurrentProcessId(),
                 (unsigned long long)GetTickCount64(),
                 msg);
-        fclose(f);
+        fflush(g_traceFile);
     }
     LeaveCriticalSection(&g_traceLock);
 }
@@ -714,15 +729,14 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
 
     const EntityBodyInfo info =
         GetEntityBodyInfo(pRequest->GetRawHttpRequest());
-    BodyTrace("BEGIN rsc=%p declared=%llu hasBody=%d",
-              (const void*)rsc, (unsigned long long)info.length,
-              (int)info.hasBody);
     if (!info.hasBody)
     {
         // No entity body: run the body phase with an empty body. Avoids an
         // async round-trip for the common bodyless request.
         return FinishBodyRead(rsc, pHttpContext, "no-body");
     }
+    BodyTrace("BEGIN rsc=%p declared=%llu", (const void*)rsc,
+              (unsigned long long)info.length);
 
     // Pre-size the accumulator so multi-chunk bodies don't pay repeated
     // reallocation. Client-controlled Content-Length is clamped to 1 MiB
@@ -751,13 +765,9 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
             // m_ReadBuf lives on the per-request context, so it stays valid until
             // OnAsyncCompletion reports the completion.
             rsc->m_BodyReadActive = true;
-            BodyTrace("READ rsc=%p async-pending have=%zu",
-                      (const void*)rsc, rsc->m_Body.size());
             return RQ_NOTIFICATION_PENDING;
         }
         rsc->m_BodyReadActive = false;
-        BodyTrace("READ rsc=%p sync read=%lu hrr=0x%08X have=%zu",
-                  (const void*)rsc, read, (unsigned)hrr, rsc->m_Body.size());
 
         if (read > 0)
         {
@@ -765,10 +775,12 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
                                rsc->m_ReadBuf, rsc->m_ReadBuf + read);
         }
 
-        // End of body: zero-length read, or explicit EOF.
+        // End of body: zero-length read, or explicit EOF. A zero-length read
+        // with a SUCCESS status is logged: mid-body it would be a misjudged
+        // EOF (the FINISH reason zero-or-eof + size tells which).
         if (read == 0 || hrr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
         {
-            BodyTrace("STOP rsc=%p cond=zero-or-eof read=%lu hrr=0x%08X have=%zu declared=%llu",
+            BodyTrace("ZERO-OR-EOF rsc=%p read=%lu hrr=0x%08X have=%zu declared=%llu",
                       (const void*)rsc, read, (unsigned)hrr, rsc->m_Body.size(),
                       (unsigned long long)info.length);
             return FinishBodyRead(rsc, pHttpContext, "zero-or-eof");
@@ -776,7 +788,7 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
         // Hard error: stop rather than risk spinning. What we have is inspected.
         if (FAILED(hrr))
         {
-            BodyTrace("STOP rsc=%p cond=sync-error hrr=0x%08X have=%zu declared=%llu",
+            BodyTrace("SYNC-ERROR rsc=%p hrr=0x%08X have=%zu declared=%llu",
                       (const void*)rsc, (unsigned)hrr, rsc->m_Body.size(),
                       (unsigned long long)info.length);
             return FinishBodyRead(rsc, pHttpContext, "sync-error");
@@ -1234,16 +1246,21 @@ CMyHttpModule::OnAsyncCompletion(
     const DWORD   cb = pCompletionInfo->GetCompletionBytes();
     const HRESULT ch = pCompletionInfo->GetCompletionStatus();
 
-    // Trace BEFORE the ownership filter: a completion for one of our requests
-    // that fails the filter below (wrong notification bits, or no read marked
-    // active) is the prime suspect for requests that wedge in BEGIN_REQUEST
-    // and never reach ARR. The trace tells those apart from unrelated noise.
+    // Log ONLY abnormal completions (rejected by the ownership filter, no read
+    // marked active, zero-byte, or failed). Accepted hot-path completions are
+    // silent: tracing every one perturbs the timing enough to mask the stall
+    // race (v14). A rejected completion for one of our requests is the prime
+    // suspect for requests that wedge in BEGIN_REQUEST and never reach ARR.
     if (rsc != NULL)
     {
-        BodyTrace("ASYNC rsc=%p notif=0x%08X post=%d cb=%lu ch=0x%08X active=%d tx=%d",
-                  (const void*)rsc, dwNotification, (int)fPostNotification,
-                  cb, (unsigned)ch, (int)rsc->m_BodyReadActive,
-                  (int)(rsc->m_pTx != NULL));
+        const bool ownershipOk = (rsc->m_pTx != NULL) && rsc->m_BodyReadActive;
+        if (!ownershipOk || cb == 0 || FAILED(ch))
+        {
+            BodyTrace("ASYNC-ABNORMAL rsc=%p notif=0x%08X post=%d cb=%lu ch=0x%08X active=%d tx=%d",
+                      (const void*)rsc, dwNotification, (int)fPostNotification,
+                      cb, (unsigned)ch, (int)rsc->m_BodyReadActive,
+                      (int)(rsc->m_pTx != NULL));
+        }
     }
 
     // No transaction, or no read of ours in flight: not ours either.
