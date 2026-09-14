@@ -510,12 +510,45 @@ function Invoke-ConcurrencyProbe([string]$Name, [int]$Clients, [int]$Reps, [int]
             return @{ stall = $stall; trunc = $trunc; pass = $pass }
         } -ArgumentList $curl, $probeUrl, $f, $TimeoutSec, $Reps, $Bytes
     }
+    # Snapshot in-flight requests WHILE the load is running. v11 proved that a
+    # stalled request is torn down the moment its client disconnects (curl
+    # --max-time), so post-phase snapshots always see 0 and FREB can never
+    # capture a stall (an aborted request never "completes"). Get-WebRequest
+    # during the load shows what each in-flight request is doing RIGHT NOW.
+    $snapLog = Join-Path $ConfRoot "inflight-snapshots.log"
+    Remove-Item $snapLog -ErrorAction SilentlyContinue
+    $maxInflight = 0
+    try { Import-Module WebAdministration -ErrorAction SilentlyContinue } catch { }
+    while (@($jobs | Where-Object { $_.State -eq 'Running' }).Count -gt 0) {
+        try {
+            $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
+            $ts = (Get-Date).ToString('HH:mm:ss.fff')
+            Add-Content $snapLog ("[{0}] inflight={1}" -f $ts, $inflight.Count)
+            if ($inflight.Count -gt $maxInflight) { $maxInflight = $inflight.Count }
+            foreach ($r in ($inflight | Sort-Object { [long]$_.timeElapsed } -Descending)) {
+                Add-Content $snapLog ("    {0} {1} elapsed={2}ms state={3}" -f `
+                    $r.verb, $r.url, $r.timeElapsed, $r.state)
+                if ([long]$r.timeElapsed -gt 10000) {
+                    $dump = $r | Format-List * | Out-String
+                    Add-Content $snapLog ("    >>> LONG-RUNNING REQUEST (>{0}ms) FULL DUMP:`n{1}" -f 10000, $dump)
+                }
+            }
+        } catch { }
+        Start-Sleep -Milliseconds 1500
+    }
     $results = $jobs | Receive-Job -Wait -AutoRemoveJob
     $stall = 0; $trunc = 0; $pass = 0
     foreach ($r in $results) { $stall += $r.stall; $trunc += $r.trunc; $pass += $r.pass }
     $total = $stall + $trunc + $pass
     $status = if ($stall -eq 0 -and $trunc -eq 0) { "PASS" } else { "STALL/TRUNC" }
     Write-Verdict $Name $status "pass=$pass stall=$stall truncated=$trunc of $total (clients=$Clients reps=$Reps)"
+    # Surface what the snapshots saw: any request still executing after >=10s
+    # is a stalled one -- its state/module IS the blocking stage.
+    $slow = @(Get-Content $snapLog -ErrorAction SilentlyContinue |
+              Where-Object { $_ -match 'elapsed=\d{5,}ms' })
+    Write-Host ("[SNAP] max concurrent in-flight seen: {0}; slow (>10s) entries: {1}; log: {2}" -f `
+        $maxInflight, $slow.Count, $snapLog)
+    $slow | Select-Object -First 40 | ForEach-Object { Write-Host "[SNAP] $_" }
     return @{ Name = $Name; Ok = ($stall -eq 0 -and $trunc -eq 0); Status = $status;
               Pass = $pass; Stall = $stall; Trunc = $trunc; Total = $total }
 }
@@ -528,38 +561,27 @@ $c1  = Invoke-ConcurrencyProbe "load-c1"  1          $LoadReps $TargetBytes "arr
 $c16 = Invoke-ConcurrencyProbe "load-c16" $LoadClients $LoadReps $TargetBytes "arrload=16&pad="
 
 # ---------------------------------------------------------------------------
-# 6a) in-flight request snapshot -- FREB only flushes its XML when a request
-#     COMPLETES, but the stalled requests are still executing server-side right
-#     now (their client gave up at $TimeoutSec; the server-side request runs on
-#     until ARR's proxy timeout). Get-WebRequest (WebAdministration) lists the
-#     requests currently being run and shows what each is doing -- state, time
-#     elapsed, pipeline state -- which pinpoints the blocking stage without
-#     needing FREB at all. Runs on every probe (not only with -Freb).
+# 6a) final in-flight check. The PRIMARY in-flight diagnostic now lives INSIDE
+#     Invoke-ConcurrencyProbe (snapshots taken WHILE the load is running): v11
+#     proved that a stalled request is torn down the instant its client
+#     disconnects (curl --max-time), so after the phase there is nothing left
+#     to see. This final check remains as a cheap sanity probe.
 # ---------------------------------------------------------------------------
 try {
     Import-Module WebAdministration -ErrorAction Stop
-    # A stalled request persists server-side until ARR's proxy timeout (~120s),
-    # so poll a few times: round 1 immediately, then two more if empty.
-    for ($round = 1; $round -le 3; $round++) {
-        $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
-        if ($inflight.Count -eq 0) {
-            $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
-        }
-        Write-Host ("[INFLIGHT] round {0}: {1} request(s) still executing (pool {2}):" -f `
-            $round, $inflight.Count, $PoolName)
-        $shown = 0
-        foreach ($r in $inflight) {
-            if ($shown -ge 20) { Write-Host "[INFLIGHT] ... (truncated)"; break }
-            Write-Host ("[INFLIGHT] {0} {1} elapsed={2}ms state={3}" -f `
-                $r.verb, $r.url, $r.timeElapsed, $r.state)
-            $shown++
-        }
-        if ($inflight.Count -gt 0) {
-            Write-Host "[INFLIGHT] full record of the first in-flight request:"
-            $inflight[0] | Format-List * | Out-String | ForEach-Object { Write-Host $_ }
-            break
-        }
-        if ($round -lt 3) { Start-Sleep -Seconds 3 }
+    $inflight = @(Get-WebRequest -ApplicationPool $PoolName -ErrorAction SilentlyContinue)
+    if ($inflight.Count -eq 0) {
+        $inflight = @(Get-WebRequest -ErrorAction SilentlyContinue)
+    }
+    Write-Host ("[INFLIGHT] after load phase: {0} request(s) still executing (pool {1})" -f `
+        $inflight.Count, $PoolName)
+    foreach ($r in ($inflight | Select-Object -First 10)) {
+        Write-Host ("[INFLIGHT] {0} {1} elapsed={2}ms state={3}" -f `
+            $r.verb, $r.url, $r.timeElapsed, $r.state)
+    }
+    if ($inflight.Count -gt 0) {
+        Write-Host "[INFLIGHT] full record of the first in-flight request:"
+        $inflight[0] | Format-List * | Out-String | ForEach-Object { Write-Host $_ }
     }
 } catch {
     Write-Warning ("[INFLIGHT] snapshot failed: {0}" -f $_.Exception.Message)
