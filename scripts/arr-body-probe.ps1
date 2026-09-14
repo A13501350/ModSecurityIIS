@@ -192,7 +192,7 @@ $webConfig = Join-Path $SiteRoot "web.config"
 # Ensure the section is declared (the MSI declares it, but be defensive: an
 # already-installed module path may not have run the MSI installer's schema).
 $secOk = $false
-for ($try in 1..5) {
+for ($try = 1; $try -le 5; $try++) {
     $out = & $appcmd set config $SiteName /section:ModSecurity `
         /enabled:true /configFile:"$ConfRoot\modsecurity-arr.conf" /commit:site 2>&1
     if ($LASTEXITCODE -eq 0) { $secOk = $true; break }
