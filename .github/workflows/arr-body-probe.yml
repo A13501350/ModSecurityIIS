@@ -1,0 +1,210 @@
+name: ARR body-forward probe
+# Reproduces / verifies the bench-harness defect: a ~100 KiB POST through the
+# connector's reverse proxy (URL Rewrite + ARR -> backend) stalls or is
+# truncated, while a 1 KiB POST on the same path is fine. See
+# scripts/arr-body-probe.ps1 and bench/README.md ("Known defects").
+#
+# Runs ONLY on manual dispatch or pushes to diag/** -- it never touches the
+# mainline Build ModSecurityIIS pipeline, so a repro failure here does not
+# redden master. Use it to confirm the defect on master, then to confirm a fix.
+#
+# To verify against an already-built master DLL (skips the ~40-min compile),
+# pass the run-id of a successful Build ModSecurityIIS run via build_run_id.
+run-name: >-
+  ${{ inputs.label != '' && inputs.label ||
+       'ARR body-forward probe' }}${{ inputs.build_run_id != '' && format(' [reuse {0}]', inputs.build_run_id) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'Name for this run (shown in the Actions list)'
+        required: false
+        default: ''
+        type: string
+      build_run_id:
+        description: 'Optional run-id of a prior Build ModSecurityIIS run to reuse the DLL (else build)'
+        required: false
+        default: ''
+        type: string
+      freb:
+        description: 'Capture IIS Failed Request Tracing (FREB) to pinpoint the stall stage (connector body-read vs ARR forward)'
+        required: false
+        default: false
+        type: boolean
+      load_clients:
+        description: 'Concurrency-phase client count (default 16). NOTE: FREB tracing can mask the race -- prefer no-FREB runs with higher load.'
+        required: false
+        default: ''
+        type: string
+      load_reps:
+        description: 'Concurrency-phase repetitions per client (default 4)'
+        required: false
+        default: ''
+        type: string
+      load_rounds:
+        description: 'Extra rounds of the c16 phase (default 1) to accumulate stall samples per run'
+        required: false
+        default: ''
+        type: string
+  # No push trigger on purpose: pushing a commit to diag/** would spawn a full
+  # ~13-min build for no reason. This is a diagnostic probe -- drive it by
+  # workflow_dispatch only, reusing an existing build via build_run_id.
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules, recursive)
+        if: ${{ inputs.build_run_id == '' }}
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        if: ${{ inputs.build_run_id == '' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install Conan 2.x + Ninja
+        if: ${{ inputs.build_run_id == '' }}
+        run: pip install "conan>=2" ninja
+
+      - name: Cache Conan packages + engine build
+        if: ${{ inputs.build_run_id == '' }}
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.conan2/p
+            build/libmodsecurity_build
+          key: lmengine-${{ runner.os }}-${{ hashFiles('libmodsecurity/build/win32/conanfile.txt') }}-${{ hashFiles('cmake/build_libmodsecurity.cmake') }}
+          restore-keys: |
+            lmengine-${{ runner.os }}-
+            conan193-${{ runner.os }}-
+
+      - name: Run sccache
+        if: ${{ inputs.build_run_id == '' }}
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure sccache env
+        if: ${{ inputs.build_run_id == '' }}
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_ENV "SCCACHE_GHA_ENABLED=true"
+          Add-Content $env:GITHUB_ENV "SCCACHE_IDLE_TIMEOUT=0"
+          Add-Content $env:GITHUB_PATH (Split-Path $env:SCCACHE_PATH)
+
+      - name: Set up MSVC toolchain (cl.exe + Windows SDK)
+        if: ${{ inputs.build_run_id == '' }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: ammaraskar/msvc-problem-matcher@0.3.0
+        if: ${{ inputs.build_run_id == '' }}
+
+      - name: Configure
+        if: ${{ inputs.build_run_id == '' }}
+        run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER_LAUNCHER=sccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+
+      - name: Build
+        if: ${{ inputs.build_run_id == '' }}
+        run: cmake --build build --config Release
+
+      - name: sccache stats
+        if: ${{ inputs.build_run_id == '' }}
+        run: "& $env:SCCACHE_PATH --show-stats"
+
+      - name: Upload artifacts
+        if: ${{ inputs.build_run_id == '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: modsecurityiis
+          if-no-files-found: warn
+          path: |
+            build/Release/*.dll
+            build/*.dll
+            build/libmodsecurity_build/build_libmodsecurity.log
+
+  package:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules, recursive)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Download built DLLs
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis
+          path: artifact
+          run-id: ${{ inputs.build_run_id != '' && inputs.build_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force msi-input | Out-Null
+          Get-ChildItem artifact -Recurse -Filter *.dll |
+              Copy-Item -Destination msi-input -Force
+          $base = ((Get-Content VERSION -TotalCount 1).Trim() -replace "^v","") -replace "-.*$",""
+          .\iis\build_msi.bat msi-input $base msi-out
+
+      - name: Upload MSI
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: modsecurityiis-msi
+          if-no-files-found: warn
+          path: msi-out/*.msi
+
+  probe:
+    needs: package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules, recursive)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Download MSI
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis-msi
+          path: msi
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go (echo backend)
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Run ARR body-forward probe
+        shell: pwsh
+        run: |
+          # Use a HASHTABLE splat (not an array): array splatting binds
+          # positionally, so "-Msi" would become the value of $Msi and the real
+          # path would leak into $ConfRoot. Hashtable splat does named binding.
+          $ht = @{}
+          $msi = (Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1).FullName
+          if ($msi) { $ht['Msi'] = $msi }
+          # inputs.freb is "" on push-triggered runs -- do not ToBoolean("") (throws).
+          $frebRaw = "${{ inputs.freb }}"
+          $freb = ($frebRaw -ieq 'true') -or ($frebRaw -eq '1')
+          if ($freb) { $ht['Freb'] = $true }
+          if ("${{ inputs.load_clients }}" -ne '') { $ht['LoadClients'] = "${{ inputs.load_clients }}" }
+          if ("${{ inputs.load_reps }}" -ne '')    { $ht['LoadReps']    = "${{ inputs.load_reps }}" }
+          if ("${{ inputs.load_rounds }}" -ne '')  { $ht['LoadRounds']  = "${{ inputs.load_rounds }}" }
+          ./scripts/arr-body-probe.ps1 @ht
+
+      - name: Upload probe diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arr-probe-diagnostics
+          if-no-files-found: ignore
+          path: C:/inetpub/modsec-arr/
