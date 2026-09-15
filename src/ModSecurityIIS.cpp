@@ -127,6 +127,38 @@ static void BodyTrace(const char* fmt, ...)
     LeaveCriticalSection(&g_traceLock);
 }
 
+// ---------------------------------------------------------------------------
+// Legacy ASYNC body-read path -- DISABLED BY DEFAULT.
+//
+// Set MODSEC_IIS_BODY_ASYNC=1 to re-enable the pre-1f94045 behavior: async
+// ReadEntityBody whose completion arrives through the module-wide
+// OnAsyncCompletion multicast. Kept for reference/debugging only: on this
+// path, under concurrent load with ARR consuming the re-inserted body, async
+// completions were observed to never arrive (requests wedged in
+// RQ_BEGIN_REQUEST) or the re-inserted body stalled mid-forward (v13-v16 on
+// diag/arr-body-stall). The default SYNCHRONOUS path has no outstanding async
+// operation to lose and is the shipping behavior.
+// ---------------------------------------------------------------------------
+namespace {
+    std::atomic<int> g_bodyAsyncState{ 0 };   // 0=uninit 1=sync(default) 2=async
+}
+
+static bool BodyReadsAsync()
+{
+    int st = g_bodyAsyncState.load(std::memory_order_relaxed);
+    if (st == 0)
+    {
+        char flag[16] = { 0 };
+        const DWORD n = GetEnvironmentVariableA("MODSEC_IIS_BODY_ASYNC",
+                                                flag, sizeof(flag));
+        const bool on = (n > 0 && n < sizeof(flag)) &&
+                        (flag[0] == '1' || flag[0] == 't' || flag[0] == 'T');
+        g_bodyAsyncState.store(on ? 2 : 1, std::memory_order_relaxed);
+        st = on ? 2 : 1;
+    }
+    return st == 2;
+}
+
 
 // ---------------------------------------------------------------------------
 // Small helpers (WCHAR <-> UTF8, sockaddr -> ip/port)
@@ -765,12 +797,38 @@ CMyHttpModule::DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
     // worker thread while the client uploads -- bounded by the configured
     // SecRequestBodyLimit -- which is the standard pattern from the
     // ReadEntityBody documentation.
+    const bool async = BodyReadsAsync();
     for (;;)
     {
-        DWORD read = 0;
-        HRESULT hr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                              (DWORD)sizeof(rsc->m_ReadBuf),
-                                              FALSE /* sync */, &read, NULL);
+        DWORD read     = 0;
+        BOOL  fPending = FALSE;
+        HRESULT hr;
+        if (async)
+        {
+            // Legacy path (MODSEC_IIS_BODY_ASYNC=1): completion delivered via
+            // the module-wide OnAsyncCompletion multicast. DISABLED BY
+            // DEFAULT -- completions were observed to never arrive under
+            // concurrent load (diag/arr-body-stall v13-v16).
+            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
+                                          (DWORD)sizeof(rsc->m_ReadBuf),
+                                          TRUE /* async */, &read, &fPending);
+        }
+        else
+        {
+            // Default shipping path (see the rationale above the loop).
+            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
+                                          (DWORD)sizeof(rsc->m_ReadBuf),
+                                          FALSE /* sync */, &read, NULL);
+        }
+        if (async && fPending)
+        {
+            // m_ReadBuf lives on the per-request context, so it stays valid
+            // until OnAsyncCompletion reports the completion.
+            rsc->m_BodyReadActive = true;
+            return RQ_NOTIFICATION_PENDING;
+        }
+        rsc->m_BodyReadActive = false;
+
         if (read > 0)
         {
             rsc->m_Body.insert(rsc->m_Body.end(),
@@ -1212,6 +1270,131 @@ CMyHttpModule::OnBeginRequest(
     return RQ_NOTIFICATION_CONTINUE;
 }
 
+
+
+// ---------------------------------------------------------------------------
+// OnAsyncCompletion -- LEGACY ASYNC PATH (disabled unless
+// MODSEC_IIS_BODY_ASYNC=1). Resumes an asynchronous entity-body read issued
+// by DriveBodyRead on the legacy path. In the default synchronous mode no
+// read of ours is ever pending, so the ownership filter below always
+// short-circuits this handler. Completes foreign async operations (e.g. ARR's
+// own 16 KiB entity reads, which IIS multicasts to every module) are seen
+// here with active==0 and are ignored.
+// ---------------------------------------------------------------------------
+
+REQUEST_NOTIFICATION_STATUS
+CMyHttpModule::OnAsyncCompletion(
+    IN IHttpContext * pHttpContext,
+    IN DWORD          dwNotification,
+    IN BOOL           fPostNotification,
+    IN IHttpEventProvider * pProvider,
+    IN IHttpCompletionInfo * pCompletionInfo
+)
+{
+    UNREFERENCED_PARAMETER(pProvider);
+
+    if (!BodyReadsAsync())
+    {
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    // Only handle completions for entity-body reads we started from
+    // RQ_BEGIN_REQUEST. Do NOT call PostCompletion() -- that is for
+    // module-owned async work and would double-signal this IIS-tracked I/O.
+    if (pHttpContext == NULL || pCompletionInfo == NULL ||
+        !(dwNotification & RQ_BEGIN_REQUEST) || fPostNotification)
+    {
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    REQUEST_STORED_CONTEXT* rsc = NULL;
+    IHttpModuleContextContainer* pContainer =
+        pHttpContext->GetModuleContextContainer();
+    if (pContainer != NULL)
+    {
+        rsc = (REQUEST_STORED_CONTEXT*)pContainer->GetModuleContext(
+                  g_pModuleContext);
+    }
+
+    const DWORD   cb = pCompletionInfo->GetCompletionBytes();
+    const HRESULT ch = pCompletionInfo->GetCompletionStatus();
+
+    // Log ONLY abnormal completions (rejected by the ownership filter, no read
+    // marked active, zero-byte, or failed). Accepted hot-path completions are
+    // silent: tracing every one perturbs the timing enough to mask the stall
+    // race (v14). A rejected completion for one of our requests is the prime
+    // suspect for requests that wedge in BEGIN_REQUEST and never reach ARR.
+    if (rsc != NULL)
+    {
+        const bool ownershipOk = (rsc->m_pTx != NULL) && rsc->m_BodyReadActive;
+        if (!ownershipOk || cb == 0 || FAILED(ch))
+        {
+            BodyTrace("ASYNC-ABNORMAL rsc=%p notif=0x%08X post=%d cb=%lu ch=0x%08X active=%d tx=%d",
+                      (const void*)rsc, dwNotification, (int)fPostNotification,
+                      cb, (unsigned)ch, (int)rsc->m_BodyReadActive,
+                      (int)(rsc->m_pTx != NULL));
+        }
+    }
+
+    // No transaction, or no read of ours in flight: not ours either.
+    if (rsc == NULL || rsc->m_pTx == NULL || !rsc->m_BodyReadActive)
+    {
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    try
+    {
+        // The chunk that just completed is in the per-request read buffer.
+        if (cb > 0)
+        {
+            rsc->m_Body.insert(rsc->m_Body.end(),
+                               rsc->m_ReadBuf, rsc->m_ReadBuf + cb);
+        }
+        rsc->m_BodyReadActive = false;
+
+        // Distinguish the three stop conditions: a real EOF status, a
+        // zero-byte completion with a SUCCESS status (a mid-body zero read
+        // would be a misjudged EOF -- the reason string in the trace decides
+        // that), and a hard error.
+        const char* reason = NULL;
+        if (ch == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF))
+        {
+            reason = "async-eof";
+        }
+        else if (cb == 0)
+        {
+            reason = "async-zero";
+        }
+        else if (FAILED(ch))
+        {
+            reason = "async-error";
+        }
+        if (reason != NULL)
+        {
+            // Body complete (or a read error): finish with what we have and
+            // return the status directly -- no PostCompletion().
+            return FinishBodyRead(rsc, pHttpContext, reason);
+        }
+
+        // More body expected: issue the next read. Returns PENDING if that
+        // read goes asynchronous again, otherwise the final status. The
+        // declared Content-Length stop condition still applies: it is
+        // re-derived inside DriveBodyRead(), so it holds across completions.
+        return DriveBodyRead(rsc, pHttpContext);
+    }
+    catch (const std::exception& e)
+    {
+        // Fail-closed: finish the request rather than let an exception cross
+        // the module boundary and kill w3wp.
+        ReportException("OnAsyncCompletion", e.what());
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    catch (...)
+    {
+        ReportException("OnAsyncCompletion", NULL);
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+}
 
 
 // ---------------------------------------------------------------------------

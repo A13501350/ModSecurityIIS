@@ -12,7 +12,7 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false),
+          m_ResponseHeadersFed(false), m_BodyReadActive(false),
           m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false)
     { }
 
@@ -79,6 +79,10 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // IIS with a SINGLE InsertEntityBody() once the body is complete.
     std::vector<char>         m_Body;
     char                      m_ReadBuf[65536];
+    // True while an async ReadEntityBody() is in flight. Only ever set on the
+    // LEGACY async path (MODSEC_IIS_BODY_ASYNC=1); the default synchronous
+    // path never leaves a read pending.
+    bool                      m_BodyReadActive;
 };
 
 
@@ -105,9 +109,18 @@ public:
         IN IHttpEventProvider * pProvider
     ) override;
 
-    // Entity-body reads are SYNCHRONOUS (see DriveBodyRead): both async
-    // completion mechanisms lost completions under concurrent load, so there
-    // is no per-operation callback and no OnAsyncCompletion involvement.
+    // Entity-body reads are SYNCHRONOUS by default (see DriveBodyRead): both
+    // async completion mechanisms lost completions under concurrent load, so
+    // there is no per-operation callback involvement. The legacy multicast
+    // handler below is retained DISABLED for reference/debugging only.
+    REQUEST_NOTIFICATION_STATUS
+    OnAsyncCompletion(
+        IN IHttpContext * pHttpContext,
+        IN DWORD          dwNotification,
+        IN BOOL           fPostNotification,
+        IN IHttpEventProvider * pProvider,
+        IN IHttpCompletionInfo * pCompletionInfo
+    ) override;
 
     CMyHttpModule();
     ~CMyHttpModule();
@@ -117,11 +130,15 @@ public:
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
 private:
-    // Drains the request entity body with SYNCHRONOUS ReadEntityBody() calls,
-    // continuing through short reads (they do NOT mean end-of-body) and
-    // stopping on EOF / error / once the declared Content-Length is consumed.
-    // Both helpers are static: the whole read path carries no CMyHttpModule*
-    // state (rsc already holds the IHttpContext).
+    // Drains the request entity body, stopping on EOF / error / once the
+    // declared Content-Length is consumed. Two modes:
+    //  - DEFAULT: SYNCHRONOUS ReadEntityBody() calls (fAsync=FALSE), the whole
+    //    body consumed and re-inserted before returning -- no async operation
+    //    exists that could be lost (diag/arr-body-stall).
+    //  - MODSEC_IIS_BODY_ASYNC=1: legacy ASYNCHRONOUS reads whose completions
+    //    resume via OnAsyncCompletion (retained for reference; known to lose
+    //    completions under concurrent load).
+    // Short reads NEVER mean end-of-body in either mode.
     static REQUEST_NOTIFICATION_STATUS
     DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 
