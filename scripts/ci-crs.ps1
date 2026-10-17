@@ -229,6 +229,7 @@ foreach ($attempt in 1..3) {
     $body = ("$($own.Content)" -replace "\s+", " ").Trim()
     if ($body.Length -gt 120) { $body = $body.Substring(0, 120) }
     Write-Host ("ownership check attempt {0}: status={1} body='{2}'" -f $attempt, $own.StatusCode, $body)
+    Write-Host ("  headers: {0}" -f (($own.Headers.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value -join ',')" }) -join "; "))
     if ($own.StatusCode -eq 200 -and "$($own.Content)" -match "hello from modsectest") {
         $owned = $true
         break
@@ -239,6 +240,16 @@ if (-not $owned) {
     Write-Host "site inventory at ownership-check failure:"
     & $appcmd list sites
     & $appcmd list site $SiteName
+    Write-Host "raw response bytes (first 256):"
+    try {
+        $raw = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -TimeoutSec 10
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes("$($raw.Content)")
+        $hex = ($bytes[0..([Math]::Min(255, $bytes.Length - 1))] | ForEach-Object { $_.ToString("X2") }) -join " "
+        Write-Host $hex
+    }
+    catch {
+        Write-Host "raw fetch failed: $($_.Exception.Message)"
+    }
     throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
