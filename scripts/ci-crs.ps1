@@ -1,8 +1,7 @@
-# CRS regression stage for ModSecurityIIS. Runs AFTER ci-smoke.ps1 in the
-# same job (module already deployed, site/app pool exist). CRS rules are
-# loaded directly; the IIS site proxies every request to the albedo echo
-# backend via URL Rewrite + ARR, and go-ftw replays the official CRS
-# regression tests, asserting status codes and audit-log rule hits.
+# CRS regression stage for ModSecurityIIS. Runs as a standalone CI job.
+# CRS rules are loaded directly; the IIS site proxies every request to the
+# albedo echo backend via URL Rewrite + ARR, and go-ftw replays the official
+# CRS regression tests, asserting status codes and audit-log rule hits.
 
 [CmdletBinding()]
 param(
@@ -10,7 +9,13 @@ param(
     [string]$ConfRoot   = "C:\inetpub\modsec",
     [string]$SiteRoot   = "C:\inetpub\modsectest",
     [string]$SiteName   = "ModSecTest",
-    [string]$PoolName   = "ModSecTestPool"
+    [string]$PoolName   = "ModSecTestPool",
+    # MSI to install when the module is not registered yet. Empty = assume the
+    # module is already installed (the historical same-job-after-smoke flow).
+    [string]$Msi = "",
+    # Bootstrap binding for the site when it must be created (the script
+    # rebinds to :80 further down regardless).
+    [int]   $Port = 18080
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +26,55 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Must run elevated."
 }
 $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
+
+# --- 0b) standalone-job bootstrap ----------------------------------------------
+# Bootstraps whatever is missing on a fresh runner:
+#   * IIS static-content feature (without it the StaticFile handler maps to
+#     DefaultDocumentModule only, which returns 200 with Content-Length: 0);
+#   * module not registered and -Msi given -> install the MSI, then restart IIS;
+#   * site/app pool missing -> create them. hello.txt is written unconditionally:
+#     the port-80 ownership check in step 3 matches its content.
+$features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, Web-Http-Errors, Web-Filtering -ErrorAction SilentlyContinue
+if ($features | Where-Object { -not $_.Installed }) {
+    Write-Host "== Installing missing IIS features =="
+    Install-WindowsFeature Web-Static-Content, Web-Default-Doc, Web-Http-Errors, Web-Filtering | Out-Null
+    if ((Get-Service W3SVC).Status -ne "Running") { Start-Service W3SVC }
+}
+$moduleRegistered = [bool](& $appcmd list modules /name:ModSecurityIIS 2>$null |
+    Select-String "ModSecurityIIS" -Quiet)
+if (-not $moduleRegistered) {
+    if (-not $Msi -or -not (Test-Path $Msi)) {
+        throw "ModSecurityIIS module is not registered and no usable -Msi was given."
+    }
+    $msiLog = Join-Path (Get-Location).Path "crs-msi-install.log"
+    Write-Host "== Installing $Msi =="
+    $p = Start-Process msiexec.exe -Wait -PassThru `
+         -ArgumentList @("/i", (Resolve-Path $Msi).Path, "/qn", "/norestart", "/l*v", $msiLog)
+    if ($p.ExitCode -ne 0) {
+        Get-Content $msiLog -ErrorAction SilentlyContinue | Write-Host
+        throw "msiexec failed (exit=$($p.ExitCode)); log: $msiLog"
+    }
+    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
+    & iisreset /start 2>&1 | Out-Null
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+    Write-Host "== MSI installed =="
+}
+
+New-Item -ItemType Directory -Force $SiteRoot | Out-Null
+Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
+$siteExists = [bool](& $appcmd list site $SiteName 2>$null | Select-String $SiteName -Quiet)
+if (-not $siteExists) {
+    Write-Host "== Creating site $SiteName (bootstrap) =="
+    & $appcmd add apppool /name:$PoolName
+    # No managed runtime: the test site only serves static files.
+    & $appcmd set apppool $PoolName /managedRuntimeVersion:"" /processModel.loadUserProfile:false
+    & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
+    & $appcmd set app "$SiteName/" /applicationPool:$PoolName
+    & $appcmd start site $SiteName
+}
 
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"
@@ -122,15 +176,30 @@ SecRuleRemoveById 920273
 Write-Host "[2/8] Engine config written ($conf)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
+# responseBodyBlock starts OFF for the ownership check so small static
+# responses (hello.txt) are served with their real body; flip it back ON
+# after the check passes so CRS phase-4 rules run normally.
 & $appcmd set config $SiteName /section:ModSecurity `
-    /enabled:true /configFile:$conf /responseBodyBlock:true /commit:site
+    /enabled:true /configFile:$conf /responseBodyBlock:false /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
-# go-ftw targets http://localhost (port 80) by default. Delete the Default
-# Web Site to win the :80 binding race.
+# go-ftw targets http://localhost (port 80) by default. Take the :80 binding.
+# Every step here is exit-code verified: a SILENT failure of the Default Web
+# Site deletion leaves its iisstart.htm answering on :80 (200 with the wrong
+# body), and the WAS binding conflict then keeps this site down -- exactly the
+# failure the ownership check below exists to catch.
 & $appcmd delete site "Default Web Site" 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    # stderr carries appcmd errors, so a missing site yields an empty pipeline.
+    if (& $appcmd list site "Default Web Site" 2>$null) {
+        throw "Failed to delete 'Default Web Site' (exit=$LASTEXITCODE); it would keep stealing port 80."
+    }
+    Write-Host "Default Web Site not present -- port 80 already free."
+}
 & $appcmd set site $SiteName /bindings:"http/*:80:"
+if ($LASTEXITCODE -ne 0) { throw "appcmd set site (bind :80) failed." }
 & $appcmd start site $SiteName
+if ($LASTEXITCODE -ne 0) { throw "appcmd start site failed." }
 
 & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
 & iisreset /start 2>&1 | Out-Null
@@ -140,12 +209,40 @@ foreach ($i in 1..30) {
 }
 
 # Assert THIS site owns port 80 before anything else depends on it.
-$own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
-           -SkipHttpErrorCheck -TimeoutSec 10
-if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsectest") {
-    throw "port-80 ownership check failed ($($own.StatusCode)); ModSecTest is not serving localhost."
+$owned = $false
+foreach ($attempt in 1..3) {
+    try {
+        $own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+                   -SkipHttpErrorCheck -TimeoutSec 10
+    }
+    catch {
+        Write-Host "ownership check attempt ${attempt}: request failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 3
+        continue
+    }
+    $body = ("$($own.Content)" -replace "\s+", " ").Trim()
+    if ($body.Length -gt 120) { $body = $body.Substring(0, 120) }
+    Write-Host ("ownership check attempt {0}: status={1} body='{2}'" -f $attempt, $own.StatusCode, $body)
+    Write-Host ("  headers: {0}" -f (($own.Headers.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value -join ',')" }) -join "; "))
+    if ($own.StatusCode -eq 200 -and "$($own.Content)" -match "hello from modsectest") {
+        $owned = $true
+        break
+    }
+    Start-Sleep -Seconds 3
+}
+if (-not $owned) {
+    Write-Host "site inventory at ownership-check failure:"
+    & $appcmd list sites
+    & $appcmd list site $SiteName
+
+    throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
+
+# Re-enable response-body blocking now that ownership is confirmed.
+& $appcmd set config $SiteName /section:ModSecurity /responseBodyBlock:true /commit:site
+if ($LASTEXITCODE -ne 0) { throw "appcmd set config (responseBodyBlock:true) failed." }
+Write-Host "[3b/8] responseBodyBlock enabled for CRS tests."
 
 # --- 4) reverse proxy: URL Rewrite + ARR -> albedo ------------------------------
 choco install urlrewrite iis-arr -y --no-progress | Out-Null
