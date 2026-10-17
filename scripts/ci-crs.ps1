@@ -32,12 +32,22 @@ $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
 # This script used to run AFTER ci-smoke.ps1 in the same job, where the MSI was
 # already installed and the site already existed. It now runs as its own CI job
 # on a fresh runner, so it bootstraps whatever is missing:
+#   * IIS static-content feature (absent on the windows-latest runner image:
+#     without it the StaticFile handler maps to DefaultDocumentModule only,
+#     which returns 200 with Content-Length: 0 for .txt -- the signature that
+#     kept failing the ownership check);
 #   * module not registered and -Msi given -> install the MSI (schema +
 #     modsecurity.conf + module registration), then restart IIS so the config
 #     system sees the new section;
 #   * site/app pool missing -> create them. hello.txt is written
 #     unconditionally: the port-80 ownership check in step 3 matches its
 #     content.
+$features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, Web-Http-Errors, Web-Filtering -ErrorAction SilentlyContinue
+if ($features | Where-Object { -not $_.Installed }) {
+    Write-Host "== Installing missing IIS features =="
+    Install-WindowsFeature Web-Static-Content, Web-Default-Doc, Web-Http-Errors, Web-Filtering | Out-Null
+    if ((Get-Service W3SVC).Status -ne "Running") { Start-Service W3SVC }
+}
 $moduleRegistered = [bool](& $appcmd list modules /name:ModSecurityIIS 2>$null |
     Select-String "ModSecurityIIS" -Quiet)
 if (-not $moduleRegistered) {
