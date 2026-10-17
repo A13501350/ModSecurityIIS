@@ -187,11 +187,16 @@ static int SockAddrToPort(PSOCKADDR pAddr)
 
 // Upper bound (bytes) of request/response body we allow the engine to buffer
 // for inspection. Override with MODSEC_IIS_MAX_INSPECT_BODY_BYTES env var.
+//
+// The default is 1 MiB, aligned with the libModSecurity SecRequestBodyLimit
+// default: the module drains the FULL body before processRequestBody() runs,
+// so a cap far above the engine limit only buffers megabytes the engine would
+// reject anyway -- pure memory-amplification surface under concurrent load.
 static size_t GetMaxInspectBodyBytes()
 {
     static const size_t cached = []() -> size_t
     {
-        size_t v = 128 * 1024 * 1024;
+        size_t v = 1024 * 1024;
         char buf[32] = { 0 };
         DWORD n = GetEnvironmentVariableA("MODSEC_IIS_MAX_INSPECT_BODY_BYTES",
                                           buf, (DWORD)sizeof(buf));
@@ -204,6 +209,13 @@ static size_t GetMaxInspectBodyBytes()
             {
                 v = (size_t)x;
             }
+        }
+        // The accumulated body is re-forwarded through InsertEntityBody,
+        // whose length parameter is a DWORD: clamp the cap so the
+        // (DWORD)m_Body.size() casts can never truncate.
+        if (v > 0xFFFFFFFFull)
+        {
+            v = 0xFFFFFFFFull;
         }
         return v;
     }();
@@ -643,11 +655,13 @@ static EntityBodyInfo GetEntityBodyInfo(HTTP_REQUEST* req)
     {
         return info;
     }
-    const HTTP_KNOWN_HEADER& te =
-        req->Headers.KnownHeaders[HttpHeaderTransferEncoding];
-    if (te.pRawValue != NULL && te.RawValueLength > 0)
+    // Ask http.sys rather than parsing header text: any non-empty
+    // Transfer-Encoding (identity, trailers, ...) would otherwise pass for a
+    // body and cost a pointless read round-trip on bodyless requests.
+    if (req->Flags & HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS)
     {
-        // Chunked: there is a body but no declared length.
+        // Chunked (or otherwise undeclared length): there is a body but no
+        // declared Content-Length.
         info.hasBody = true;
         return info;
     }
@@ -698,6 +712,9 @@ CMyHttpModule::BeginBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
     rsc->m_HasBody = true;
     rsc->m_DeclaredBodyLength = info.length;
 
+    // Allocate the read staging buffer only once a body actually exists.
+    rsc->m_ReadBuf.resize(kBodyReadChunkSize);
+
     // Pre-size the accumulator so multi-chunk bodies don't pay repeated
     // reallocation. Client-controlled Content-Length is clamped to 1 MiB
     // (geometric growth handles larger bodies as they arrive).
@@ -741,16 +758,16 @@ CMyHttpModule::PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCont
         if (async)
         {
             InterlockedExchange(&rsc->m_BodyReadState, BRS_READ_PENDING);
-            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                          (DWORD)sizeof(rsc->m_ReadBuf),
+            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf.data(),
+                                          kBodyReadChunkSize,
                                           TRUE /* async */, &read, &fPending);
         }
         else
         {
             // A/B escape hatch (MODSEC_IIS_BODY_ASYNC=0): shipping master
             // behavior, fAsync=FALSE. No read ever stays pending.
-            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf,
-                                          (DWORD)sizeof(rsc->m_ReadBuf),
+            hr = pRequest->ReadEntityBody(rsc->m_ReadBuf.data(),
+                                          kBodyReadChunkSize,
                                           FALSE /* sync */, &read, NULL);
         }
 
@@ -785,7 +802,7 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
     if (read > 0)
     {
         rsc->m_Body.insert(rsc->m_Body.end(),
-                           rsc->m_ReadBuf, rsc->m_ReadBuf + read);
+                           rsc->m_ReadBuf.data(), rsc->m_ReadBuf.data() + read);
     }
 
     const ULONGLONG declared = rsc->m_DeclaredBodyLength;
@@ -850,6 +867,14 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
 REQUEST_NOTIFICATION_STATUS
 CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
+    // Set when the drained body cannot be re-forwarded to the handler. The
+    // engine still inspects what we hold in m_Body, but if it allows the
+    // request anyway the request must FAIL below: the declared Content-Length
+    // still claims the full amount and a proxy (ARR) would wait for bytes
+    // that never come -- the same hazard as the InsertEntityBody failure
+    // path, so both paths end the request the same way.
+    bool restoreFailed = false;
+
     try
     {
         // Hand the accumulated body back to the downstream handler via a
@@ -883,13 +908,16 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
             }
             else
             {
-                // Allocation failure: forward an empty body rather than fail
-                // the request, but leave a trace -- a silent empty-body POST
-                // reaching the backend is near-impossible to debug there.
+                // Allocation failure: keep the request alive only until the
+                // engine has ruled (m_Body is still in memory); if the engine
+                // allows it, fail the request below rather than hand the
+                // handler a body that no longer matches the declared
+                // Content-Length.
+                restoreFailed = true;
                 iis::WriteEventViewerLog(
                     "ModSecurityIIS: AllocateRequestMemory failed while "
-                    "re-forwarding the request body; the handler sees an "
-                    "EMPTY body for this request",
+                    "re-forwarding the request body; the request will be "
+                    "failed unless the engine blocks it",
                     EVENTLOG_ERROR_TYPE);
             }
         }
@@ -922,6 +950,15 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
 
     if (ApplyIntervention(rsc, pHttpContext, true))
     {
+        return RQ_NOTIFICATION_FINISH_REQUEST;
+    }
+    if (restoreFailed)
+    {
+        // The engine allowed the request, but its drained body can no longer
+        // be restored for the downstream handler: fail closed with 500
+        // instead of forwarding a truncated/empty body that does not match
+        // the declared Content-Length.
+        pHttpContext->GetResponse()->SetStatus(500, "Internal Server Error");
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     return RQ_NOTIFICATION_CONTINUE;
@@ -1507,9 +1544,12 @@ CMyHttpModule::OnSendResponse(
                                         length);
             }
         }
-        // HttpDataChunkFromFragmentCache: IIS exposes no API for a module to
-        // read another module's cached fragment bytes, so such content cannot
-        // be inspected here; it is skipped deliberately.
+        // Remaining chunk types (HttpDataChunkFromFragmentCache,
+        // HttpDataChunkFromMemoryNoCopy, ...) are skipped deliberately:
+        // FragmentCache bytes are another module's cached content with no
+        // module-readable API, and the other chunk variants are not produced
+        // by the response paths this connector fronts. Neither can be
+        // inspected here.
     }
 
     bool moreData = (pProvider->GetFlags() &
