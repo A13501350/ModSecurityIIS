@@ -274,6 +274,60 @@ if (-not $owned) {
     catch { Write-Host "isolation probe fetch failed: $($_.Exception.Message)" }
     # Re-enable so the artifact reflects the intended config.
     & $appcmd set config $SiteName /section:ModSecurity /enabled:true /commit:site 2>&1 | Out-Null
+
+    # FREB: capture the full pipeline for the failing request. The box is
+    # already going to fail, so servicing-pending risk is acceptable.
+    Write-Host "FREB: enabling failed-request tracing for post-mortem..."
+    $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
+    New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
+    try {
+        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All -NoRestart -ErrorAction Stop | Out-Null
+    } catch {
+        try { & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host } catch {}
+    }
+    try {
+        & $appcmd set config $SiteName /section:system.webServer/tracing/traceFailedRequestsLogging `
+            /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
+        $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
+        [xml]$doc = Get-Content $ahConfig
+        $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
+        if (-not $loc) { $loc = $doc.configuration.AppendChild($doc.CreateElement("location")); $loc.SetAttribute("path", $SiteName) }
+        $sws = $loc."system.webServer"
+        if (-not $sws) { $sws = $loc.AppendChild($doc.CreateElement("system.webServer")) }
+        $tracing = $sws.tracing
+        if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
+        $tfr = $tracing.traceFailedRequests
+        if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
+        $tfr.RemoveAll()
+        $add = $doc.CreateElement("add"); $add.SetAttribute("path", "*")
+        $ta = $doc.CreateElement("traceAreas")
+        $prov = $doc.CreateElement("add")
+        $prov.SetAttribute("provider", "WWW Server")
+        $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
+        $prov.SetAttribute("verbosity", "Verbose")
+        [void]$ta.AppendChild($prov); [void]$add.AppendChild($ta)
+        $fd = $doc.CreateElement("failureDefinitions")
+        $fd.SetAttribute("statusCodes", "200-999"); $fd.SetAttribute("timeTaken", "00:00:01")
+        [void]$add.AppendChild($fd); [void]$tfr.AppendChild($add)
+        $doc.Save($ahConfig)
+    } catch { Write-Host "FREB config WARN: $($_.Exception.Message)" }
+    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
+    & iisreset /start 2>&1 | Out-Null
+    foreach ($i in 1..30) { if ((Get-Service W3SVC).Status -eq "Running") { break }; Start-Sleep -Seconds 1 }
+    & $appcmd start site $SiteName 2>&1 | Out-Null
+    try {
+        $f = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 10
+        Write-Host ("FREB probe: status={0} ContentLength={1}" -f $f.StatusCode,
+            $(if ($f.Headers.'Content-Length') { $f.Headers.'Content-Length' } else { 'missing' }))
+    } catch { Write-Host "FREB probe failed: $($_.Exception.Message)" }
+    Start-Sleep -Seconds 2
+    $frLogs = Get-ChildItem $frebDir -Recurse -Filter "fr*.xml" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+    foreach ($fr in $frLogs) {
+        Write-Host "--- FREB log: $($fr.FullName) ---"
+        Get-Content $fr.FullName -TotalCount 120 | ForEach-Object { Write-Host "  $_" }
+    }
+    if (-not $frLogs) { Write-Host "FREB: no fr*.xml logs produced under $frebDir" }
+
     throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
