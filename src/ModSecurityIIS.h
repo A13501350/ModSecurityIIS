@@ -20,6 +20,10 @@ enum BodyReadState
     BRS_DONE = 2         // body finished; late/foreign completions are ignored
 };
 
+// Size of each ReadEntityBody chunk. The staging buffer (m_ReadBuf below)
+// is allocated with this exact size on demand in BeginBodyRead.
+constexpr DWORD kBodyReadChunkSize = 65536;
+
 class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 {
  public:
@@ -93,7 +97,10 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // The entity body is drained chunk by chunk into m_Body and handed back to
     // IIS with a SINGLE InsertEntityBody() once the body is complete.
     std::vector<char>         m_Body;
-    char                      m_ReadBuf[65536];
+    // Per-read staging buffer, allocated on demand in BeginBodyRead: bodyless
+    // requests (the common GET) must not carry 64 KiB of dead weight in their
+    // stored context.
+    std::vector<char>         m_ReadBuf;
     // What the request declared about its body (cached at BeginRequest so the
     // stop condition holds across async completions).
     bool                      m_HasBody;
