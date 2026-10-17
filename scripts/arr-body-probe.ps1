@@ -27,8 +27,10 @@
 # or, against an already-installed module:
 #   $env:MODSEC_IIS_ARR_MSI = ""; ./scripts/arr-body-probe.ps1
 #
-# The CI workflow .github/workflows/arr-body-probe.yml drives this on
-# windows-latest (builds/reuses the MSI, sets up Go, runs this).
+# Driven by .github/workflows/arr-body-probe.yml, which lives on the working
+# branches (bench/v2-v3-perf etc.) -- NOT on master, where only the mainline
+# Build ModSecurityIIS pipeline stays. Locally:
+#   ./scripts/arr-body-probe.ps1 -Msi <path-to.msi>
 
 [CmdletBinding()]
 param(
