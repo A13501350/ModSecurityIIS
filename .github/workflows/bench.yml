@@ -55,6 +55,12 @@ on:
         description: 'Requests/sec when mode = latency'
         required: false
         default: '500'
+      v3_body_modes:
+        description: 'v3 entity-body read paths to measure (sync forces MODSEC_IIS_BODY_ASYNC=0; async is the ARR-model default)'
+        required: false
+        default: 'sync,async'
+        type: choice
+        options: ['sync,async', 'async', 'sync']
 
 jobs:
   # Cheap parse gate, with no dependencies so it runs in parallel with the
@@ -332,9 +338,11 @@ jobs:
           BENCH_DURATION:    ${{ inputs.duration    || '20s'        }}
           BENCH_MODE:        ${{ inputs.mode        || 'throughput' }}
           BENCH_RATE:        ${{ inputs.rate        || '500'        }}
+          BENCH_V3_MODES:    ${{ inputs.v3_body_modes || 'sync,async' }}
         run: |
           foreach ($k in 'BENCH_RULESETS','BENCH_SCENARIOS','BENCH_CONCURRENCY',
-                         'BENCH_REPEATS','BENCH_DURATION','BENCH_MODE','BENCH_RATE') {
+                         'BENCH_REPEATS','BENCH_DURATION','BENCH_MODE','BENCH_RATE',
+                         'BENCH_V3_MODES') {
             $v = [Environment]::GetEnvironmentVariable($k)
             Add-Content $env:GITHUB_ENV "$k=$v"
             Write-Host "$k=$v"
@@ -355,6 +363,7 @@ jobs:
             -Duration $env:BENCH_DURATION `
             -Mode $env:BENCH_MODE `
             -Rate $env:BENCH_RATE `
+            -V3BodyModes ($env:BENCH_V3_MODES -split ',' | ForEach-Object { $_.Trim() }) `
             -OutFile bench-raw.csv
 
       # Guarded on the CSV: these are bookkeeping steps, and when the benchmark

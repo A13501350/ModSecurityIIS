@@ -30,6 +30,12 @@
 .PARAMETER Duration   Duration of a single bombardier run, e.g. 20s.
 .PARAMETER Mode       throughput (full tilt) or latency (-r fixed arrival rate).
 .PARAMETER Rate       Requests/sec for -Mode latency.
+.PARAMETER V3BodyModes  Which v3 body-read paths to measure. The v3 connector
+                        defaults to the async ARR-model state machine on this
+                        branch; "sync" forces MODSEC_IIS_BODY_ASYNC=0 (the
+                        master synchronous path). v2 and baseline are
+                        unaffected. Default: both, so the run yields a v3
+                        sync-vs-async comparison alongside v2-vs-v3.
 #>
 [CmdletBinding()]
 param(
@@ -42,6 +48,7 @@ param(
     [string]$Duration   = "20s",
     [ValidateSet("throughput", "latency")][string]$Mode = "throughput",
     [int]$Rate          = 500,
+    [ValidateSet("sync", "async")][string[]]$V3BodyModes = @("sync", "async"),
     [string]$OutFile    = "bench-raw.csv",
     [string]$JsonDir    = "bench-json"
 )
@@ -235,14 +242,30 @@ if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
 try {
     foreach ($ruleset in $Rulesets) {
         for ($rep = 1; $rep -le $Repeats; $rep++) {
-            # Arms interleaved inside every repetition: baseline, v2, v3.
-            foreach ($arm in @("baseline", "v2", "v3")) {
+            # Arms interleaved inside every repetition: baseline, v2, then the
+            # requested v3 body-read modes. Each v3 mode installs the same v3
+            # DLL with a different MODSEC_IIS_BODY_ASYNC pool env var.
+            $arms = @("baseline", "v2") + @($V3BodyModes | ForEach-Object { "v3-$_" })
+            foreach ($arm in $arms) {
 
-                $config = if ($arm -eq "baseline") { "" } else { New-Config $arm $ruleset }
-                $dllDir = if ($arm -eq "v2") { $V2DllDir } elseif ($arm -eq "v3") { $V3DllDir } else { "" }
+                # Map the labelled arm to the install triple:
+                #   (installArm, bodyReadMode, configArm, dllDir)
+                if ($arm -eq "baseline") {
+                    $installArm = "baseline"; $bodyMode = "async"
+                    $config = ""; $dllDir = ""
+                } elseif ($arm -eq "v2") {
+                    $installArm = "v2"; $bodyMode = "async"
+                    $config = New-Config "v2" $ruleset; $dllDir = $V2DllDir
+                } else {
+                    # v3-sync / v3-async
+                    $bodyMode = $arm.Substring(3)   # "sync" or "async"
+                    $installArm = "v3"
+                    $config = New-Config "v3" $ruleset; $dllDir = $V3DllDir
+                }
 
                 Write-Host "== rep $rep/$Repeats  arm=$arm  ruleset=$ruleset"
-                Install-Arm -Arm $arm -DllDir $dllDir -ConfigFile $config
+                Install-Arm -Arm $installArm -DllDir $dllDir -ConfigFile $config `
+                            -BodyReadMode $bodyMode
 
                 # Warm up ARR, the origin's connection pool and the connector's
                 # rules load. Not recorded, and taken before the first CPU

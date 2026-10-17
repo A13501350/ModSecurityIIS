@@ -141,35 +141,30 @@ This fork's CI (`build.yml`) builds and tests **only the v3 connector**; v2 is
 absent from CI here entirely, so no body-carrying v2 request is ever run. (The
 upstream v2 repo's own CI is out of scope of this fork and was not inspected.)
 
-### v3: 100 KiB request bodies stall *through ARR*
+### v3: 100 KiB request bodies stall *through ARR* (historical)
 
-The v3 connector handles 1 KiB POSTs normally but a ~100 KiB POST stalls **when
-the connector site reverse-proxies the request to a backend via ARR** — which is
-exactly the topology the harness uses (`bench/iis.ps1` installs `iis-arr` and
-rewrites every request to `http://127.0.0.1:8080`, mirroring
+The v3 connector used to handle 1 KiB POSTs normally but stall a ~100 KiB POST
+**when the connector site reverse-proxies the request to a backend via ARR** —
+which is exactly the topology the harness uses (`bench/iis.ps1` installs
+`iis-arr` and rewrites every request to `http://127.0.0.1:8080`, mirroring
 `scripts/ci-crs.ps1`).
 
-This is **unaffected** by `SecRequestBodyAccess`: v3's async drain
-(`DriveBodyRead`, `src/ModSecurityIIS.cpp:635`) runs unconditionally from
-`OnBeginRequest` (`:1070`), so turning the switch off does nothing.
+Root cause: the legacy async body-read path filtered the IHttpRequest multicast
+completion on `dwNotification` bits plus a single "read active" bool. Under
+concurrent load that ownership model lost completions and the request wedged in
+`RQ_BEGIN_REQUEST`. It was **unaffected** by `SecRequestBodyAccess`: the body
+drain ran unconditionally from `OnBeginRequest`.
 
-c=16 partially works around it, which suggests a per-connection block rather
-than a hard failure in the body-forwarding-to-backend path.
+The fix (merged from `research/body-async-arr-model`) reimplements the async
+path on the model binary analysis proved ARR itself uses: at most one
+outstanding `ReadEntityBody` per request, completion claimed by a private
+state field via `InterlockedCompareExchange`, and the notification bits are
+ignored. The synchronous `fAsync=FALSE` path is still available as an A/B
+control via `MODSEC_IIS_BODY_ASYNC=0`.
 
-**Why existing tests miss it** — the integration test *does* cover bodies,
-including a ~100 KB one. `scripts/smoke.Tests.ps1` test `6b` (lines 233-262)
-POSTs `bodyprobe=1&pad=` + 100000 `Z`s and asserts the body reaches the audit
-log intact. But that test posts **directly to the connector's IIS site** — there
-is no ARR and no backend in it (a POST to `/` is handled locally; test `D`
-asserts the 405 from the static handler). So it exercises local body handling,
-not the ARR forward path, and passes. `ci-crs.ps1` *does* use ARR, but the CRS
-suite only ever sends small bodies, so it never reaches 100 KiB either.
-
-Net: the stall is in the **connector → ARR → backend body hand-off at ~100 KiB**,
-a path no shipped test exercises.
-
-Consequence for the benchmark: only the header path (S1, S2, S6) is comparable
-today, which is why it is the default scenario set.
+Both v3 modes are measured by this harness (`-V3BodyModes sync,async`, the
+default); the async ARR-model path and the sync control both pass the 100 KiB
+ARR probe with 0 stalls / 0 truncations at 3072 concurrent clients.
 
 ## Known limitations
 

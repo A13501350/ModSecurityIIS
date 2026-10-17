@@ -54,6 +54,12 @@ function Initialize-BenchSite {
     & $script:AppCmd set apppool $script:PoolName /processModel.maxProcesses:1 | Out-Null
     & $script:AppCmd set apppool $script:PoolName /processModel.idleTimeout:00:00:00 | Out-Null
 
+    # The v3 connector's body-read mode is selected via the w3wp process
+    # environment (MODSEC_IIS_BODY_ASYNC). Default on this branch is async;
+    # set it to 0 to force the synchronous master path. We mutate the pool's
+    # environmentVariables collection per arm, so start clean.
+    Clear-BodyReadEnv
+
     $webConfig = Join-Path $script:SiteRoot "web.config"
     @"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -147,6 +153,44 @@ function Initialize-ModSecuritySection {
 # Arm install / uninstall
 # ---------------------------------------------------------------------------
 
+# The v3 connector reads MODSEC_IIS_BODY_ASYNC from the w3wp environment.
+# Default on this branch is ASYNC (the ARR-model state machine); an explicit
+# 0 opts into the synchronous master path. v2 and baseline ignore the var.
+# These two helpers mutate the app pool's processModel/environmentVariables
+# collection via the WebAdministration provider so the change lands before the
+# next iisreset starts w3wp.
+function Set-BodyReadEnv {
+    param([ValidateSet("sync", "async")][string]$Mode = "async")
+
+    Import-Module WebAdministration -ErrorAction Stop
+    $filter = "system.applicationHost/applicationPools/add[@name='$script:PoolName']/processModel/environmentVariables"
+
+    # Remove any previous value so sync<->async switches don't stack entries.
+    try {
+        Remove-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+            -Filter $filter -Name '.' `
+            -AtElement @{ name = 'MODSEC_IIS_BODY_ASYNC' } `
+            -ErrorAction SilentlyContinue
+    } catch { }
+
+    if ($Mode -eq "sync") {
+        Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+            -Filter $filter -Name '.' `
+            -Value @{ name = 'MODSEC_IIS_BODY_ASYNC'; value = '0' }
+    }
+}
+
+function Clear-BodyReadEnv {
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        $filter = "system.applicationHost/applicationPools/add[@name='$script:PoolName']/processModel/environmentVariables"
+        Remove-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+            -Filter $filter -Name '.' `
+            -AtElement @{ name = 'MODSEC_IIS_BODY_ASYNC' } `
+            -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Uninstall-Arm {
     # Disable through appcmd (AHADMIN), then unregister the module and drop the
     # binaries. The section DECLARATION is permanent for the job, so nothing
@@ -168,20 +212,32 @@ function Uninstall-Arm {
 
 # Installs one connector. $DllDir must contain modsecurityiis.dll; for v3 it
 # must also contain libModSecurity.dll. $ConfigFile is the ModSecurity config
-# the connector is pointed at.
+# the connector is pointed at. $BodyReadMode selects the v3 entity-body read
+# path (sync forces MODSEC_IIS_BODY_ASYNC=0; async is the branch default).
+# Ignored for baseline/v2.
 function Install-Arm {
     param(
         [Parameter(Mandatory)][ValidateSet("baseline", "v2", "v3")][string]$Arm,
         [string]$DllDir,
-        [string]$ConfigFile
+        [string]$ConfigFile,
+        [ValidateSet("sync", "async")][string]$BodyReadMode = "async"
     )
 
     Uninstall-Arm
 
     if ($Arm -eq "baseline") {
+        Clear-BodyReadEnv
         Restart-IIS
         Write-Host "== arm 'baseline': no WAF module installed"
         return
+    }
+
+    # Select the body-read path BEFORE iisreset so the fresh w3wp inherits it.
+    if ($Arm -eq "v3") {
+        Set-BodyReadEnv -Mode $BodyReadMode
+        Write-Host "== arm 'v3' body-read mode: $BodyReadMode"
+    } else {
+        Clear-BodyReadEnv
     }
 
     Assert-True (Test-Path (Join-Path $DllDir "modsecurityiis.dll")) "connector DLL present for $Arm"
