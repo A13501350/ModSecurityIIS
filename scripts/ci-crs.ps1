@@ -248,6 +248,24 @@ if (-not $owned) {
     Write-Host "site inventory at ownership-check failure:"
     & $appcmd list sites
     & $appcmd list site $SiteName
+
+    # Snapshot IIS config + logs so the artifact explains what actually served
+    # the request. Copy into the upload tree before any further mutation.
+    $diagRoot = "$ConfRoot\diag"
+    New-Item -ItemType Directory -Force $diagRoot | Out-Null
+    Copy-Item "$env:windir\System32\inetsrv\config\applicationHost.config" "$diagRoot\applicationHost.config" -Force -ErrorAction SilentlyContinue
+    Copy-Item "$env:windir\System32\inetsrv\config\administration.config"  "$diagRoot\administration.config"  -Force -ErrorAction SilentlyContinue
+    $w3svcLogs = "C:\inetpub\logs\LogFiles"
+    if (Test-Path $w3svcLogs) {
+        Get-ChildItem $w3svcLogs -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 5 |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path $diagRoot $_.Name) -Force }
+    }
+    Write-Host "handler mappings for site:"
+    & $appcmd list config $SiteName /section:system.webServer/handlers 2>&1 | Select-Object -First 30
+    Write-Host "global modules:"
+    & $appcmd list modules 2>&1 | Select-Object -First 20
+
     Write-Host "raw response bytes (first 256):"
     try {
         $raw = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -TimeoutSec 10
