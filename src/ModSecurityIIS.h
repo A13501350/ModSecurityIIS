@@ -7,13 +7,28 @@
 #include <memory>
 #include <vector>
 
+// ARR-model asynchronous entity-body state machine. At most ONE async
+// ReadEntityBody is outstanding per request; the completion is claimed by
+// swapping this state, never by filtering the multicast notification bits
+// (research/body-async-arr-model, modeled on FORWARDING_HANDLER::
+// OnAsyncCompletion in requestRouter.dll, which ignores dwNotification and
+// dispatches on its private handler state).
+enum BodyReadState
+{
+    BRS_IDLE = 0,        // no outstanding read
+    BRS_READ_PENDING = 1,// exactly one async ReadEntityBody in flight
+    BRS_DONE = 2         // body finished; late/foreign completions are ignored
+};
+
 class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 {
  public:
     REQUEST_STORED_CONTEXT()
         : m_pTx(nullptr), m_pHttpContext(nullptr),
-          m_ResponseHeadersFed(false), m_BodyReadActive(false),
-          m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false)
+          m_ResponseHeadersFed(false),
+          m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false),
+          m_HasBody(false), m_DeclaredBodyLength(0),
+          m_BodyReadState(BRS_IDLE)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -79,10 +94,14 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // IIS with a SINGLE InsertEntityBody() once the body is complete.
     std::vector<char>         m_Body;
     char                      m_ReadBuf[65536];
-    // True while an async ReadEntityBody() is in flight. Only ever set on the
-    // LEGACY async path (MODSEC_IIS_BODY_ASYNC=1); the default synchronous
-    // path never leaves a read pending.
-    bool                      m_BodyReadActive;
+    // What the request declared about its body (cached at BeginRequest so the
+    // stop condition holds across async completions).
+    bool                      m_HasBody;
+    ULONGLONG                 m_DeclaredBodyLength;   // 0 == unknown/chunked
+    // ARR-model single-outstanding-read state; interlocked because the
+    // completion may arrive on an IIS I/O thread while BeginRequest returned
+    // PENDING. See the BodyReadState enum above.
+    volatile LONG             m_BodyReadState;
 };
 
 
@@ -109,10 +128,9 @@ public:
         IN IHttpEventProvider * pProvider
     ) override;
 
-    // Entity-body reads are SYNCHRONOUS by default (see DriveBodyRead): both
-    // async completion mechanisms lost completions under concurrent load, so
-    // there is no per-operation callback involvement. The legacy multicast
-    // handler below is retained DISABLED for reference/debugging only.
+    // Entity-body reads follow the ARR state-machine model (see the
+    // BodyReadState enum): asynchronous by default on this research branch,
+    // fAsync=FALSE available via MODSEC_IIS_BODY_ASYNC=0 for A/B comparison.
     REQUEST_NOTIFICATION_STATUS
     OnAsyncCompletion(
         IN IHttpContext * pHttpContext,
@@ -130,22 +148,30 @@ public:
     BOOL WriteEventViewerLog(LPCSTR szNotification, WORD category = EVENTLOG_INFORMATION_TYPE);
 
 private:
-    // Drains the request entity body, stopping on EOF / error / once the
-    // declared Content-Length is consumed. Two modes:
-    //  - DEFAULT: SYNCHRONOUS ReadEntityBody() calls (fAsync=FALSE), the whole
-    //    body consumed and re-inserted before returning -- no async operation
-    //    exists that could be lost (diag/arr-body-stall).
-    //  - MODSEC_IIS_BODY_ASYNC=1: legacy ASYNCHRONOUS reads whose completions
-    //    resume via OnAsyncCompletion (retained for reference; known to lose
-    //    completions under concurrent load).
-    // Short reads NEVER mean end-of-body in either mode.
+    // First entry from OnBeginRequest: resolve what the request declares,
+    // pre-size the accumulator, then pump reads.
     static REQUEST_NOTIFICATION_STATUS
-    DriveBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
+    BeginBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
+
+    // Issues ReadEntityBody calls until one goes pending (returns
+    // RQ_NOTIFICATION_PENDING) or the body finishes. Inline-completed chunks
+    // are consumed in a loop; a pended read resumes in OnAsyncCompletion,
+    // which re-enters here to chain the next read -- the same continuation
+    // shape ARR's FORWARDING_HANDLER uses.
+    static REQUEST_NOTIFICATION_STATUS
+    PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
+
+    // Appends one completed chunk and applies the stop conditions (EOF /
+    // error / declared Content-Length / inspection cap). Returns true when
+    // another read must be issued; false with *pStatus holding the final
+    // notification status (FinishBodyRead already ran).
+    static bool
+    ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
+                     DWORD cb, HRESULT hr,
+                     REQUEST_NOTIFICATION_STATUS* pStatus);
 
     // Restores the drained entity body for the downstream handler, feeds it to
-    // the engine and applies any intervention. `reason` names the stop
-    // condition (body-trace diagnostics only).
+    // the engine and applies any intervention.
     static REQUEST_NOTIFICATION_STATUS
-    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
-                   const char* reason);
+    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 };

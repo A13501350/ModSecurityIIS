@@ -51,15 +51,21 @@ param(
     # around it"), so a single-request probe is not enough to reproduce it.
     [int]   $LoadClients    = 16,
     [int]   $LoadReps       = 4,
-    # Extra rounds of the c16 phase: the cheap body-trace perturbs the race
-    # somewhat (v15 saw 1/256 vs 17-24/256 untraced), so sample more requests
-    # per run to accumulate enough stalls for the trace verdict.
+    # Extra rounds of the c16 phase: sample more requests per run to accumulate
+    # enough stalls to make the verdict robust.
     [int]   $LoadRounds     = 1,
     # Opt-in IIS Failed Request Tracing (FREB). Off by default; enable via -Freb
     # or $env:MODSEC_IIS_FREB=1. When on, the connector+ARR pipeline is traced
     # and stalled 100 KiB POSTs are captured so the blocking stage can be pinned
     # (connector body-read vs ARR forward). See Enable-Freb / Get-FrebSummary.
-    [switch]$Freb
+    [switch]$Freb,
+    # Entity-body read path under test:
+    #   async (default on research/body-async-arr-model): fAsync=TRUE with the
+    #       ARR-model single-outstanding-read state machine;
+    #   sync: sets MODSEC_IIS_BODY_ASYNC=0 on the probe app pool, forcing the
+    #       shipping master fAsync=FALSE loop, as an in-run A/B control.
+    [ValidateSet('async','sync')]
+    [string]$BodyReadMode = 'async'
 )
 
 $ErrorActionPreference = "Stop"
@@ -255,16 +261,6 @@ if (-not (Get-Command $BackendExe -ErrorAction SilentlyContinue)) {
 }
 
 # ---------------------------------------------------------------------------
-# 0b) body-trace (diag branch instrumentation). The connector (this branch)
-#     logs every entity-body state transition when MODSEC_IIS_BODY_TRACE=1 and
-#     MODSEC_IIS_TRACE_FILE are set in the w3wp environment. Set them at
-#     machine level before any iisreset so the worker processes inherit them.
-# ---------------------------------------------------------------------------
-[Environment]::SetEnvironmentVariable("MODSEC_IIS_BODY_TRACE", "1", "Machine")
-[Environment]::SetEnvironmentVariable("MODSEC_IIS_TRACE_FILE",
-    (Join-Path $ConfRoot "data\body-trace.log"), "Machine")
-
-# ---------------------------------------------------------------------------
 # 1) ensure IIS
 # ---------------------------------------------------------------------------
 $features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, `
@@ -372,6 +368,22 @@ Set-Content (Join-Path $SiteRoot "hello.txt") "hello from arr probe" -Encoding A
 & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
 & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
 & $appcmd set app "$SiteName/" /applicationPool:$PoolName
+
+# ---------------------------------------------------------------------------
+# 5a) body-read A/B switch. The app-pool process environment is read when
+#     w3wp starts (iisreset happens below), so this lands before any request.
+# ---------------------------------------------------------------------------
+if ($BodyReadMode -eq 'sync') {
+    Write-Host "[body] forcing synchronous reads: MODSEC_IIS_BODY_ASYNC=0 on pool $PoolName"
+    # WebAdministration is not auto-loaded in PowerShell 7; the IIS features
+    # installed earlier provide it.
+    Import-Module WebAdministration
+    Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Filter "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables" `
+        -Name '.' -Value @{ name = 'MODSEC_IIS_BODY_ASYNC'; value = '0' }
+} else {
+    Write-Host "[body] async ARR-model reads (default; MODSEC_IIS_BODY_ASYNC unset)"
+}
 
 $poolId = "IIS AppPool\$PoolName"
 icacls "$ConfRoot\data" /grant "${poolId}:(OI)(CI)M" | Out-Null
@@ -618,94 +630,6 @@ if ($missing -gt 0) {
     Write-Host "[BACKEND] (connector DriveBodyRead/InsertEntityBody or ARR before forwarding)."
 } else {
     Write-Host "[BACKEND] all requests reached the backend => stall is on the response path back to the client."
-}
-
-# Read a file that a live process holds open for writing (the connector keeps
-# body-trace.log open with a persistent handle). Select-String / Copy-Item open
-# with FileShare.Read only and fail with EBUSY; open with ReadWrite sharing.
-function Get-SharedLines([string]$Path) {
-    if (-not (Test-Path $Path)) { return @() }
-    try {
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
-                                     [System.IO.FileAccess]::Read,
-                                     [System.IO.FileShare]::ReadWrite)
-        try {
-            $sr = New-Object System.IO.StreamReader($fs)
-            try {
-                return @(($sr.ReadToEnd() -split "`r?`n") | Where-Object { $_ -ne '' })
-            } finally { $sr.Close() }
-        } finally { $fs.Close() }
-    } catch {
-        Write-Warning ("[BODYTRACE] cannot read {0}: {1}" -f $Path, $_.Exception.Message)
-        return @()
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 6c) body-trace verdict -- decide between the three stall hypotheses using the
-#     connector's entity-body trace (enabled via MODSEC_IIS_BODY_TRACE):
-#       FINISH size == declared  => full body WAS inserted; the entity pipe
-#                                   lost the "more data" signal toward ARR
-#                                   (IIS-side, hypothesis C1)
-#       FINISH size < declared   => the connector finished the read EARLY on a
-#                                   misjudged short-read/EOF (the reason=
-#                                   field names the exact stop condition;
-#                                   hypothesis: misjudged EOF)
-#       BEGIN without FINISH     => a completion the module never saw --
-#                                   the request wedged in BEGIN_REQUEST
-#                                   (hypothesis C2)
-#       INSERT hr != 0           => InsertEntityBody itself failed (C3)
-#       ASYNC-ABNORMAL lines     => completions that failed the ownership
-#                                   filter (C2 evidence, one line each)
-# ---------------------------------------------------------------------------
-$traceLog = Join-Path $ConfRoot "data\body-trace.log"
-$traceLines = Get-SharedLines $traceLog
-if ($traceLines.Count -eq 0) {
-    Write-Host "[BODYTRACE] no readable trace at $traceLog (env var did not reach w3wp?)."
-} else {
-    $begins = @($traceLines | Where-Object { $_ -match 'BEGIN rsc=([0-9A-Fa-f]+)' })
-    $finishes = foreach ($l in ($traceLines |
-            Where-Object { $_ -match 'FINISH rsc=([0-9A-Fa-f]+) reason=(\S+) size=(\d+)' })) {
-        if ($l -match 'FINISH rsc=([0-9A-Fa-f]+) reason=(\S+) size=(\d+)') {
-            [pscustomobject]@{ Rsc = $Matches[1]; Reason = $Matches[2];
-                               Size = [long]$Matches[3]; Line = $l }
-        }
-    }
-    $bRsc = $begins | ForEach-Object { if ($_ -match 'BEGIN rsc=([0-9A-Fa-f]+)') { $Matches[1] } } |
-            Sort-Object -Unique
-    $fRsc = $finishes | ForEach-Object { $_.Rsc } | Sort-Object -Unique
-    $wedged = @($bRsc | Where-Object { $fRsc -notcontains $_ })
-    Write-Host ("[BODYTRACE] began={0} finished={1} wedged(no-FINISH)={2}" -f `
-        $bRsc.Count, $fRsc.Count, $wedged.Count)
-
-    $reasons = $finishes | Group-Object Reason | Sort-Object Count -Descending
-    Write-Host ("[BODYTRACE] finish reasons: " +
-        (($reasons | ForEach-Object { "{0}={1}" -f $_.Name, $_.Count }) -join " "))
-
-    # Declared sizes seen in the trace (102400 = probe target, 1024 = control).
-    $short = @($finishes | Where-Object {
-        $_.Size -ne 0 -and $_.Size -ne 102400 -and $_.Size -ne 1024
-    })
-    Write-Host ("[BODYTRACE] SHORT finishes (size not 0/1024/102400 -- misjudged-EOF evidence): {0}" -f `
-        $short.Count)
-    $short | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_.Line) }
-
-    $badInsert = @($traceLines | Where-Object { $_ -match 'INSERT .*hr=0x0*[1-9a-fA-F]' })
-    Write-Host ("[BODYTRACE] INSERT failures: {0}" -f $badInsert.Count)
-    $badInsert | Select-Object -First 5 | ForEach-Object { Write-Host ("  " + $_) }
-
-    $abnormal = @($traceLines | Where-Object { $_ -match 'ASYNC-ABNORMAL' })
-    Write-Host ("[BODYTRACE] abnormal completions (ownership-filter rejects / zero / failed): {0}" -f `
-        $abnormal.Count)
-    $abnormal | Select-Object -First 10 | ForEach-Object { Write-Host ("  " + $_) }
-
-    if ($wedged.Count -gt 0) {
-        Write-Host "[BODYTRACE] wedged rsc ids (first 5): $($wedged | Select-Object -First 5)"
-    }
-    # Keep a share-tolerant copy for the artifact upload (the original stays
-    # locked by w3wp until IIS stops).
-    $copy = Join-Path $ConfRoot "body-trace-copy.log"
-    Set-Content -Path $copy -Value $traceLines -Encoding Ascii
 }
 
 # ---------------------------------------------------------------------------

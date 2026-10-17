@@ -47,6 +47,14 @@ on:
         required: false
         default: ''
         type: string
+      body_read_mode:
+        description: 'Entity-body read path: async = ARR-model fAsync=TRUE state machine (default); sync = MODSEC_IIS_BODY_ASYNC=0 master control'
+        required: false
+        default: 'async'
+        type: choice
+        options:
+          - async
+          - sync
   # No push trigger on purpose: pushing a commit to diag/** would spawn a full
   # ~13-min build for no reason. This is a diagnostic probe -- drive it by
   # workflow_dispatch only, reusing an existing build via build_run_id.
@@ -101,7 +109,7 @@ jobs:
         with:
           arch: x64
 
-      - uses: ammaraskar/msvc-problem-matcher@0.3.0
+      - uses: ammaraskar/msvc-problem-matcher@master
         if: ${{ inputs.build_run_id == '' }}
 
       - name: Configure
@@ -199,6 +207,7 @@ jobs:
           if ("${{ inputs.load_clients }}" -ne '') { $ht['LoadClients'] = "${{ inputs.load_clients }}" }
           if ("${{ inputs.load_reps }}" -ne '')    { $ht['LoadReps']    = "${{ inputs.load_reps }}" }
           if ("${{ inputs.load_rounds }}" -ne '')  { $ht['LoadRounds']  = "${{ inputs.load_rounds }}" }
+          $ht['BodyReadMode'] = "${{ inputs.body_read_mode }}"
           ./scripts/arr-body-probe.ps1 @ht
 
       - name: Upload probe diagnostics
