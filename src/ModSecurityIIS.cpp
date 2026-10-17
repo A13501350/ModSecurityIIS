@@ -1568,7 +1568,13 @@ CMyHttpModule::OnSendResponse(
             // Complete body available in this notification. Disable chunked
             // framing (set Content-Length) so a block-replace is clean, then
             // evaluate phase-4 synchronously and block if a rule matches.
-            if (pProvider->GetHeadersBeingSent() && respInspected < maxInspect &&
+            // Only override when we actually have body bytes to report: a
+            // headers-only first notification (EntityChunkCount==0) leaves
+            // respInspected at 0, and pinning Content-Length to "0" there
+            // makes http.sys drop the real body when it arrives in the next
+            // notification -- the "200 with empty body" signature.
+            if (respInspected > 0 && pProvider->GetHeadersBeingSent() &&
+                respInspected < maxInspect &&
                 pHttpContext->GetResponse()->GetHeader(HttpHeaderContentLength) == NULL)
             {
                 CHAR szLength[21];
