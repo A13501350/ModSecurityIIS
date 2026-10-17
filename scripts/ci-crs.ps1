@@ -1,8 +1,7 @@
-# CRS regression stage for ModSecurityIIS. Runs AFTER ci-smoke.ps1 in the
-# same job (module already deployed, site/app pool exist). CRS rules are
-# loaded directly; the IIS site proxies every request to the albedo echo
-# backend via URL Rewrite + ARR, and go-ftw replays the official CRS
-# regression tests, asserting status codes and audit-log rule hits.
+# CRS regression stage for ModSecurityIIS. Runs as a standalone CI job.
+# CRS rules are loaded directly; the IIS site proxies every request to the
+# albedo echo backend via URL Rewrite + ARR, and go-ftw replays the official
+# CRS regression tests, asserting status codes and audit-log rule hits.
 
 [CmdletBinding()]
 param(
@@ -29,19 +28,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
 
 # --- 0b) standalone-job bootstrap ----------------------------------------------
-# This script used to run AFTER ci-smoke.ps1 in the same job, where the MSI was
-# already installed and the site already existed. It now runs as its own CI job
-# on a fresh runner, so it bootstraps whatever is missing:
-#   * IIS static-content feature (absent on the windows-latest runner image:
-#     without it the StaticFile handler maps to DefaultDocumentModule only,
-#     which returns 200 with Content-Length: 0 for .txt -- the signature that
-#     kept failing the ownership check);
-#   * module not registered and -Msi given -> install the MSI (schema +
-#     modsecurity.conf + module registration), then restart IIS so the config
-#     system sees the new section;
-#   * site/app pool missing -> create them. hello.txt is written
-#     unconditionally: the port-80 ownership check in step 3 matches its
-#     content.
+# Bootstraps whatever is missing on a fresh runner:
+#   * IIS static-content feature (without it the StaticFile handler maps to
+#     DefaultDocumentModule only, which returns 200 with Content-Length: 0);
+#   * module not registered and -Msi given -> install the MSI, then restart IIS;
+#   * site/app pool missing -> create them. hello.txt is written unconditionally:
+#     the port-80 ownership check in step 3 matches its content.
 $features = Get-WindowsFeature Web-Static-Content, Web-Default-Doc, Web-Http-Errors, Web-Filtering -ErrorAction SilentlyContinue
 if ($features | Where-Object { -not $_.Installed }) {
     Write-Host "== Installing missing IIS features =="
@@ -77,12 +69,7 @@ $siteExists = [bool](& $appcmd list site $SiteName 2>$null | Select-String $Site
 if (-not $siteExists) {
     Write-Host "== Creating site $SiteName (bootstrap) =="
     & $appcmd add apppool /name:$PoolName
-    # No managed runtime: ModSecurity is a native module and the test site only
-    # serves static files. Leaving the CLR on lets ASP.NET's integrated pipeline
-    # intercept .txt requests (DefaultHttpHandler returns 200 with an empty body
-    # -- the signature seen at the ownership check). smoke.Tests.ps1 relies on
-    # the static-file handler returning 405 for POST to hello.txt; the same
-    # handler must serve hello.txt here.
+    # No managed runtime: the test site only serves static files.
     & $appcmd set apppool $PoolName /managedRuntimeVersion:"" /processModel.loadUserProfile:false
     & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
     & $appcmd set app "$SiteName/" /applicationPool:$PoolName
@@ -189,12 +176,9 @@ SecRuleRemoveById 920273
 Write-Host "[2/8] Engine config written ($conf)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
-# responseBodyBlock starts OFF for the ownership check: the connector's
-# response-body buffer path currently pins Content-Length to 0 on the
-# headers-only first notification for small static responses, which makes
-# http.sys drop hello.txt's body (200 with empty body). The check below
-# needs the real body to confirm THIS site owns port 80; we flip it back ON
-# right after the check passes so CRS phase-4 rules run normally.
+# responseBodyBlock starts OFF for the ownership check so small static
+# responses (hello.txt) are served with their real body; flip it back ON
+# after the check passes so CRS phase-4 rules run normally.
 & $appcmd set config $SiteName /section:ModSecurity `
     /enabled:true /configFile:$conf /responseBodyBlock:false /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
@@ -224,11 +208,7 @@ foreach ($i in 1..30) {
     Start-Sleep -Seconds 1
 }
 
-# Assert THIS site owns port 80 before anything else depends on it. Retry a
-# few times: WAS may still be activating bindings right after iisreset, and
-# each attempt logs the status + response body so a wrong-content failure is
-# self-diagnosing (iisstart.htm = the Default Web Site came back from the
-# dead; hello.txt = something else transformed the response).
+# Assert THIS site owns port 80 before anything else depends on it.
 $owned = $false
 foreach ($attempt in 1..3) {
     try {
@@ -259,9 +239,7 @@ if (-not $owned) {
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
 
-# Re-enable response-body blocking now that ownership is confirmed; the
-# step-4 web.config also pins responseBodyBlock="true", but set it here too
-# so the value is correct even if the web.config write is skipped.
+# Re-enable response-body blocking now that ownership is confirmed.
 & $appcmd set config $SiteName /section:ModSecurity /responseBodyBlock:true /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (responseBodyBlock:true) failed." }
 Write-Host "[3b/8] responseBodyBlock enabled for CRS tests."
