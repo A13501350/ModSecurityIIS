@@ -59,7 +59,14 @@ param(
     # or $env:MODSEC_IIS_FREB=1. When on, the connector+ARR pipeline is traced
     # and stalled 100 KiB POSTs are captured so the blocking stage can be pinned
     # (connector body-read vs ARR forward). See Enable-Freb / Get-FrebSummary.
-    [switch]$Freb
+    [switch]$Freb,
+    # Entity-body read path under test:
+    #   async (default on research/body-async-arr-model): fAsync=TRUE with the
+    #       ARR-model single-outstanding-read state machine;
+    #   sync: sets MODSEC_IIS_BODY_ASYNC=0 on the probe app pool, forcing the
+    #       shipping master fAsync=FALSE loop, as an in-run A/B control.
+    [ValidateSet('async','sync')]
+    [string]$BodyReadMode = 'async'
 )
 
 $ErrorActionPreference = "Stop"
@@ -372,6 +379,19 @@ Set-Content (Join-Path $SiteRoot "hello.txt") "hello from arr probe" -Encoding A
 & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
 & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
 & $appcmd set app "$SiteName/" /applicationPool:$PoolName
+
+# ---------------------------------------------------------------------------
+# 5a) body-read A/B switch. The app-pool process environment is read when
+#     w3wp starts (iisreset happens below), so this lands before any request.
+# ---------------------------------------------------------------------------
+if ($BodyReadMode -eq 'sync') {
+    Write-Host "[body] forcing synchronous reads: MODSEC_IIS_BODY_ASYNC=0 on pool $PoolName"
+    Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Filter "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables" `
+        -Name '.' -Value @{ name = 'MODSEC_IIS_BODY_ASYNC'; value = '0' }
+} else {
+    Write-Host "[body] async ARR-model reads (default; MODSEC_IIS_BODY_ASYNC unset)"
+}
 
 $poolId = "IIS AppPool\$PoolName"
 icacls "$ConfRoot\data" /grant "${poolId}:(OI)(CI)M" | Out-Null
