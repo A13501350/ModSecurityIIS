@@ -177,11 +177,23 @@ Write-Host "[2/8] Engine config written ($conf)"
     /enabled:true /configFile:$conf /responseBodyBlock:true /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
-# go-ftw targets http://localhost (port 80) by default. Delete the Default
-# Web Site to win the :80 binding race.
+# go-ftw targets http://localhost (port 80) by default. Take the :80 binding.
+# Every step here is exit-code verified: a SILENT failure of the Default Web
+# Site deletion leaves its iisstart.htm answering on :80 (200 with the wrong
+# body), and the WAS binding conflict then keeps this site down -- exactly the
+# failure the ownership check below exists to catch.
 & $appcmd delete site "Default Web Site" 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    # stderr carries appcmd errors, so a missing site yields an empty pipeline.
+    if (& $appcmd list site "Default Web Site" 2>$null) {
+        throw "Failed to delete 'Default Web Site' (exit=$LASTEXITCODE); it would keep stealing port 80."
+    }
+    Write-Host "Default Web Site not present -- port 80 already free."
+}
 & $appcmd set site $SiteName /bindings:"http/*:80:"
+if ($LASTEXITCODE -ne 0) { throw "appcmd set site (bind :80) failed." }
 & $appcmd start site $SiteName
+if ($LASTEXITCODE -ne 0) { throw "appcmd start site failed." }
 
 & iisreset /stop  2>&1 | Out-Null; Start-Sleep -Seconds 2
 & iisreset /start 2>&1 | Out-Null
@@ -190,11 +202,36 @@ foreach ($i in 1..30) {
     Start-Sleep -Seconds 1
 }
 
-# Assert THIS site owns port 80 before anything else depends on it.
-$own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
-           -SkipHttpErrorCheck -TimeoutSec 10
-if ($own.StatusCode -ne 200 -or "$($own.Content)" -notmatch "hello from modsectest") {
-    throw "port-80 ownership check failed ($($own.StatusCode)); ModSecTest is not serving localhost."
+# Assert THIS site owns port 80 before anything else depends on it. Retry a
+# few times: WAS may still be activating bindings right after iisreset, and
+# each attempt logs the status + response body so a wrong-content failure is
+# self-diagnosing (iisstart.htm = the Default Web Site came back from the
+# dead; hello.txt = something else transformed the response).
+$owned = $false
+foreach ($attempt in 1..3) {
+    try {
+        $own = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing `
+                   -SkipHttpErrorCheck -TimeoutSec 10
+    }
+    catch {
+        Write-Host "ownership check attempt ${attempt}: request failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 3
+        continue
+    }
+    $body = ("$($own.Content)" -replace "\s+", " ").Trim()
+    if ($body.Length -gt 120) { $body = $body.Substring(0, 120) }
+    Write-Host ("ownership check attempt {0}: status={1} body='{2}'" -f $attempt, $own.StatusCode, $body)
+    if ($own.StatusCode -eq 200 -and "$($own.Content)" -match "hello from modsectest") {
+        $owned = $true
+        break
+    }
+    Start-Sleep -Seconds 3
+}
+if (-not $owned) {
+    Write-Host "site inventory at ownership-check failure:"
+    & $appcmd list sites
+    & $appcmd list site $SiteName
+    throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
 

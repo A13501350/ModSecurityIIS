@@ -305,7 +305,7 @@ jobs:
     # gated (if: inputs.build_run_id == '') so the ~6-min compile + DLL upload are
     # skipped. Installing from the MSI means this job no longer needs the raw
     # DLL artifact: package downloads it (reused or fresh) and builds the MSI.
-    needs: [build, package]
+    needs: [package]
 
     steps:
       - name: Checkout (with submodules, recursive)
@@ -426,11 +426,13 @@ jobs:
         with:
           name: crs-diagnostics
           if-no-files-found: ignore
+          # Absolute paths only: mixing a workspace-relative file here makes
+          # upload-artifact compute the workspace as rootDirectory, which is
+          # not a parent of C:\inetpub and hard-fails the step.
           path: |
             C:/inetpub/modsec/
             C:/inetpub/logs/modsec-crs-audit/
             C:/inetpub/logs/FailedReqLogFiles/
-            crs-msi-install.log
 
       - name: Upload FTW output and audit log
         if: always()
