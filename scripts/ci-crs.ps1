@@ -179,8 +179,14 @@ SecRuleRemoveById 920273
 Write-Host "[2/8] Engine config written ($conf)"
 
 # --- 3) point the test site at the CRS config ----------------------------------
+# responseBodyBlock starts OFF for the ownership check: the connector's
+# response-body buffer path currently pins Content-Length to 0 on the
+# headers-only first notification for small static responses, which makes
+# http.sys drop hello.txt's body (200 with empty body). The check below
+# needs the real body to confirm THIS site owns port 80; we flip it back ON
+# right after the check passes so CRS phase-4 rules run normally.
 & $appcmd set config $SiteName /section:ModSecurity `
-    /enabled:true /configFile:$conf /responseBodyBlock:true /commit:site
+    /enabled:true /configFile:$conf /responseBodyBlock:false /commit:site
 if ($LASTEXITCODE -ne 0) { throw "appcmd set config (ModSecurity section) failed." }
 
 # go-ftw targets http://localhost (port 80) by default. Take the :80 binding.
@@ -251,6 +257,13 @@ if (-not $owned) {
     throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
+
+# Re-enable response-body blocking now that ownership is confirmed; the
+# step-4 web.config also pins responseBodyBlock="true", but set it here too
+# so the value is correct even if the web.config write is skipped.
+& $appcmd set config $SiteName /section:ModSecurity /responseBodyBlock:true /commit:site
+if ($LASTEXITCODE -ne 0) { throw "appcmd set config (responseBodyBlock:true) failed." }
+Write-Host "[3b/8] responseBodyBlock enabled for CRS tests."
 
 # --- 4) reverse proxy: URL Rewrite + ARR -> albedo ------------------------------
 choco install urlrewrite iis-arr -y --no-progress | Out-Null
