@@ -229,10 +229,6 @@ foreach ($i in 1..30) {
 # each attempt logs the status + response body so a wrong-content failure is
 # self-diagnosing (iisstart.htm = the Default Web Site came back from the
 # dead; hello.txt = something else transformed the response).
-$helloPath = Join-Path $SiteRoot "hello.txt"
-$helloLen = if (Test-Path $helloPath) { (Get-Item $helloPath).Length } else { -1 }
-Write-Host ("hello.txt: exists={0} len={1}" -f (Test-Path $helloPath), $helloLen)
-& $appcmd list apppool $PoolName /text:managedRuntimeVersion | ForEach-Object { Write-Host "apppool managedRuntimeVersion='$_'" }
 $owned = $false
 foreach ($attempt in 1..3) {
     try {
@@ -258,103 +254,6 @@ if (-not $owned) {
     Write-Host "site inventory at ownership-check failure:"
     & $appcmd list sites
     & $appcmd list site $SiteName
-
-    # Snapshot IIS config + logs so the artifact explains what actually served
-    # the request. Copy into the upload tree before any further mutation.
-    $diagRoot = "$ConfRoot\diag"
-    New-Item -ItemType Directory -Force $diagRoot | Out-Null
-    Copy-Item "$env:windir\System32\inetsrv\config\applicationHost.config" "$diagRoot\applicationHost.config" -Force -ErrorAction SilentlyContinue
-    Copy-Item "$env:windir\System32\inetsrv\config\administration.config"  "$diagRoot\administration.config"  -Force -ErrorAction SilentlyContinue
-    $w3svcLogs = "C:\inetpub\logs\LogFiles"
-    if (Test-Path $w3svcLogs) {
-        Get-ChildItem $w3svcLogs -Recurse -Filter "*.log" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 5 |
-            ForEach-Object { Copy-Item $_.FullName (Join-Path $diagRoot $_.Name) -Force }
-    }
-    Write-Host "handler mappings for site:"
-    & $appcmd list config $SiteName /section:system.webServer/handlers 2>&1 | Select-Object -First 30
-    Write-Host "global modules:"
-    & $appcmd list modules 2>&1 | Select-Object -First 20
-
-    Write-Host "raw response bytes (first 256):"
-    try {
-        $raw = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -TimeoutSec 10
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes("$($raw.Content)")
-        $hex = ($bytes[0..([Math]::Min(255, $bytes.Length - 1))] | ForEach-Object { $_.ToString("X2") }) -join " "
-        Write-Host $hex
-    }
-    catch {
-        Write-Host "raw fetch failed: $($_.Exception.Message)"
-    }
-    # Isolation probe: disable ModSecurity for the site and re-fetch. If the
-    # body now arrives, the connector is stripping it; if it is still empty,
-    # the static-file handler / site config is at fault.
-    Write-Host "isolation probe: disabling ModSecurity for site..."
-    & $appcmd set config $SiteName /section:ModSecurity /enabled:false /commit:site 2>&1
-    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
-    & iisreset /start 2>&1 | Out-Null
-    foreach ($i in 1..30) { if ((Get-Service W3SVC).Status -eq "Running") { break }; Start-Sleep -Seconds 1 }
-    try {
-        $iso = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 10
-        Write-Host ("isolation probe (modsec off): status={0} body='{1}'" -f $iso.StatusCode,
-            ("$($iso.Content)" -replace "\s+", " ").Trim())
-    }
-    catch { Write-Host "isolation probe fetch failed: $($_.Exception.Message)" }
-    # Re-enable so the artifact reflects the intended config.
-    & $appcmd set config $SiteName /section:ModSecurity /enabled:true /commit:site 2>&1 | Out-Null
-
-    # FREB: capture the full pipeline for the failing request. The box is
-    # already going to fail, so servicing-pending risk is acceptable.
-    Write-Host "FREB: enabling failed-request tracing for post-mortem..."
-    $frebDir = "C:\inetpub\logs\FailedReqLogFiles"
-    New-Item -ItemType Directory -Force $frebDir -ErrorAction SilentlyContinue | Out-Null
-    try {
-        Enable-WindowsOptionalFeature -Online -FeatureName IIS-HttpTracing -All -NoRestart -ErrorAction Stop | Out-Null
-    } catch {
-        try { & dism /Online /Enable-Feature /FeatureName:IIS-HttpTracing /All /NoRestart 2>&1 | Write-Host } catch {}
-    }
-    try {
-        & $appcmd set config $SiteName /section:system.webServer/tracing/traceFailedRequestsLogging `
-            /enabled:true /directory:$frebDir /maxLogFiles:50 /commit:site 2>&1 | Out-Null
-        $ahConfig = "$env:windir\System32\inetsrv\config\applicationHost.config"
-        [xml]$doc = Get-Content $ahConfig
-        $loc = @($doc.configuration.location) | Where-Object { $_.path -eq $SiteName } | Select-Object -First 1
-        if (-not $loc) { $loc = $doc.configuration.AppendChild($doc.CreateElement("location")); $loc.SetAttribute("path", $SiteName) }
-        $sws = $loc."system.webServer"
-        if (-not $sws) { $sws = $loc.AppendChild($doc.CreateElement("system.webServer")) }
-        $tracing = $sws.tracing
-        if (-not $tracing) { $tracing = $sws.AppendChild($doc.CreateElement("tracing")) }
-        $tfr = $tracing.traceFailedRequests
-        if (-not $tfr) { $tfr = $tracing.AppendChild($doc.CreateElement("traceFailedRequests")) }
-        $tfr.RemoveAll()
-        $add = $doc.CreateElement("add"); $add.SetAttribute("path", "*")
-        $ta = $doc.CreateElement("traceAreas")
-        $prov = $doc.CreateElement("add")
-        $prov.SetAttribute("provider", "WWW Server")
-        $prov.SetAttribute("areas", "RequestNotifications,Modules,Security,Filter,StaticFile,Rewrite,RequestRouting")
-        $prov.SetAttribute("verbosity", "Verbose")
-        [void]$ta.AppendChild($prov); [void]$add.AppendChild($ta)
-        $fd = $doc.CreateElement("failureDefinitions")
-        $fd.SetAttribute("statusCodes", "200-999"); $fd.SetAttribute("timeTaken", "00:00:01")
-        [void]$add.AppendChild($fd); [void]$tfr.AppendChild($add)
-        $doc.Save($ahConfig)
-    } catch { Write-Host "FREB config WARN: $($_.Exception.Message)" }
-    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
-    & iisreset /start 2>&1 | Out-Null
-    foreach ($i in 1..30) { if ((Get-Service W3SVC).Status -eq "Running") { break }; Start-Sleep -Seconds 1 }
-    & $appcmd start site $SiteName 2>&1 | Out-Null
-    try {
-        $f = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 10
-        Write-Host ("FREB probe: status={0} ContentLength={1}" -f $f.StatusCode,
-            $(if ($f.Headers.'Content-Length') { $f.Headers.'Content-Length' } else { 'missing' }))
-    } catch { Write-Host "FREB probe failed: $($_.Exception.Message)" }
-    Start-Sleep -Seconds 2
-    $frLogs = Get-ChildItem $frebDir -Recurse -Filter "fr*.xml" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3
-    foreach ($fr in $frLogs) {
-        Write-Host "--- FREB log: $($fr.FullName) ---"
-        Get-Content $fr.FullName -TotalCount 120 | ForEach-Object { Write-Host "  $_" }
-    }
-    if (-not $frLogs) { Write-Host "FREB: no fr*.xml logs produced under $frebDir" }
 
     throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
