@@ -10,7 +10,13 @@ param(
     [string]$ConfRoot   = "C:\inetpub\modsec",
     [string]$SiteRoot   = "C:\inetpub\modsectest",
     [string]$SiteName   = "ModSecTest",
-    [string]$PoolName   = "ModSecTestPool"
+    [string]$PoolName   = "ModSecTestPool",
+    # MSI to install when the module is not registered yet. Empty = assume the
+    # module is already installed (the historical same-job-after-smoke flow).
+    [string]$Msi = "",
+    # Bootstrap binding for the site when it must be created (the script
+    # rebinds to :80 further down regardless).
+    [int]   $Port = 18080
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +27,51 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Must run elevated."
 }
 $appcmd  = "$env:windir\System32\inetsrv\appcmd.exe"
+
+# --- 0b) standalone-job bootstrap ----------------------------------------------
+# This script used to run AFTER ci-smoke.ps1 in the same job, where the MSI was
+# already installed and the site already existed. It now runs as its own CI job
+# on a fresh runner, so it bootstraps whatever is missing:
+#   * module not registered and -Msi given -> install the MSI (schema +
+#     modsecurity.conf + module registration), then restart IIS so the config
+#     system sees the new section;
+#   * site/app pool missing -> create them. hello.txt is written
+#     unconditionally: the port-80 ownership check in step 3 matches its
+#     content.
+$moduleRegistered = [bool](& $appcmd list modules /name:ModSecurityIIS 2>$null |
+    Select-String "ModSecurityIIS" -Quiet)
+if (-not $moduleRegistered) {
+    if (-not $Msi -or -not (Test-Path $Msi)) {
+        throw "ModSecurityIIS module is not registered and no usable -Msi was given."
+    }
+    $msiLog = Join-Path (Get-Location).Path "crs-msi-install.log"
+    Write-Host "== Installing $Msi =="
+    $p = Start-Process msiexec.exe -Wait -PassThru `
+         -ArgumentList @("/i", (Resolve-Path $Msi).Path, "/qn", "/norestart", "/l*v", $msiLog)
+    if ($p.ExitCode -ne 0) {
+        Get-Content $msiLog -ErrorAction SilentlyContinue | Write-Host
+        throw "msiexec failed (exit=$($p.ExitCode)); log: $msiLog"
+    }
+    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
+    & iisreset /start 2>&1 | Out-Null
+    foreach ($i in 1..30) {
+        if ((Get-Service W3SVC).Status -eq "Running") { break }
+        Start-Sleep -Seconds 1
+    }
+    Write-Host "== MSI installed =="
+}
+
+New-Item -ItemType Directory -Force $SiteRoot | Out-Null
+Set-Content (Join-Path $SiteRoot "hello.txt") "hello from modsectest" -Encoding Ascii
+$siteExists = [bool](& $appcmd list site $SiteName 2>$null | Select-String $SiteName -Quiet)
+if (-not $siteExists) {
+    Write-Host "== Creating site $SiteName (bootstrap) =="
+    & $appcmd add apppool /name:$PoolName
+    & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
+    & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
+    & $appcmd set app "$SiteName/" /applicationPool:$PoolName
+    & $appcmd start site $SiteName
+}
 
 # --- 1) fetch + unpack OWASP CRS ----------------------------------------------
 $crsDir  = Join-Path $ConfRoot "coreruleset"

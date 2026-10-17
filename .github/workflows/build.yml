@@ -295,9 +295,10 @@ jobs:
             upgrade.log
             uninstall.log
 
-  # Experimental: install the packaged MSI and assert real blocking behavior
-  # (header rule, request-body rule, pass-through, audit log, event log), then
-  # run the OWASP CRS suite. Failure here fails the workflow.
+  # Install the packaged MSI and assert real blocking behavior (header rule,
+  # request-body rule, pass-through, audit log, event log). The OWASP CRS
+  # regression suite runs in the parallel `crs` job and the concurrency stress
+  # gate in `stress-body` -- both need only the MSI artifact.
   smoke-iis:
     runs-on: windows-latest
     # The build job still runs on reuse, but its Configure/Build/Upload steps are
@@ -333,7 +334,37 @@ jobs:
           if-no-files-found: ignore
           path: msi-install.log
 
-      - name: Set up Go
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iis-smoke-diagnostics
+          if-no-files-found: ignore
+          path: |
+            C:/inetpub/modsec/
+            C:/inetpub/logs/modsec-audit/
+            C:/inetpub/modsectest/
+
+  # CRS regression gate -- its own job so the long go-ftw suite runs in
+  # PARALLEL with smoke-iis and stress-body instead of stretching the critical
+  # path behind the smoke tests, and so a go-ftw flake fails this job alone
+  # instead of taking the smoke result down with it. ci-crs.ps1 is
+  # self-bootstrapping since the split: on this fresh runner it installs the
+  # MSI when the module is not registered and creates the site/pool when
+  # missing. The freb/ftw_debug/no_gate dispatch inputs apply to this job.
+  crs:
+    needs: [package]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules, recursive)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # ci-crs.ps1 installs go-ftw + albedo via `go install`; Go is not
+      # preinstalled on windows-latest.
+      - name: Setup Go
         id: setup-go
         uses: actions/setup-go@v7
         with:
@@ -368,6 +399,13 @@ jobs:
           restore-keys: |
             gotools-${{ runner.os }}-
 
+      - name: Download MSI
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis-msi
+          path: msi
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Test against OWASP CRS (go-ftw + albedo)
         shell: pwsh
         env:
@@ -378,19 +416,21 @@ jobs:
           # it must not redden the workflow. Debug runs therefore opt out of
           # go-ftw gating; normal runs keep it ON.
           MODSEC_IIS_NO_GATE: ${{ inputs.no_gate == true || inputs.ftw_debug == true }}
-        run: ./scripts/ci-crs.ps1
+        run: |
+          $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
+          ./scripts/ci-crs.ps1 -Msi $msi
 
-      - name: Upload smoke diagnostics
+      - name: Upload CRS diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: iis-smoke-diagnostics
+          name: crs-diagnostics
           if-no-files-found: ignore
           path: |
             C:/inetpub/modsec/
-            C:/inetpub/logs/modsec-audit/
+            C:/inetpub/logs/modsec-crs-audit/
             C:/inetpub/logs/FailedReqLogFiles/
-            C:/inetpub/modsectest/
+            crs-msi-install.log
 
       - name: Upload FTW output and audit log
         if: always()
@@ -458,7 +498,7 @@ jobs:
   # release always contains an MSI that passed the tests on this exact commit.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, package, smoke-iis, stress-body]
+    needs: [build, package, smoke-iis, crs, stress-body]
     runs-on: windows-latest
     permissions:
       # GITHUB_TOKEN is read-only by default; creating a release needs write.
