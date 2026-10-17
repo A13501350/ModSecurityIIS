@@ -167,13 +167,11 @@ private:
     // notification status (FinishBodyRead already ran).
     static bool
     ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
-                     DWORD cb, HRESULT hr, const char* where,
+                     DWORD cb, HRESULT hr,
                      REQUEST_NOTIFICATION_STATUS* pStatus);
 
     // Restores the drained entity body for the downstream handler, feeds it to
-    // the engine and applies any intervention. `reason` names the stop
-    // condition (body-trace diagnostics only).
+    // the engine and applies any intervention.
     static REQUEST_NOTIFICATION_STATUS
-    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
-                   const char* reason);
+    FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext);
 };

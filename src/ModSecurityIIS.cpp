@@ -42,93 +42,6 @@ PVOID           g_pModuleContext = NULL;
 HANDLE          g_hEventLog = NULL;
 
 // ---------------------------------------------------------------------------
-// Body-trace (diagnostic, diag branch only). Enabled by setting BOTH
-//   MODSEC_IIS_BODY_TRACE=1
-//   MODSEC_IIS_TRACE_FILE=<path>
-// in the w3wp environment BEFORE the pool starts. Appended lines:
-//   BEGIN declared=<len>        (has-body requests only)
-//   ASYNC-FOREIGN ...          (completions that did not claim the
-//                               BRS_READ_PENDING state: foreign multicast
-//                               operations such as ARR's own entity reads)
-//   ASYNC-TERMINAL ...         (claimed completion that is zero-byte/failed)
-//   FINISH reason= size=        (stop condition + accumulated size)
-//   INSERT hr=                  (InsertEntityBody result, checked)
-// correlated by the per-request context pointer. Purpose: decide whether a
-// load-dependent mid-body stall through ARR is (a) the connector finishing the
-// body read prematurely on a misjudged short-read/EOF (FINISH size < declared
-// Content-Length), (b) a completion the module never saw (BEGIN without
-// FINISH), or (c) the full body inserted but the IIS entity pipe losing the
-// "more data" signal toward ARR (FINISH size == declared, stall downstream).
-//
-// IMPORTANT: v14 showed that per-line fopen/fclose tracing (and FREB) PERTURBS
-// the timing enough to mask the race entirely (three 0-stall runs where the
-// untraced harness stalls 4-24/256). Hence: a persistent handle, no logging on
-// the accepted-completion hot path, and abnormal-only ASYNC lines.
-// ---------------------------------------------------------------------------
-namespace {
-    std::atomic<int> g_bodyTraceState{ 0 };   // 0=uninit 1=off 2=on
-    FILE*            g_traceFile = nullptr;
-    CRITICAL_SECTION g_traceLock;
-
-    void BodyTraceInit()
-    {
-        char flag[16] = { 0 };
-        DWORD n = GetEnvironmentVariableA("MODSEC_IIS_BODY_TRACE", flag, sizeof(flag));
-        if (n == 0 || flag[0] == '\0' || flag[0] == '0')
-        {
-            g_bodyTraceState.store(1, std::memory_order_relaxed);
-            return;
-        }
-        char path[MAX_PATH] = { 0 };
-        n = GetEnvironmentVariableA("MODSEC_IIS_TRACE_FILE", path, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH)
-        {
-            g_bodyTraceState.store(1, std::memory_order_relaxed);
-            return;
-        }
-        InitializeCriticalSection(&g_traceLock);
-        if (fopen_s(&g_traceFile, path, "a") != 0 || g_traceFile == nullptr)
-        {
-            DeleteCriticalSection(&g_traceLock);
-            g_bodyTraceState.store(1, std::memory_order_relaxed);
-            return;
-        }
-        g_bodyTraceState.store(2, std::memory_order_relaxed);
-    }
-}
-
-static void BodyTrace(const char* fmt, ...)
-{
-    int st = g_bodyTraceState.load(std::memory_order_relaxed);
-    if (st == 0)
-    {
-        BodyTraceInit();
-        st = g_bodyTraceState.load(std::memory_order_relaxed);
-    }
-    if (st != 2)
-    {
-        return;
-    }
-
-    char msg[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, ap);
-    va_end(ap);
-
-    EnterCriticalSection(&g_traceLock);
-    if (g_traceFile != nullptr)
-    {
-        fprintf(g_traceFile, "[pid=%lu tick=%llu] %s\n",
-                (unsigned long)GetCurrentProcessId(),
-                (unsigned long long)GetTickCount64(),
-                msg);
-        fflush(g_traceFile);
-    }
-    LeaveCriticalSection(&g_traceLock);
-}
-
-// ---------------------------------------------------------------------------
 // Body-read mode selection -- research/body-async-arr-model.
 //
 // DEFAULT ON THIS BRANCH: ASYNCHRONOUS (fAsync=TRUE). The implementation
@@ -771,7 +684,7 @@ CMyHttpModule::BeginBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
     IHttpRequest* pRequest = pHttpContext->GetRequest();
     if (pRequest == NULL)
     {
-        return FinishBodyRead(rsc, pHttpContext, "no-request");
+        return FinishBodyRead(rsc, pHttpContext);
     }
 
     const EntityBodyInfo info =
@@ -780,15 +693,10 @@ CMyHttpModule::BeginBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCon
     {
         // No entity body: run the body phase with an empty body. Avoids an
         // async round-trip for the common bodyless request.
-        return FinishBodyRead(rsc, pHttpContext, "no-body");
+        return FinishBodyRead(rsc, pHttpContext);
     }
     rsc->m_HasBody = true;
     rsc->m_DeclaredBodyLength = info.length;
-
-    // The declared length drives the stop condition in ConsumeBodyChunk (on
-    // every chunk, including async-resumed ones).
-    BodyTrace("BEGIN rsc=%p declared=%llu", (const void*)rsc,
-              (unsigned long long)info.length);
 
     // Pre-size the accumulator so multi-chunk bodies don't pay repeated
     // reallocation. Client-controlled Content-Length is clamped to 1 MiB
@@ -814,7 +722,7 @@ CMyHttpModule::PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCont
     if (pRequest == NULL)
     {
         InterlockedExchange(&rsc->m_BodyReadState, BRS_DONE);
-        return FinishBodyRead(rsc, pHttpContext, "no-request");
+        return FinishBodyRead(rsc, pHttpContext);
     }
 
     const bool async = BodyReadsAsync();
@@ -860,8 +768,7 @@ CMyHttpModule::PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCont
         }
 
         REQUEST_NOTIFICATION_STATUS status = RQ_NOTIFICATION_CONTINUE;
-        if (!ConsumeBodyChunk(rsc, pHttpContext, read, hr,
-                              async ? "async-inline" : "sync", &status))
+        if (!ConsumeBodyChunk(rsc, pHttpContext, read, hr, &status))
         {
             return status;
         }
@@ -872,7 +779,7 @@ CMyHttpModule::PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCont
 bool
 CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
                                 IHttpContext* pHttpContext,
-                                DWORD read, HRESULT hr, const char* where,
+                                DWORD read, HRESULT hr,
                                 REQUEST_NOTIFICATION_STATUS* pStatus)
 {
     if (read > 0)
@@ -890,21 +797,15 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
                      (HRESULT_CODE(hr) == ERROR_HANDLE_EOF);
     if (eof)
     {
-        BodyTrace("EOF rsc=%p where=%s read=%lu hr=0x%08X have=%zu declared=%llu",
-                  (const void*)rsc, where, read, (unsigned)hr,
-                  rsc->m_Body.size(), (unsigned long long)declared);
         InterlockedExchange(&rsc->m_BodyReadState, BRS_DONE);
-        *pStatus = FinishBodyRead(rsc, pHttpContext, "eof");
+        *pStatus = FinishBodyRead(rsc, pHttpContext);
         return false;
     }
     // Hard error: stop rather than risk spinning. What we have is inspected.
     if (FAILED(hr))
     {
-        BodyTrace("READ-ERROR rsc=%p where=%s hr=0x%08X have=%zu declared=%llu",
-                  (const void*)rsc, where, (unsigned)hr, rsc->m_Body.size(),
-                  (unsigned long long)declared);
         InterlockedExchange(&rsc->m_BodyReadState, BRS_DONE);
-        *pStatus = FinishBodyRead(rsc, pHttpContext, "read-error");
+        *pStatus = FinishBodyRead(rsc, pHttpContext);
         return false;
     }
     // Everything the client declared has arrived: stop without another read.
@@ -913,7 +814,7 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
     if (declared > 0 && (ULONGLONG)rsc->m_Body.size() >= declared)
     {
         InterlockedExchange(&rsc->m_BodyReadState, BRS_DONE);
-        *pStatus = FinishBodyRead(rsc, pHttpContext, "declared-length");
+        *pStatus = FinishBodyRead(rsc, pHttpContext);
         return false;
     }
     // Accumulation cap: the engine never inspects past maxInspect bytes
@@ -940,20 +841,17 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
                 EVENTLOG_WARNING_TYPE);
         }
         InterlockedExchange(&rsc->m_BodyReadState, BRS_DONE);
-        *pStatus = FinishBodyRead(rsc, pHttpContext, "inspect-cap");
+        *pStatus = FinishBodyRead(rsc, pHttpContext);
         return false;
     }
     return true;   // issue the next read
 }
 
 REQUEST_NOTIFICATION_STATUS
-CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext,
-                              const char* reason)
+CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
     try
     {
-        BodyTrace("FINISH rsc=%p reason=%s size=%zu",
-                  (const void*)rsc, reason, rsc->m_Body.size());
         // Hand the accumulated body back to the downstream handler via a
         // single InsertEntityBody(). When the accumulation cap engaged this is
         // a PREFIX of the entity: IIS inserts it BEFORE the unread remainder,
@@ -969,8 +867,6 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                 memcpy(pBody, rsc->m_Body.data(), rsc->m_Body.size());
                 const HRESULT ihr = pRequest->InsertEntityBody(
                                         pBody, (DWORD)rsc->m_Body.size());
-                BodyTrace("INSERT rsc=%p size=%zu hr=0x%08X",
-                          (const void*)rsc, rsc->m_Body.size(), (unsigned)ihr);
                 if (FAILED(ihr))
                 {
                     // Insertion failure: the handler would see a body that is
@@ -1388,25 +1284,16 @@ CMyHttpModule::OnAsyncCompletion(
                                    BRS_IDLE, BRS_READ_PENDING)
             != BRS_READ_PENDING)
     {
-        BodyTrace("ASYNC-FOREIGN rsc=%p notif=0x%08X post=%d state=%ld",
-                  (const void*)rsc, dwNotification, (int)fPostNotification,
-                  (long)rsc->m_BodyReadState);
         return RQ_NOTIFICATION_CONTINUE;
     }
 
     const DWORD   cb = pCompletionInfo->GetCompletionBytes();
     const HRESULT ch = pCompletionInfo->GetCompletionStatus();
 
-    if (cb == 0 || FAILED(ch))
-    {
-        BodyTrace("ASYNC-TERMINAL rsc=%p notif=0x%08X cb=%lu ch=0x%08X",
-                  (const void*)rsc, dwNotification, cb, (unsigned)ch);
-    }
-
     try
     {
         REQUEST_NOTIFICATION_STATUS status = RQ_NOTIFICATION_CONTINUE;
-        if (!ConsumeBodyChunk(rsc, pHttpContext, cb, ch, "async", &status))
+        if (!ConsumeBodyChunk(rsc, pHttpContext, cb, ch, &status))
         {
             // Body complete (or terminal): InsertEntityBody + phase 2 ran
             // inside FinishBodyRead; resume (or finish) the pipeline.
