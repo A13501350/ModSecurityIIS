@@ -220,8 +220,8 @@ foreach ($i in 1..30) {
 # self-diagnosing (iisstart.htm = the Default Web Site came back from the
 # dead; hello.txt = something else transformed the response).
 $helloPath = Join-Path $SiteRoot "hello.txt"
-Write-Host ("hello.txt: exists={0} len={1}" -f (Test-Path $helloPath),
-    (if (Test-Path $helloPath) { (Get-Item $helloPath).Length } else { -1 }))
+$helloLen = if (Test-Path $helloPath) { (Get-Item $helloPath).Length } else { -1 }
+Write-Host ("hello.txt: exists={0} len={1}" -f (Test-Path $helloPath), $helloLen)
 & $appcmd list apppool $PoolName /text:managedRuntimeVersion | ForEach-Object { Write-Host "apppool managedRuntimeVersion='$_'" }
 $owned = $false
 foreach ($attempt in 1..3) {
