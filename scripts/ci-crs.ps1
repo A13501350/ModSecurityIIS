@@ -219,6 +219,10 @@ foreach ($i in 1..30) {
 # each attempt logs the status + response body so a wrong-content failure is
 # self-diagnosing (iisstart.htm = the Default Web Site came back from the
 # dead; hello.txt = something else transformed the response).
+$helloPath = Join-Path $SiteRoot "hello.txt"
+Write-Host ("hello.txt: exists={0} len={1}" -f (Test-Path $helloPath),
+    (if (Test-Path $helloPath) { (Get-Item $helloPath).Length } else { -1 }))
+& $appcmd list apppool $PoolName /text:managedRuntimeVersion | ForEach-Object { Write-Host "apppool managedRuntimeVersion='$_'" }
 $owned = $false
 foreach ($attempt in 1..3) {
     try {
@@ -254,6 +258,22 @@ if (-not $owned) {
     catch {
         Write-Host "raw fetch failed: $($_.Exception.Message)"
     }
+    # Isolation probe: disable ModSecurity for the site and re-fetch. If the
+    # body now arrives, the connector is stripping it; if it is still empty,
+    # the static-file handler / site config is at fault.
+    Write-Host "isolation probe: disabling ModSecurity for site..."
+    & $appcmd set config $SiteName /section:ModSecurity /enabled:false /commit:site 2>&1
+    & iisreset /stop 2>&1 | Out-Null; Start-Sleep -Seconds 2
+    & iisreset /start 2>&1 | Out-Null
+    foreach ($i in 1..30) { if ((Get-Service W3SVC).Status -eq "Running") { break }; Start-Sleep -Seconds 1 }
+    try {
+        $iso = Invoke-WebRequest "http://localhost/hello.txt" -UseBasicParsing -SkipHttpErrorCheck -TimeoutSec 10
+        Write-Host ("isolation probe (modsec off): status={0} body='{1}'" -f $iso.StatusCode,
+            ("$($iso.Content)" -replace "\s+", " ").Trim())
+    }
+    catch { Write-Host "isolation probe fetch failed: $($_.Exception.Message)" }
+    # Re-enable so the artifact reflects the intended config.
+    & $appcmd set config $SiteName /section:ModSecurity /enabled:true /commit:site 2>&1 | Out-Null
     throw "port-80 ownership check failed; ModSecTest is not serving localhost."
 }
 Write-Host "[3/8] Site '$SiteName' now serving CRS config on port 80."
