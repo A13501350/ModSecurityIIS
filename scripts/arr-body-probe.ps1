@@ -386,6 +386,9 @@ Set-Content (Join-Path $SiteRoot "hello.txt") "hello from arr probe" -Encoding A
 # ---------------------------------------------------------------------------
 if ($BodyReadMode -eq 'sync') {
     Write-Host "[body] forcing synchronous reads: MODSEC_IIS_BODY_ASYNC=0 on pool $PoolName"
+    # WebAdministration is not auto-loaded in PowerShell 7; the IIS features
+    # installed earlier provide it.
+    Import-Module WebAdministration
     Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
         -Filter "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables" `
         -Name '.' -Value @{ name = 'MODSEC_IIS_BODY_ASYNC'; value = '0' }
