@@ -402,12 +402,63 @@ jobs:
             go-ftw-output.txt
             modsec_crs_audit.log
 
+  # Concurrency stress gate for the entity-body read path. The historical
+  # connector defects (lost async completion notifications, per-op callback
+  # re-entry stalls) only reproduce under CONCURRENT 100 KiB POSTs through the
+  # ARR forward path -- neither the smoke test (single direct POST, no ARR) nor
+  # go-ftw (sequential replay) covers that combination. This job drives
+  # scripts/arr-body-probe.ps1 (kept in scripts/ when the diagnostic-probe
+  # workflow was removed from master) with a BOUNDED load -- c=128 x 2 reps x
+  # 2 rounds (~512 x 100 KiB POSTs) against its own throwaway site + echo
+  # backend -- and gates on zero STALL/TRUNC. A separate job (not the tail of
+  # smoke-iis) because the probe is designed for a fresh box: ci-crs leaves
+  # albedo on 8080 and possibly a global rewrite fallback rule that would
+  # hijack the probe site. Runs in parallel with smoke-iis, so it adds nothing
+  # to the critical path.
+  stress-body:
+    needs: [package]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules, recursive)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # The probe's echo backend is compiled on the fly via `go run`.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Download MSI
+        uses: actions/download-artifact@v8
+        with:
+          name: modsecurityiis-msi
+          path: msi
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run bounded body stress probe
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
+          ./scripts/arr-body-probe.ps1 -Msi $msi -LoadClients 128 -LoadReps 2 -LoadRounds 2
+
+      - name: Upload stress diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-body-diagnostics
+          if-no-files-found: ignore
+          path: C:/inetpub/modsec-arr/
+
   # Publish a GitHub Release when a v* tag is pushed. Runs only after the
-  # whole pipeline (build -> package -> smoke/CRS) has passed, so a release
-  # always contains an MSI that passed the tests on this exact commit.
+  # whole pipeline (build -> package -> smoke/CRS + stress) has passed, so a
+  # release always contains an MSI that passed the tests on this exact commit.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, package, smoke-iis]
+    needs: [build, package, smoke-iis, stress-body]
     runs-on: windows-latest
     permissions:
       # GITHUB_TOKEN is read-only by default; creating a release needs write.
