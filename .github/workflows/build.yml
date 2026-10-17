@@ -145,7 +145,7 @@ jobs:
         with:
           arch: x64
 
-      - uses: ammaraskar/msvc-problem-matcher@0.3.0
+      - uses: ammaraskar/msvc-problem-matcher@master
         if: ${{ inputs.build_run_id == '' }}
 
       # The four steps below are already gated. In reuse mode they all skip, as
