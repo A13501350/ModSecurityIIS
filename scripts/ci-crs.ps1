@@ -68,6 +68,14 @@ if (-not $siteExists) {
     Write-Host "== Creating site $SiteName (bootstrap) =="
     & $appcmd add apppool /name:$PoolName
     & $appcmd set apppool $PoolName /processModel.loadUserProfile:false
+
+    # The pool identity must be able to read the physical path. Missing this
+    # yields 200 with an EMPTY body for hello.txt (static file handler gets
+    # the request, then fails to open the file); smoke.Tests.ps1 grants the
+    # same set for its own site.
+    $poolId = "IIS AppPool\$PoolName"
+    icacls $SiteRoot /grant "${poolId}:(OI)(CI)RX" | Out-Null
+
     & $appcmd add site /name:$SiteName /physicalPath:$SiteRoot "/bindings:http/*:$($Port):"
     & $appcmd set app "$SiteName/" /applicationPool:$PoolName
     & $appcmd start site $SiteName
