@@ -485,7 +485,11 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem msi -Filter *.msi | Select-Object -First 1).FullName
-          ./scripts/arr-body-probe.ps1 -Msi $msi -LoadClients 128 -LoadReps 2 -LoadRounds 2
+          # -PerfStatsPath turns on the connector's phase timers (switch only;
+          # default off everywhere else): the probe load yields per-phase
+          # count/total_us/max_us snapshots for the stage breakdown.
+          ./scripts/arr-body-probe.ps1 -Msi $msi -LoadClients 128 -LoadReps 2 -LoadRounds 2 `
+              -PerfStatsPath C:\inetpub\modsec-arr\perf\phase-stats.csv
 
       - name: Upload stress diagnostics
         if: always()

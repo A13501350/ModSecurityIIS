@@ -56,6 +56,11 @@ param(
     # Extra rounds of the c16 phase: sample more requests per run to accumulate
     # enough stalls to make the verdict robust.
     [int]   $LoadRounds     = 1,
+    # Opt-in connector phase stats (MODSEC_IIS_PERF_STATS). When set, the
+    # module appends 30-second-window snapshots (count/total_us/max_us per
+    # phase) to this file, giving the per-stage breakdown of where request
+    # time goes. Off by default.
+    [string]$PerfStatsPath  = "",
     # Opt-in IIS Failed Request Tracing (FREB). Off by default; enable via -Freb
     # or $env:MODSEC_IIS_FREB=1. When on, the connector+ARR pipeline is traced
     # and stalled 100 KiB POSTs are captured so the blocking stage can be pinned
@@ -385,6 +390,19 @@ if ($BodyReadMode -eq 'sync') {
         -Name '.' -Value @{ name = 'MODSEC_IIS_BODY_ASYNC'; value = '0' }
 } else {
     Write-Host "[body] async ARR-model reads (default; MODSEC_IIS_BODY_ASYNC unset)"
+}
+
+# 5b) connector phase stats switch: pool-level env var (read when w3wp
+#     starts) plus write ACL for the pool identity on the stats file dir.
+if ($PerfStatsPath) {
+    $perfDir = Split-Path $PerfStatsPath
+    New-Item -ItemType Directory -Force $perfDir | Out-Null
+    icacls $perfDir /grant "IIS AppPool\$($PoolName):(OI)(CI)M" | Out-Null
+    Write-Host "[perf] MODSEC_IIS_PERF_STATS=$PerfStatsPath on pool $PoolName"
+    Import-Module WebAdministration
+    Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Filter "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables" `
+        -Name '.' -Value @{ name = 'MODSEC_IIS_PERF_STATS'; value = $PerfStatsPath }
 }
 
 $poolId = "IIS AppPool\$PoolName"
