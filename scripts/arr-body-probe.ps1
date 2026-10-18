@@ -398,11 +398,22 @@ if ($PerfStatsPath) {
     $perfDir = Split-Path $PerfStatsPath
     New-Item -ItemType Directory -Force $perfDir | Out-Null
     icacls $perfDir /grant "IIS AppPool\$($PoolName):(OI)(CI)M" | Out-Null
-    Write-Host "[perf] MODSEC_IIS_PERF_STATS=$PerfStatsPath on pool $PoolName"
     Import-Module WebAdministration
+    $envFilter = "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables"
     Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
-        -Filter "system.applicationHost/applicationPools/add[@name='$PoolName']/processModel/environmentVariables" `
+        -Filter $envFilter `
         -Name '.' -Value @{ name = 'MODSEC_IIS_PERF_STATS'; value = $PerfStatsPath }
+    # Read back: the WinPSCompat remoting session can silently no-op the
+    # hash-table -Value. Fall back to a machine-wide variable (WAS builds the
+    # w3wp environment from the system block, so this always lands).
+    $rb = Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Filter "$envFilter/add[@name='MODSEC_IIS_PERF_STATS']" -Name 'value' `
+        -ErrorAction SilentlyContinue
+    if (-not $rb -or "$rb" -ne $PerfStatsPath) {
+        Write-Warning "[perf] pool env readback mismatch ('$rb'); using machine-wide variable"
+        [Environment]::SetEnvironmentVariable('MODSEC_IIS_PERF_STATS', $PerfStatsPath, 'Machine')
+    }
+    Write-Host "[perf] MODSEC_IIS_PERF_STATS=$PerfStatsPath on pool $PoolName"
 }
 
 $poolId = "IIS AppPool\$PoolName"
@@ -683,6 +694,22 @@ try {
     Write-Warning ("[INFLIGHT] snapshot failed: {0}" -f $_.Exception.Message)
 }
 
+# 6b) perf stats presence check: tells us whether the module picked the switch
+#     up at all, BEFORE teardown makes diagnosis impossible.
+if ($PerfStatsPath) {
+    if (Test-Path $PerfStatsPath) {
+        Write-Host ("[perf] stats file present: {0} bytes -> {1}" -f `
+            (Get-Item $PerfStatsPath).Length, $PerfStatsPath)
+        Get-Content $PerfStatsPath | Select-Object -Last 22 | ForEach-Object { Write-Host "  $_" }
+    } else {
+        Write-Warning "[perf] stats file MISSING after load phase ($PerfStatsPath)"
+        Write-Host ("[perf] machine-level MODSEC_IIS_PERF_STATS = '{0}'" -f `
+            [Environment]::GetEnvironmentVariable('MODSEC_IIS_PERF_STATS', 'Machine'))
+        & $appcmd list apppool $PoolName /text:processModel.environmentVariables 2>&1 |
+            ForEach-Object { Write-Host "  pool-env: $_" }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 6b) FREB trace summary (opt-in) -- pinpoint the blocking stage for stalls
 # ---------------------------------------------------------------------------
@@ -711,6 +738,9 @@ if ($frebOn) {
 & iisreset /stop 2>&1 | Out-Null
 Copy-Item "C:\inetpub\logs\LogFiles" (Join-Path $ConfRoot "iis-logs") `
     -Recurse -Force -ErrorAction SilentlyContinue
+# Remove the perf-stats fallback switch (idempotent): a machine-level variable
+# would leak into later local runs long after the probe site is gone.
+[Environment]::SetEnvironmentVariable('MODSEC_IIS_PERF_STATS', $null, 'Machine')
 if (-not $beProc.HasExited) { $beProc.Kill() }
 & $appcmd delete site $SiteName 2>$null | Out-Null
 & $appcmd delete apppool $PoolName 2>$null | Out-Null
