@@ -24,6 +24,27 @@ enum BodyReadState
 // is allocated with this exact size on demand in BeginBodyRead.
 constexpr DWORD kBodyReadChunkSize = 65536;
 
+// ---------------------------------------------------------------------------
+// Perf phase stats (MODSEC_IIS_PERF_STATS=<path>). Implemented in
+// ModSecurityIIS.cpp; cheap no-ops while the switch is off.
+// ---------------------------------------------------------------------------
+enum PerfPhase
+{
+    PERF_BEGIN = 0,      // OnBeginRequest: config + tx create + phase 1
+    PERF_BODY_DRAIN,     // body drain wall time (incl. IIS I/O wait)
+    PERF_BODY_IO,        // accumulated ReadEntityBody call time
+    PERF_BODY_RESTORE,   // AllocateRequestMemory + InsertEntityBody re-forward
+    PERF_PHASE2,         // appendRequestBody + processRequestBody
+    PERF_RESP_HDRS,      // response headers feed + processResponseHeaders
+    PERF_RESP_BODY_ACC,  // response body chunk accumulation
+    PERF_PHASE4,         // processResponseBody
+    PERF_LOGGING,        // processLogging at end of request
+    PERF_PHASE_COUNT
+};
+
+ULONGLONG PerfQpcNow() noexcept;
+void PerfRecord(int phase, ULONGLONG qpcStart) noexcept;
+
 class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 {
  public:
@@ -32,7 +53,7 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
           m_ResponseHeadersFed(false),
           m_ResponseBodyBlock(false), m_ResponseBodyEvaluated(false),
           m_HasBody(false), m_DeclaredBodyLength(0),
-          m_BodyReadState(BRS_IDLE)
+          m_BodyReadState(BRS_IDLE), m_BodyDrainStartTicks(0)
     { }
 
     ~REQUEST_STORED_CONTEXT()
@@ -60,7 +81,9 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
             try
             {
                 // v3 finalizes logging at the end of the request lifecycle.
+                const ULONGLONG tLog = PerfQpcNow();
                 m_pTx->processLogging();
+                PerfRecord(PERF_LOGGING, tLog);
                 delete m_pTx;
             }
             catch (...)
@@ -109,6 +132,9 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
     // completion may arrive on an IIS I/O thread while BeginRequest returned
     // PENDING. See the BodyReadState enum above.
     volatile LONG             m_BodyReadState;
+    // QPC stamp taken at BeginBodyRead entry; consumed by PERF_BODY_DRAIN in
+    // FinishBodyRead (reset to 0 after recording). 0 == not draining.
+    ULONGLONG                 m_BodyDrainStartTicks;
 };
 
 

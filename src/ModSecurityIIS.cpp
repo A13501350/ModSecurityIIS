@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
+#include <ctime>
 
 #include "httpserv.h"
 
@@ -40,6 +41,151 @@ PVOID           g_pModuleContext = NULL;
 
 // Event Viewer handle, owned by CMyHttpModule and shared with connector.cpp.
 HANDLE          g_hEventLog = NULL;
+
+// ---------------------------------------------------------------------------
+// Perf phase stats -- MODSEC_IIS_PERF_STATS=<log file path>.
+//
+// Switch-gated instrumentation (the debug-mechanism contract: a switch only).
+// When the env var names a file, every phase boundary accumulates
+// count / total / max QPC ticks into lock-free atomics; one thread per
+// 30-second window appends a per-window snapshot (converted to microseconds
+// via QPF) to the file. With the switch off the per-request cost is one
+// relaxed atomic load.
+// ---------------------------------------------------------------------------
+namespace {
+    struct PerfPhaseStats
+    {
+        std::atomic<LONG64> count      { 0 };
+        std::atomic<LONG64> ticksTotal { 0 };
+        std::atomic<LONG64> ticksMax   { 0 };
+    };
+
+    PerfPhaseStats g_perf[PERF_PHASE_COUNT];
+
+    const char* const g_perfNames[PERF_PHASE_COUNT] =
+    {
+        "begin", "body_drain", "body_io", "body_restore", "phase2",
+        "resp_hdrs", "resp_body_acc", "phase4", "logging"
+    };
+
+    std::atomic<bool>   g_perfEnabled{ false };
+    char                g_perfPath[MAX_PATH] = "";
+    std::atomic<LONG64> g_perfNextDump{ 0 };          // QPC ticks, dump gate
+    SRWLOCK             g_perfFileLock = SRWLOCK_INIT;
+    FILE*               g_perfFile = nullptr;
+
+    // Dump cadence in QPC ticks (QPF ticks per 30 s), resolved once at load.
+    const LONG64 g_perfDumpInterval = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart * 30;
+    }();
+
+    // Highest-resolution timestamp available without a perf dependency: QPC,
+    // ~20 ns per call -- negligible even at stress-load request rates.
+    const ULONGLONG ticksPerUs = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return (ULONGLONG)(f.QuadPart / 1000000ui64);   // >= 1 on any real hw
+    }();
+}
+
+ULONGLONG PerfQpcNow() noexcept
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (ULONGLONG)c.QuadPart;
+}
+
+// One CAS-gated snapshot per interval; single writer holds the SRWLOCK.
+static void PerfMaybeDump() noexcept
+{
+    const LONG64 now = (LONG64)PerfQpcNow();
+    LONG64 next = g_perfNextDump.load(std::memory_order_relaxed);
+    if (now < next ||
+        !g_perfNextDump.compare_exchange_strong(next, now + g_perfDumpInterval))
+    {
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_perfFileLock);
+    if (g_perfFile == nullptr)
+    {
+        if (fopen_s(&g_perfFile, g_perfPath, "a") != 0 || g_perfFile == nullptr)
+        {
+            // Never rethrow into a notification handler; drop stats instead.
+            g_perfEnabled.store(false, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&g_perfFileLock);
+            return;
+        }
+    }
+    char stamp[32];
+    const __time64_t t = _time64(nullptr);
+    struct tm tmv;
+    if (_gmtime64_s(&tmv, &t) == 0)
+    {
+        strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    }
+    else
+    {
+        stamp[0] = '\0';
+    }
+    fprintf(g_perfFile, "# dump %s\n", stamp);
+    for (int p = 0; p < PERF_PHASE_COUNT; p++)
+    {
+        const LONG64 n = g_perf[p].count.exchange(0, std::memory_order_relaxed);
+        const LONG64 total = g_perf[p].ticksTotal.exchange(0, std::memory_order_relaxed);
+        const LONG64 maxT = g_perf[p].ticksMax.exchange(0, std::memory_order_relaxed);
+        fprintf(g_perfFile, "%s,%lld,%lld,%lld\n", g_perfNames[p],
+                (long long)n,
+                (long long)(ticksPerUs ? total / ticksPerUs : 0),
+                (long long)(ticksPerUs ? maxT / ticksPerUs : 0));
+    }
+    fflush(g_perfFile);
+    ReleaseSRWLockExclusive(&g_perfFileLock);
+}
+
+void PerfRecord(int phase, ULONGLONG qpcStart) noexcept
+{
+    if (!g_perfEnabled.load(std::memory_order_relaxed) ||
+        phase < 0 || phase >= PERF_PHASE_COUNT || qpcStart == 0)
+    {
+        return;
+    }
+
+    const ULONGLONG dt = PerfQpcNow() - qpcStart;
+    PerfPhaseStats& s = g_perf[phase];
+    s.count.fetch_add(1, std::memory_order_relaxed);
+    s.ticksTotal.fetch_add((LONG64)dt, std::memory_order_relaxed);
+
+    // Max update via CAS loop (no interlocked-max intrinsic on LONG64).
+    LONG64 cur = s.ticksMax.load(std::memory_order_relaxed);
+    while ((ULONGLONG)cur < dt &&
+           !s.ticksMax.compare_exchange_weak(cur, (LONG64)dt,
+                                             std::memory_order_relaxed))
+    {
+    }
+
+    PerfMaybeDump();
+}
+
+// Read the switch once at module load. The w3wp process snapshot of the
+// environment is what counts: set the variable system-wide (or in the
+// spawning shell for local runs) and recycle the app pool / iisreset.
+static void PerfEnableFromEnv()
+{
+    char buf[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("MODSEC_IIS_PERF_STATS",
+                                            buf, (DWORD)sizeof(buf));
+    if (n > 0 && n < sizeof(buf) &&
+        _stricmp(buf, "0") != 0 && _stricmp(buf, "false") != 0)
+    {
+        memcpy(g_perfPath, buf, n + 1);
+        g_perfEnabled.store(true, std::memory_order_relaxed);
+        g_perfNextDump.store(0, std::memory_order_relaxed); // dump on 1st sample
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Body-read mode selection -- research/body-async-arr-model.
@@ -695,6 +841,8 @@ static EntityBodyInfo GetEntityBodyInfo(HTTP_REQUEST* req)
 REQUEST_NOTIFICATION_STATUS
 CMyHttpModule::BeginBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
+    rsc->m_BodyDrainStartTicks = PerfQpcNow();
+
     IHttpRequest* pRequest = pHttpContext->GetRequest();
     if (pRequest == NULL)
     {
@@ -758,17 +906,21 @@ CMyHttpModule::PumpBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCont
         if (async)
         {
             InterlockedExchange(&rsc->m_BodyReadState, BRS_READ_PENDING);
+            const ULONGLONG tIo = PerfQpcNow();
             hr = pRequest->ReadEntityBody(rsc->m_ReadBuf.data(),
                                           kBodyReadChunkSize,
                                           TRUE /* async */, &read, &fPending);
+            PerfRecord(PERF_BODY_IO, tIo);
         }
         else
         {
             // A/B escape hatch (MODSEC_IIS_BODY_ASYNC=0): shipping master
             // behavior, fAsync=FALSE. No read ever stays pending.
+            const ULONGLONG tIo = PerfQpcNow();
             hr = pRequest->ReadEntityBody(rsc->m_ReadBuf.data(),
                                           kBodyReadChunkSize,
                                           FALSE /* sync */, &read, NULL);
+            PerfRecord(PERF_BODY_IO, tIo);
         }
 
         if (async && fPending)
@@ -867,6 +1019,12 @@ CMyHttpModule::ConsumeBodyChunk(REQUEST_STORED_CONTEXT* rsc,
 REQUEST_NOTIFICATION_STATUS
 CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpContext)
 {
+    // Consume the drain-wall-time sample started in BeginBodyRead. Zeroed so
+    // a defensive second entry cannot record a garbage interval.
+    const ULONGLONG drainStart = rsc->m_BodyDrainStartTicks;
+    rsc->m_BodyDrainStartTicks = 0;
+    PerfRecord(PERF_BODY_DRAIN, drainStart);
+
     // Set when the drained body cannot be re-forwarded to the handler. The
     // engine still inspects what we hold in m_Body, but if it allows the
     // request anyway the request must FAIL below: the declared Content-Length
@@ -885,6 +1043,7 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
         IHttpRequest* pRequest = pHttpContext->GetRequest();
         if (pRequest != NULL && !rsc->m_Body.empty())
         {
+            const ULONGLONG tRestore = PerfQpcNow();
             void* pBody = pHttpContext->AllocateRequestMemory(
                               (DWORD)rsc->m_Body.size());
             if (pBody != NULL)
@@ -899,6 +1058,7 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                     // body, because the declared Content-Length still claims
                     // the full amount and a proxy (ARR) will wait for bytes
                     // that never come. Fail the request instead.
+                    PerfRecord(PERF_BODY_RESTORE, tRestore);
                     iis::WriteEventViewerLog(
                         "ModSecurityIIS: InsertEntityBody failed while "
                         "re-forwarding the request body; failing the request",
@@ -920,9 +1080,11 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                     "failed unless the engine blocks it",
                     EVENTLOG_ERROR_TYPE);
             }
+            PerfRecord(PERF_BODY_RESTORE, tRestore);
         }
 
         // Feed the body to the engine, bounded to cap memory use.
+        const ULONGLONG tPhase2 = PerfQpcNow();
         const size_t maxInspect = GetMaxInspectBodyBytes();
         size_t take = rsc->m_Body.size();
         if (take > maxInspect)
@@ -935,6 +1097,7 @@ CMyHttpModule::FinishBodyRead(REQUEST_STORED_CONTEXT* rsc, IHttpContext* pHttpCo
                 (const unsigned char*)rsc->m_Body.data(), take);
         }
         rsc->m_pTx->processRequestBody();
+        PerfRecord(PERF_PHASE2, tPhase2);
     }
     catch (const std::exception& e)
     {
@@ -986,6 +1149,7 @@ CMyHttpModule::OnBeginRequest(
 
     do
     {
+    const ULONGLONG tBegin = PerfQpcNow();
     if (pHttpContext == NULL)
     {
         hr = E_UNEXPECTED;
@@ -1225,6 +1389,7 @@ CMyHttpModule::OnBeginRequest(
     tx->processRequestHeaders();
     if (ApplyIntervention(rsc, pHttpContext, true))
     {
+        PerfRecord(PERF_BEGIN, tBegin);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
 
@@ -1233,6 +1398,7 @@ CMyHttpModule::OnBeginRequest(
     // entity body" comment block above: reads continue through short reads
     // (they do not mean end-of-body) and stop at the declared length rather
     // than asking for bytes past the end of the body.
+    PerfRecord(PERF_BEGIN, tBegin);
     return BeginBodyRead(rsc, pHttpContext);
 
     } while (0);
@@ -1426,6 +1592,7 @@ CMyHttpModule::OnSendResponse(
     // so re-adding duplicates would pollute the transaction.
     if (!rsc->m_ResponseHeadersFed)
     {
+        const ULONGLONG tRespHdrs = PerfQpcNow();
 #define _TRANSHEADER(id,str)                                               \
     if (pRaw->Headers.KnownHeaders[id].pRawValue != NULL)                   \
     {                                                                      \
@@ -1495,9 +1662,11 @@ CMyHttpModule::OnSendResponse(
     IisTrace("OnSendResponse: after processResponseHeaders status=%d", respStatus);
     if (ApplyIntervention(rsc, pHttpContext, responseBodyBlockingEnabled(rsc)))
     {
+        PerfRecord(PERF_RESP_HDRS, tRespHdrs);
         return RQ_NOTIFICATION_FINISH_REQUEST;
     }
     rsc->m_ResponseHeadersFed = true;
+    PerfRecord(PERF_RESP_HDRS, tRespHdrs);
     }
 
     // --- response body: Mode A (block) vs Mode B (inspect-only) ---
@@ -1509,6 +1678,7 @@ CMyHttpModule::OnSendResponse(
     {
     size_t respInspected = 0;
     const size_t maxInspect = GetMaxInspectBodyBytes();
+    const ULONGLONG tRespAcc = PerfQpcNow();
     for (ULONG c = 0; c < pRaw->EntityChunkCount; c++)
     {
         HTTP_DATA_CHUNK* chunk = &pRaw->pEntityChunks[c];
@@ -1552,6 +1722,8 @@ CMyHttpModule::OnSendResponse(
         // inspected here.
     }
 
+    PerfRecord(PERF_RESP_BODY_ACC, tRespAcc);
+
     bool moreData = (pProvider->GetFlags() &
                      HTTP_SEND_RESPONSE_FLAG_MORE_DATA) != 0;
 
@@ -1589,7 +1761,9 @@ CMyHttpModule::OnSendResponse(
                                                        TRUE);
             }
             rsc->m_ResponseBodyEvaluated = true;
+            const ULONGLONG tPhase4 = PerfQpcNow();
             rsc->m_pTx->processResponseBody();
+            PerfRecord(PERF_PHASE4, tPhase4);
             if (ApplyIntervention(rsc, pHttpContext, true))
             {
                 // Disruptive: ApplyIntervention replaced the response
@@ -1612,7 +1786,9 @@ CMyHttpModule::OnSendResponse(
         rsc->m_ResponseBodyEvaluated = true;
         IisTrace("OnSendResponse: before processResponseBody (Mode B) tx=%p",
                  (void*)rsc->m_pTx);
+        const ULONGLONG tPhase4b = PerfQpcNow();
         rsc->m_pTx->processResponseBody();
+        PerfRecord(PERF_PHASE4, tPhase4b);
         ApplyIntervention(rsc, pHttpContext, false);
     }
     }
@@ -1680,6 +1856,8 @@ RegisterModule(
 
     g_pModuleContext = pModuleInfo->GetId();
     g_pHttpServer    = pHttpServer;
+
+    PerfEnableFromEnv();
 
     // Owned by this scope until SetRequestNotifications succeeds; the
     // unique_ptr deletes it on any early return (allocation failure, a
