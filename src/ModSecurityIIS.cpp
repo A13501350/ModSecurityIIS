@@ -71,6 +71,7 @@ namespace {
     std::atomic<bool>   g_perfEnabled{ false };
     char                g_perfPath[MAX_PATH] = "";
     std::atomic<LONG64> g_perfNextDump{ 0 };          // QPC ticks, dump gate
+    std::atomic<LONG64> g_perfRecsSinceDump{ 0 };     // records since snapshot
     SRWLOCK             g_perfFileLock = SRWLOCK_INIT;
     FILE*               g_perfFile = nullptr;
 
@@ -97,16 +98,24 @@ ULONGLONG PerfQpcNow() noexcept
     return (ULONGLONG)c.QuadPart;
 }
 
-// One CAS-gated snapshot per interval; single writer holds the SRWLOCK.
+// One CAS-gated snapshot per trigger; single writer holds the SRWLOCK.
+// Triggered by elapsed interval OR a record-count threshold: the CI stress
+// phases are shorter than 30 s (a 512-request 100 KiB load finishes in ~14 s),
+// so a time-only gate produced a single near-empty snapshot.
 static void PerfMaybeDump() noexcept
 {
     const LONG64 now = (LONG64)PerfQpcNow();
     LONG64 next = g_perfNextDump.load(std::memory_order_relaxed);
-    if (now < next ||
-        !g_perfNextDump.compare_exchange_strong(next, now + g_perfDumpInterval))
+    const LONG64 recs = g_perfRecsSinceDump.load(std::memory_order_relaxed);
+    if (next != 0 && now < next && recs < 256)
     {
         return;
     }
+    if (!g_perfNextDump.compare_exchange_strong(next, now + g_perfDumpInterval))
+    {
+        return;
+    }
+    g_perfRecsSinceDump.store(0, std::memory_order_relaxed);
 
     AcquireSRWLockExclusive(&g_perfFileLock);
     if (g_perfFile == nullptr)
@@ -157,6 +166,7 @@ void PerfRecord(int phase, ULONGLONG qpcStart) noexcept
     PerfPhaseStats& s = g_perf[phase];
     s.count.fetch_add(1, std::memory_order_relaxed);
     s.ticksTotal.fetch_add((LONG64)dt, std::memory_order_relaxed);
+    g_perfRecsSinceDump.fetch_add(1, std::memory_order_relaxed);
 
     // Max update via CAS loop (no interlocked-max intrinsic on LONG64).
     LONG64 cur = s.ticksMax.load(std::memory_order_relaxed);
