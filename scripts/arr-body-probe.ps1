@@ -694,22 +694,6 @@ try {
     Write-Warning ("[INFLIGHT] snapshot failed: {0}" -f $_.Exception.Message)
 }
 
-# 6b) perf stats presence check: tells us whether the module picked the switch
-#     up at all, BEFORE teardown makes diagnosis impossible.
-if ($PerfStatsPath) {
-    if (Test-Path $PerfStatsPath) {
-        Write-Host ("[perf] stats file present: {0} bytes -> {1}" -f `
-            (Get-Item $PerfStatsPath).Length, $PerfStatsPath)
-        Get-Content $PerfStatsPath | Select-Object -Last 22 | ForEach-Object { Write-Host "  $_" }
-    } else {
-        Write-Warning "[perf] stats file MISSING after load phase ($PerfStatsPath)"
-        Write-Host ("[perf] machine-level MODSEC_IIS_PERF_STATS = '{0}'" -f `
-            [Environment]::GetEnvironmentVariable('MODSEC_IIS_PERF_STATS', 'Machine'))
-        & $appcmd list apppool $PoolName /text:processModel.environmentVariables 2>&1 |
-            ForEach-Object { Write-Host "  pool-env: $_" }
-    }
-}
-
 # ---------------------------------------------------------------------------
 # 6b) FREB trace summary (opt-in) -- pinpoint the blocking stage for stalls
 # ---------------------------------------------------------------------------
@@ -741,6 +725,21 @@ Copy-Item "C:\inetpub\logs\LogFiles" (Join-Path $ConfRoot "iis-logs") `
 # Remove the perf-stats fallback switch (idempotent): a machine-level variable
 # would leak into later local runs long after the probe site is gone.
 [Environment]::SetEnvironmentVariable('MODSEC_IIS_PERF_STATS', $null, 'Machine')
+
+# 6b) perf stats summary -- only AFTER iisreset /stop: w3wp holds the stats
+#     file open (share-locked) until then, and reading it earlier both kills
+#     this script (ErrorActionPreference=Stop) and blocks the artifact upload.
+if ($PerfStatsPath) {
+    if (Test-Path $PerfStatsPath) {
+        Write-Host ("[perf] stats file present: {0} bytes -> {1}" -f `
+            (Get-Item $PerfStatsPath).Length, $PerfStatsPath)
+        Get-Content $PerfStatsPath -ErrorAction SilentlyContinue |
+            Select-Object -Last 22 | ForEach-Object { Write-Host "  $_" }
+    } else {
+        Write-Warning "[perf] stats file MISSING after teardown ($PerfStatsPath)"
+    }
+}
+
 if (-not $beProc.HasExited) { $beProc.Kill() }
 & $appcmd delete site $SiteName 2>$null | Out-Null
 & $appcmd delete apppool $PoolName 2>$null | Out-Null
